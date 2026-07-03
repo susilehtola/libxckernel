@@ -39,6 +39,8 @@ _CHI = re.compile(r"^chi_(\w+)$")
 _DCHI = re.compile(r"^dchi_(\w+)_([xyz])$")
 _LAPL = re.compile(r"^lapl_chi_(\w+)$")
 _GRAD = re.compile(r"^grad_rho_([xyz])$")
+_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_([xyz])$")
+_LIBXC_SPIN = re.compile(r"^v\w+_\d+$")
 
 
 @dataclass
@@ -63,9 +65,14 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _GRAD.match(name)
     if m:
         return Operand(f"grad_rho[{_AX[m.group(1)]}]", "g"), "grad"
+    m = _GRAD_SPIN.match(name)
+    if m:
+        return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+            f"grad_{m.group(1)}"
     if name == "w":
         return Operand("w", "g"), "weight"
-    if name in LIBXC_MULTISET:
+    if name in LIBXC_MULTISET or _LIBXC_SPIN.match(name):
+        # each Libxc derivative component is passed as its own (ng,) parameter.
         return Operand(name, "g"), "libxc"
     raise ValueError(f"unrecognised symbol in integrand: {name}")
 
@@ -78,6 +85,8 @@ class GeneratedFunction:
     libxc_args: List[str]       # Libxc derivative arrays required, in order
     uses_lapl_chi: bool
     uses_grad_rho: bool
+    uses_grad_rho_a: bool = False
+    uses_grad_rho_b: bool = False
 
 
 def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
@@ -88,58 +97,65 @@ def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
 
     subs: List[str] = []
     codes: List[str] = []
-    libxc: List[str] = []
-    uses_lapl = uses_grad = False
+    scalar: List[str] = []       # Libxc derivative components: own (ng,) params
+    uses: set = set()
 
     for base, exp in powers.items():
         e = int(exp)
         op, kind = _classify(base.name)
         if kind == "libxc":
-            libxc.append(base.name)
+            scalar.append(base.name)
         elif kind == "grad":
-            uses_grad = True
+            uses.add("grad")
+        elif kind in ("grad_a", "grad_b"):
+            uses.add(kind)
         elif kind == "basis" and op.code == "lapl_chi":
-            uses_lapl = True
+            uses.add("lapl")
         for _ in range(e):
             subs.append(op.subscript)
             codes.append(op.code)
 
     einsum_str = ",".join(subs) + "->" + out_indices
-    return einsum_str, float(coeff), codes, libxc, (uses_lapl, uses_grad)
+    return einsum_str, float(coeff), codes, scalar, uses
+
+
+def _libxc_sort_key(n: str):
+    if n in LIBXC_MULTISET:
+        return (len(LIBXC_MULTISET[n]), n)
+    # spin component name '<array>_<comp>': order by derivative order then name
+    return (int(n[1]) if n[1].isdigit() else 1, n)
 
 
 def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunction:
     out_indices = "".join(lbl for pair in ki.index_pairs for lbl in pair)
-    nidx = len(out_indices)
 
     terms = sp.Add.make_args(sp.expand(ki.expr))
     lines: List[str] = []
     libxc_used: Dict[str, None] = {}
-    uses_lapl = uses_grad = False
+    uses: set = set()
 
     for term in terms:
-        subs, coeff, codes, libxc, (ul, ug) = _term_einsum(term, out_indices)
+        subs, coeff, codes, libxc, term_uses = _term_einsum(term, out_indices)
         for name in libxc:
             libxc_used.setdefault(name, None)
-        uses_lapl = uses_lapl or ul
-        uses_grad = uses_grad or ug
-        # Reorder operand codes to match the subscript order already built by
-        # _term_einsum (they are parallel lists, so just zip).
+        uses |= term_uses
         operands = ", ".join(codes)
         c = "" if coeff == 1.0 else f"{coeff!r} * "
         lines.append(f"    out += {c}np.einsum('{subs}', {operands})")
 
-    # Libxc args in canonical (order, name) sorting for a stable signature.
-    libxc_args = sorted(libxc_used, key=lambda n: (len(LIBXC_MULTISET[n]), n))
+    libxc_args = sorted(libxc_used, key=_libxc_sort_key)
 
     params = ["w", "chi", "dchi"]
-    if uses_lapl:
+    if "lapl" in uses:
         params.append("lapl_chi")
-    if uses_grad:
+    if "grad" in uses:
         params.append("grad_rho")
+    if "grad_a" in uses:
+        params.append("grad_rho_a")
+    if "grad_b" in uses:
+        params.append("grad_rho_b")
     params += libxc_args
 
-    idx_letters = ", ".join(f"n{c}" for c in out_indices)
     shape = ", ".join("nao" for _ in out_indices)
     header = [
         f"def {func_name}({', '.join(params)}):",
@@ -151,7 +167,9 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
 
     return GeneratedFunction(
         name=func_name, source=source, out_indices=out_indices,
-        libxc_args=libxc_args, uses_lapl_chi=uses_lapl, uses_grad_rho=uses_grad)
+        libxc_args=libxc_args, uses_lapl_chi=("lapl" in uses),
+        uses_grad_rho=("grad" in uses),
+        uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses))
 
 
 def compile_function(gen: GeneratedFunction):

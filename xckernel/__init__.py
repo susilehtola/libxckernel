@@ -14,6 +14,8 @@ from .functional import Functional
 from .fock import FockIntegrand, fock_integrand
 from .deriv import directional_derivative, libxc_deriv_name, libxc_symbol
 from .kernel import KernelIntegrand, kernel_integrand, fock, xc_kernel
+from .spin_kernel import SpinIntegrand, fock_spin, kernel_spin
+from .codegen import GeneratedFunction, generate, compile_function
 
 __all__ = [
     "AXES",
@@ -32,4 +34,10 @@ __all__ = [
     "kernel_integrand",
     "fock",
     "xc_kernel",
+    "SpinIntegrand",
+    "fock_spin",
+    "kernel_spin",
+    "GeneratedFunction",
+    "generate",
+    "compile_function",
 ]
