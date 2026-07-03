@@ -21,7 +21,7 @@ from scipy.linalg import expm
 
 from ..codegen import compile_function, generate
 from ..kernel import fock, xc_kernel
-from ..mo import orbital_hessian
+from ..mo import orbital_gradient, orbital_hessian
 from .validate import (FAMILY_FUNCTIONAL, Grid, ingredients_from_P,
                        libxc_eval, exc_of_P, make_grid)
 
@@ -46,12 +46,13 @@ def _orbitals(nbf: int, nocc: int, occ: float, seed: int):
     return C, P0
 
 
-def exc_of_x(name, family, g: Grid, C, nocc, occ, x) -> float:
+def exc_of_x(name, family, g: Grid, C, nocc, occ, x, sign=-1) -> float:
+    """Exc under the rotation C(x) = C exp(sign * kappa)."""
     nbf = C.shape[0]
     kappa = np.zeros((nbf, nbf))
     kappa[nocc:, :nocc] = x.T          # kappa_ai = x_ia
     kappa[:nocc, nocc:] = -x           # kappa_ia = -x_ia
-    Cx = C @ expm(-kappa)
+    Cx = C @ expm(sign * kappa)
     P = occ * Cx[:, :nocc] @ Cx[:, :nocc].T
     return exc_of_P(name, family, g, P)
 
@@ -94,7 +95,43 @@ def check(family: str, nocc=2, occ=2.0, h=2e-4):
     return err, err / scale
 
 
+def check_gradient(family: str, sign: int, nocc=2, occ=2.0, h=1e-6):
+    """Analytic orbital gradient vs FD of Exc(kappa), per sign convention."""
+    name = FAMILY_FUNCTIONAL[family]
+    g = make_grid(nbf=4, npts=150, seed=5)
+    nbf = g.chi.shape[0]
+    C, P0 = _orbitals(nbf, nocc, occ, seed=6)
+    nvir = nbf - nocc
+
+    ing = ingredients_from_P(g, P0)
+    out = libxc_eval(name, family, ing)
+    gF = generate(fock(family), "F_fn")
+    F = _call(gF, compile_function(gF), g, ing, out)
+    Ga = orbital_gradient(F, C, nocc, occ, sign=sign)
+
+    Gd = np.zeros((nocc, nvir))
+    for i in range(nocc):
+        for a in range(nvir):
+            def E(s):
+                x = np.zeros((nocc, nvir))
+                x[i, a] = s * h
+                return exc_of_x(name, family, g, C, nocc, occ, x, sign=sign)
+            Gd[i, a] = (E(+1) - E(-1)) / (2 * h)
+
+    err = np.max(np.abs(Ga - Gd))
+    scale = np.max(np.abs(Gd)) or 1.0
+    return err, err / scale
+
+
 if __name__ == "__main__":
+    print("XC orbital gradient  dExc/dx_ia  vs FD, both kappa conventions")
+    for fam in ("lda", "gga", "mgga_tau", "mgga"):
+        for sign in (-1, +1):
+            err, rel = check_gradient(fam, sign)
+            print(f"  [{'OK ' if rel < 1e-6 else 'FAIL'}] {fam:9s} "
+                  f"sign={sign:+d} {FAMILY_FUNCTIONAL[fam]:14s} "
+                  f"abs={err:.3e} rel={rel:.3e}")
+
     print("XC orbital Hessian  H_ia,jb = d2Exc/dx_ia dx_jb  vs FD of Exc(kappa)")
     for fam in ("lda", "gga", "mgga_tau", "mgga"):
         err, rel = check(fam)

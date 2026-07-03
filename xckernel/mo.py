@@ -31,14 +31,18 @@ the familiar delta_ij F_ab - delta_ab F_ij structure of orbital Hessians.
 This module only supplies the XC contribution; the host code adds the kinetic,
 nuclear and Coulomb (and exact-exchange) parts of the Hessian itself.
 
-Sign convention of kappa: codes differ between C exp(-kappa) and C exp(+kappa).
-At the expansion point x = 0 the Hessian is *invariant* under kappa -> -kappa
-(the kernel term is quadratic in dP/dx, and d2P/dx2 is the even second-order
-term of exp(-+kappa)), so orbital_hessian deliberately takes no sign argument --
-both conventions yield the identical matrix (verified numerically in
-tests/hessian_validate.py).  The convention only matters for odd-order
-quantities (e.g. the orbital gradient dExc/dx_ia = -+ 2 occ (C^T F C)_ai) or
-away from x = 0; any future gradient helper must expose it.
+Sign convention of kappa: codes differ between C exp(-kappa) and C exp(+kappa);
+we write C(x) = C exp(sign * kappa) with sign = -+1 the caller's convention.
+Only *odd* orders depend on it: the orbital gradient (linear in dP/dx) flips
+sign with the convention, as does any third-order orbital derivative (odd
+overall through dP dP dP and dP d2P terms) -- orbital_gradient therefore takes
+an explicit ``sign``.  At the expansion point x = 0 the *Hessian* is invariant
+under kappa -> -kappa (its kernel term is quadratic in dP/dx, and d2P/dx2 is
+the even second-order term of exp(sign*kappa)), so orbital_hessian deliberately
+takes no sign argument -- both conventions yield the identical matrix (verified
+numerically in tests/hessian_validate.py).  Note the convention lives only in
+this orbital-rotation layer: the AO-basis derivative tower (F_uv, g_uv,ts,
+higher) never involves kappa.
 """
 
 from __future__ import annotations
@@ -56,6 +60,25 @@ def mo_transform(G: np.ndarray, C1: np.ndarray, C2: np.ndarray,
     """
     return np.einsum("uvts,ui,va,tj,sb->iajb", G, C1, C2, C3, C4,
                      optimize=True)
+
+
+def orbital_gradient(F: np.ndarray, C: np.ndarray, nocc: int,
+                     occ: float = 2.0, sign: int = -1) -> np.ndarray:
+    """XC orbital gradient g[i,a] = dExc/dx_ia at x = 0.
+
+    With C(x) = C exp(sign * kappa) the first-order density response is
+    dP/dx_ia = sign * occ (c_a c_i^T + c_i c_a^T), so
+
+        dExc/dx_ia = sign * occ (F~ + F~^T)_ia,   F~ = C^T F C.
+
+    ``sign`` is the caller's exponential convention (-1 for C exp(-kappa),
+    +1 for C exp(+kappa)); unlike the Hessian at x = 0, this first-order
+    quantity depends on it.
+    """
+    if sign not in (-1, +1):
+        raise ValueError("sign must be -1 or +1")
+    Ft = C.T @ F @ C
+    return sign * occ * (Ft[:nocc, nocc:] + Ft[nocc:, :nocc].T)
 
 
 def orbital_hessian(F: np.ndarray, G: np.ndarray, C: np.ndarray,

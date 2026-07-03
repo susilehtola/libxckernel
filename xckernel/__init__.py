@@ -16,7 +16,7 @@ from .deriv import directional_derivative, libxc_deriv_name, libxc_symbol
 from .kernel import KernelIntegrand, kernel_integrand, fock, xc_kernel
 from .spin_kernel import SpinIntegrand, fock_spin, kernel_spin
 from .codegen import GeneratedFunction, generate, compile_function
-from .mo import mo_transform, orbital_hessian
+from .mo import mo_transform, orbital_gradient, orbital_hessian
 
 __all__ = [
     "AXES",
@@ -42,5 +42,6 @@ __all__ = [
     "generate",
     "compile_function",
     "mo_transform",
+    "orbital_gradient",
     "orbital_hessian",
 ]
