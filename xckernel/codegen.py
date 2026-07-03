@@ -41,6 +41,9 @@ _LAPL = re.compile(r"^lapl_chi_(\w+)$")
 _GRAD = re.compile(r"^grad_rho_([xyz])$")
 _GRAD_SPIN = re.compile(r"^grad_rho_([ab])_([xyz])$")
 _LIBXC_SPIN = re.compile(r"^v\w+_\d+$")
+# perturbed fields of the response contraction engine (labels p1, p2, ...)
+_PERT_SCALAR = re.compile(r"^(?:rho|lapl_rho|tau)_(p\d+)$")
+_PERT_GRAD = re.compile(r"^grad_rho_(p\d+)_([xyz])$")
 
 
 @dataclass
@@ -69,6 +72,14 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
             f"grad_{m.group(1)}"
+    m = _PERT_GRAD.match(name)
+    if m:
+        return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+            f"pgrad:{m.group(1)}"
+    m = _PERT_SCALAR.match(name)
+    if m:
+        # each perturbed scalar field is its own (ng,) parameter
+        return Operand(name, "g"), f"pscalar:{name}"
     if name == "w":
         return Operand("w", "g"), "weight"
     if name in LIBXC_MULTISET or _LIBXC_SPIN.match(name):
@@ -87,6 +98,8 @@ class GeneratedFunction:
     uses_grad_rho: bool
     uses_grad_rho_a: bool = False
     uses_grad_rho_b: bool = False
+    pert_grads: List[str] = None      # perturbation labels needing grad_rho_pN
+    pert_scalars: List[str] = None    # perturbed scalar field parameter names
 
 
 def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
@@ -108,6 +121,8 @@ def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
         elif kind == "grad":
             uses.add("grad")
         elif kind in ("grad_a", "grad_b"):
+            uses.add(kind)
+        elif kind.startswith(("pgrad:", "pscalar:")):
             uses.add(kind)
         elif kind == "basis" and op.code == "lapl_chi":
             uses.add("lapl")
@@ -154,6 +169,12 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
         params.append("grad_rho_a")
     if "grad_b" in uses:
         params.append("grad_rho_b")
+    # perturbed fields, grouped per label in sorted order: grad first (3,ng),
+    # then the scalar fields (ng,) sorted by name
+    pert_grads = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pgrad:"))
+    pert_scalars = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pscalar:"))
+    params += [f"grad_rho_{lbl}" for lbl in pert_grads]
+    params += pert_scalars
     params += libxc_args
 
     shape = ", ".join("nao" for _ in out_indices)
@@ -169,7 +190,8 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
         name=func_name, source=source, out_indices=out_indices,
         libxc_args=libxc_args, uses_lapl_chi=("lapl" in uses),
         uses_grad_rho=("grad" in uses),
-        uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses))
+        uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses),
+        pert_grads=pert_grads, pert_scalars=pert_scalars)
 
 
 def compile_function(gen: GeneratedFunction):

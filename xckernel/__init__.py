@@ -17,6 +17,8 @@ from .kernel import KernelIntegrand, kernel_integrand, fock, xc_kernel
 from .spin_kernel import SpinIntegrand, fock_spin, kernel_spin
 from .codegen import GeneratedFunction, generate, compile_function
 from .mo import mo_transform, orbital_gradient, orbital_hessian
+from .response import (ResponseIntegrand, contracted_derivative, pert_field,
+                       perturbed_variable, response_fock)
 
 __all__ = [
     "AXES",
@@ -44,4 +46,9 @@ __all__ = [
     "mo_transform",
     "orbital_gradient",
     "orbital_hessian",
+    "ResponseIntegrand",
+    "contracted_derivative",
+    "pert_field",
+    "perturbed_variable",
+    "response_fock",
 ]
