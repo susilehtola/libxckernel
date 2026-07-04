@@ -251,8 +251,9 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
                       f"{npat:3d} patterns", flush=True)
     elif backend == "c":
-        from .cbackend import (_EVALUATOR_HPP, emit_cmake, emit_f03,
-                               emit_header, emit_kernel_cpp, emit_kernel_hpp)
+        from .cbackend import (_EVALUATOR_HPP, emit_cmake, emit_exc_cpp,
+                               emit_exc_hpp, emit_f03, emit_header,
+                               emit_kernel_cpp, emit_kernel_hpp)
         from .codegen import collapse, generate_collapsed
         (out / "src").mkdir(parents=True, exist_ok=True)
         (out / "include" / "xckernel" / "kernels").mkdir(parents=True,
@@ -260,14 +261,18 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
         (out / "fortran").mkdir(exist_ok=True)
         (out / "include" / "xckernel" / "evaluator.hpp").write_text(
             _EVALUATOR_HPP)
-        names: List[str] = []
+        names: List = []
         for e in entries(families, max_order):
             t0 = time.time()
             if e.order == 0:
+                (out / "include" / "xckernel" / "kernels"
+                 / f"{e.name}.hpp").write_text(emit_exc_hpp(e.name))
+                (out / "src" / f"{e.name}.cpp").write_text(
+                    emit_exc_cpp(e.name))
                 m = manifest_for(e, None)
-                m["emitted"] = False
-                m["note"] = "energy contraction sum(w*rho*zk) is host-side"
+                m["abi"] = "xckernel.h"
                 manifest["kernels"].append(m)
+                names.append((e.name, 0))
                 continue
             ki = _integrand_for(e)
             ck = collapse(ki)
@@ -281,7 +286,7 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
             m["batch"] = False
             m["abi"] = "xckernel.h"
             manifest["kernels"].append(m)
-            names.append(e.name)
+            names.append((e.name, e.order))
             if verbose:
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
                       f"{len(ck.patterns):3d} patterns", flush=True)

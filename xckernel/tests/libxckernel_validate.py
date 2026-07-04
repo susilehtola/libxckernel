@@ -141,8 +141,13 @@ int main() {
         scalL[i].assign(scal[i].begin(), scal[i].end());
         spL[i] = scalL[i].data();
     }
-    xckernel::xck_gga_r_o2_t<long double>(ng, nbf, chiL.data(), dchiL.data(),
-                                          nullptr, spL.data(), outL.data());
+    // T = long double for basis/fields, Txc = double for Libxc arrays
+    const int nfld = ns - 4;   // gga o2: 4 libxc arrays, fields first
+    std::vector<const double*> xcp(sp.begin() + nfld, sp.end());
+    std::vector<const long double*> fldL(spL.begin(), spL.begin() + nfld);
+    xckernel::xck_gga_r_o2_t<long double, double>(
+        ng, nbf, chiL.data(), dchiL.data(), nullptr,
+        fldL.data(), xcp.data(), outL.data());
     long double maxerr = 0.0L;
     for (int i = 0; i < nbf*nbf; i++) {
         long double d = outL[i] - (long double)outd[i];

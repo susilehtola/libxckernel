@@ -181,17 +181,25 @@ namespace xckernel {
  * long double, __float128, or any type with T*T and T+T. Table
  * coefficients are dyadic rationals, exactly representable in binary
  * floating point at any precision. */
-template <typename T>
+/* Operands split by provenance: `fields` (grid weights and density
+ * fields, host-computed, type T) and `xc` (functional-derivative arrays,
+ * type Txc -- Libxc computes in double even when the host works at higher
+ * precision; Txc -> T conversion happens per access, exact when widening).
+ * Factor ids < nfld index `fields`; the rest index `xc`. */
+template <typename T, typename Txc = T>
 XCK_HD inline void stage_a(int64_t npts, int64_t nm,
                            const double* cf, const int32_t* off,
-                           const uint16_t* fid, const T* const* scal,
+                           const uint16_t* fid, int64_t nfld,
+                           const T* const* fields, const Txc* const* xc,
                            T* c) {
     for (int64_t g = 0; g < npts; ++g) {
         T acc = T(0);
         for (int64_t m = 0; m < nm; ++m) {
             T t = T(cf[m]);
-            for (int32_t f = off[m]; f < off[m + 1]; ++f)
-                t *= scal[fid[f]][g];
+            for (int32_t f = off[m]; f < off[m + 1]; ++f) {
+                const uint16_t id = fid[f];
+                t *= (id < nfld) ? fields[id][g] : T(xc[id - nfld][g]);
+            }
             acc += t;
         }
         c[g] = acc;
@@ -249,15 +257,22 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
         lines.append("    " + (",".join(str(f) for f in fids) or "0"))
         lines.append("};")
         pat_meta.append((ip, ufac, vfac, len(monos)))
+    lines.append(f"static constexpr int64_t NFLD = "
+                 f"{len(scal_order(ck)) - len(ck.libxc_args)};")
     lines += [f"}} // namespace {ns}", ""]
 
+    nfld = len(scal_order(ck)) - len(ck.libxc_args)
     lines += [
-        "/* work: caller-provided scratch of npts elements, or nullptr",
-        " * (heap-allocated internally; pass a buffer in device code). */",
-        "template <typename T>",
+        "/* fields: host-computed per-point operands (type T); xc: the",
+        " * functional-derivative arrays (type Txc; Libxc computes in double",
+        " * regardless of T). work: caller scratch of npts elements or",
+        " * nullptr (heap-allocated internally; pass a buffer in device",
+        " * code). */",
+        "template <typename T, typename Txc = T>",
         f"int {name}_t(int64_t npts, int64_t nbf,",
         "             const T* chi, const T* dchi, const T* lapl_chi,",
-        "             const T* const* scal, T* out, T* work = nullptr) {",
+        "             const T* const* fields, const Txc* const* xc,",
+        "             T* out, T* work = nullptr) {",
         "    T* c = work;",
         "    bool own = false;",
         "    if (!c) { c = new (std::nothrow) T[npts]; own = true; }",
@@ -273,8 +288,8 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
                  "dchi[1]": "dchi + (int64_t)1*nbf*npts",
                  "dchi[2]": "dchi + (int64_t)2*nbf*npts"}[vfac]
         lines += [
-            f"    stage_a<T>(npts, {nm}, {ns}::c{ip}, {ns}::o{ip}, "
-            f"{ns}::f{ip}, scal, c);",
+            f"    stage_a<T, Txc>(npts, {nm}, {ns}::c{ip}, {ns}::o{ip}, "
+            f"{ns}::f{ip}, {ns}::NFLD, fields, xc, c);",
             f"    stage_b<T>(npts, nbf, {uexpr}, c, {vexpr}, out);",
         ]
     lines += ["    if (own) delete[] c;", "    return 0;", "}",
@@ -301,13 +316,20 @@ def emit_kernel_cpp(ck: CollapsedKernel, name: str) -> str:
         "};",
         f"extern const int {name}_n_scal;",
         f"const int {name}_n_scal = {len(names)};",
+        f"extern const int {name}_n_fields;",
+        f"const int {name}_n_fields = "
+        f"{len(names) - len(ck.libxc_args)};",
         "",
+        "/* The C ABI keeps one homogeneous scal list (all double);",
+        " * fields come first, functional-derivative arrays last, split at",
+        f" * {name}_n_fields. */",
         f"int {name}(int64_t npts, int64_t nbf,",
         "           const double* chi, const double* dchi,",
         "           const double* lapl_chi,",
         "           const double* const* scal, double* out) {",
-        f"    return xckernel::{name}_t<double>(npts, nbf, chi, dchi,",
-        "                                      lapl_chi, scal, out);",
+        f"    return xckernel::{name}_t<double, double>(",
+        "        npts, nbf, chi, dchi, lapl_chi,",
+        f"        scal, scal + {len(names) - len(ck.libxc_args)}, out);",
         "}",
         "",
         "} // extern C",
@@ -356,10 +378,17 @@ def emit_header(kernel_names: List[str], version: str) -> str:
         f'#define XCKERNEL_VERSION "{version}"',
         "",
     ]
-    for name in kernel_names:
+    for name, order in kernel_names:
+        if order == 0:
+            lines.append(f"double {name}(int64_t npts, const double* w,")
+            lines.append(f"              const double* rho, "
+                         f"const double* zk);")
+            lines.append("")
+            continue
         lines.append(_KERNEL_PROTO.format(name=name))
         lines.append(f"extern const char* {name}_scal_names[];")
         lines.append(f"extern const int {name}_n_scal;")
+        lines.append(f"extern const int {name}_n_fields;")
         lines.append("")
     lines += ["#ifdef __cplusplus", "}", "#endif", "#endif /* XCKERNEL_H */",
               ""]
@@ -380,7 +409,17 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
         "  public",
         "  interface",
     ]
-    for name in kernel_names:
+    for name, order in kernel_names:
+        if order == 0:
+            lines += [
+                f"    real(c_double) function {name}(npts, w, rho, zk) "
+                f"bind(C, name='{name}')",
+                "      import :: c_int64_t, c_double",
+                "      integer(c_int64_t), value :: npts",
+                "      real(c_double), intent(in) :: w(*), rho(*), zk(*)",
+                f"    end function {name}",
+            ]
+            continue
         lines += [
             f"    integer(c_int) function {name}(npts, nbf, chi, dchi, "
             f"lapl_chi, scal, out) bind(C, name='{name}')",
@@ -396,18 +435,35 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
     return "\n".join(lines)
 
 
-def emit_cmake(kernel_names: List[str], version: str) -> str:
-    srcs = "\n    ".join(f"src/{n}.cpp" for n in kernel_names)
+def emit_cmake(kernel_names: List[Tuple[str, int]], version: str) -> str:
+    import re as _re
+    by_order: dict = {}
+    for n, order in kernel_names:
+        by_order.setdefault(order, []).append(n)
+    groups = []
+    for order in sorted(by_order):
+        srcs = "\n        ".join(f"src/{n}.cpp" for n in by_order[order])
+        groups.append(
+            f"if(XCKERNEL_MAX_ORDER GREATER_EQUAL {order})\n"
+            f"    target_sources(xckernel PRIVATE\n        {srcs}\n    )\n"
+            f"endif()")
+    grouped = "\n".join(groups)
     return f"""\
 # libxckernel build. Generated by xckernel; do not edit.
 cmake_minimum_required(VERSION 3.16)
 project(xckernel VERSION {version} LANGUAGES CXX)
 
 option(XCKERNEL_FORTRAN "Build the Fortran interface module" ON)
+# The response-kernel sources grow steeply with derivative order; exclude
+# orders you do not need at configure time (kernels above the limit are
+# declared in the header but not compiled).
+set(XCKERNEL_MAX_ORDER 4 CACHE STRING
+    "Highest derivative order to compile (0-4)")
 
-add_library(xckernel
-    {srcs}
-)
+add_library(xckernel)
+{grouped}
+target_compile_definitions(xckernel PUBLIC
+    XCKERNEL_MAX_ORDER=${{XCKERNEL_MAX_ORDER}})
 set_target_properties(xckernel PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
@@ -439,4 +495,41 @@ if(XCKERNEL_FORTRAN)
 endif()
 install(EXPORT xckernelTargets NAMESPACE xckernel::
     DESTINATION ${{CMAKE_INSTALL_LIBDIR}}/cmake/xckernel)
+"""
+
+
+# --- order-0 (energy) kernels -------------------------------------------------
+
+def emit_exc_hpp(name: str) -> str:
+    return f"""/* generated by xckernel; do not edit. */
+#pragma once
+#include <cstdint>
+#include "xckernel/evaluator.hpp"
+
+namespace xckernel {{
+
+/* Exc = sum_g w_g rho_g zk_g (zk = Libxc energy density per particle).
+ * T: host precision; Txc: the Libxc array type (double from Libxc). */
+template <typename T, typename Txc = T>
+XCK_HD inline T {name}_t(int64_t npts, const T* w, const T* rho,
+                         const Txc* zk) {{
+    T acc = T(0);
+    for (int64_t g = 0; g < npts; ++g) acc += w[g] * rho[g] * T(zk[g]);
+    return acc;
+}}
+
+}} // namespace xckernel
+"""
+
+
+def emit_exc_cpp(name: str) -> str:
+    return f"""/* generated by xckernel; do not edit. */
+#include "xckernel/kernels/{name}.hpp"
+
+extern "C" {{
+double {name}(int64_t npts, const double* w, const double* rho,
+              const double* zk) {{
+    return xckernel::{name}_t<double, double>(npts, w, rho, zk);
+}}
+}} // extern C
 """
