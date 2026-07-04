@@ -579,6 +579,50 @@ NWChem integration wants it.
    (PySCF; psi4numpy-style prototyping) sit on top (layer 3). The compiled
    library never depends on Python.
 
+## Plane-wave and real-space hosts (bulk-surveyed 2026-07-04 via
+## libxcsurvey SURVEY_KIND=kernel; full reports in each repo dir)
+
+Four codes swept: Quantum ESPRESSO, Octopus, GPAW, CP2K. The order-cap
+thesis holds without exception, with literal abort messages at every
+boundary; and the matrix-free consumption model (stage-A coefficient
+fields out; host applies) is confirmed.
+
+* **Quantum ESPRESSO** — fxc/GGA ceiling ("phonon code with meta-GGA ...
+  not yet available"); kxc via `d2mxc`, a standalone hardcoded
+  Perdew-Zunger-LDA function BYPASSING the functional library entirely
+  (Raman/electro-optic silently parametrization-specific); GGA kxc blocked
+  ("third order derivatives not implemented with GGA"); `d3gcxc` (an FD
+  GGA-kxc helper) is DEAD CODE, never called; magnon LR "does not support
+  GGA". Two-sublayer structure (XClib wrappers + LR_Modules
+  setup_dmuxc/setup_dgc precomputation -> dv_of_drho contraction). No
+  generator.
+* **Octopus** — fxc capped ("Only LDA and GGA functionals are allowed for
+  now in XCKernel"), kxc LDA-only ("Only LDA functionals are authorized"),
+  Casida GGA forces blocked, no spinor response, no lxc. Stage A =
+  small hand-written blocks (~15-75 LOC each); stage B = pointwise apply
+  + divergence: the exact fields-out consumer we designed for.
+* **GPAW** — analytic mGGA fxc crash-guarded with a C assert; the analytic
+  fxc Python path effectively dead code; PW-response hard-asserts
+  ALDA-only; kxc/lxc absent. NEW PATTERN: the numerical-DvXC workaround —
+  codes that could not afford the hand derivation pay instead in accuracy
+  and cost per iteration (finite-differencing vxc inside LR-TDDFT).
+* **CP2K** — effectively a FOURTEENTH IN-FAMILY HOST (GTO matrices, PW
+  density grid): ~10,000-LOC hand-written contraction layer across ~10
+  files; fxc good through mGGA incl. singlet/triplet/spin-flip; kxc:
+  "derivatives larger than 2 not implemented" / "analytic third
+  derivative not implemented" for GGA/mGGA/lapl (excited-state gradients
+  partly on FD fallbacks); and its GauXC GPU backend is HARD-BLOCKED from
+  all response paths (reinforcing the GauXC-track opportunity). Prime
+  candidate for a full A+B integration alongside the Gaussian hosts.
+
+Design consequences: (a) ship the **fields-out stage-A variant** of every
+kernel (matrix-free ABI: fields + derivative arrays in -> per-channel
+coefficient fields out) — Octopus/GPAW/QE consumers, and MRChem already
+established the pattern; (b) CP2K joins the in-family integration queue
+with the largest measured hand-written layer; (c) the paper gains the
+numerical-workaround pattern (GPAW) and the hardcoded-parametrization
+hazard (QE d2mxc) as sharpened evidence.
+
 ## Cross-cutting findings from the extended survey (11 hosts total)
 
 1. **The gating prerequisite is the compiled backend** (phases 2-3): four
