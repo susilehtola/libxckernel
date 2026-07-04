@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xckernel"
+version = "0.1.0"
+description = "An automatic-differentiation backend for Libxc: generate arbitrary exchange-correlation kernel elements in LCAO basis sets"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "Susi Lehtola", email = "susilehtola@gmail.com" },
+]
+dependencies = [
+    "sympy>=1.12",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# numerical evaluation of generated code against Libxc
+libxc = ["pylibxc2"]
+# validation suites
+test = ["pyscf>=2.10", "scipy"]
+
+[tool.setuptools.packages.find]
+include = ["xckernel*"]
