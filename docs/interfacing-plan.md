@@ -630,10 +630,18 @@ hazard (QE d2mxc) as sharpened evidence.
    (ChronusQ, MRChem-Eigen, plus Psi4/ERKALE/HelFEM/VeloxChem) all wait on
    it. NumPy serves only PySCF and prototyping.
 2. **Ingredient extensibility is a first-class feature, not a roadmap
-   afterthought**: two hosts need new nonlinearly-mapped ingredient sets
-   (OpenMolcas MC-PDFT Pi; ChronusQ noncollinear (rho, m)). Both are maps
-   (base fields) -> (Libxc variables) whose derivatives the tower must
-   carry — the same mechanism, worth designing once.
+   afterthought** — and it is the project's ORIGINAL MOTIVATION: the push
+   toward modern LOCAL HYBRID functionals, whose position-dependent
+   exact-exchange admixture and calibration functions introduce further
+   ingredients (the exact-exchange energy density — quadratic in P through
+   the nonlocal density matrix; the reduced electronic Hessian /
+   kinetic-energy-density tensor — bilinear in P like tau) and with them
+   whole new families of Fock and response-kernel terms, currently paid
+   for as per-code, per-kernel derivation papers (Kaupp-group
+   implementation series). Define the ingredient once (value + seed) and
+   the tower yields every matrix element mechanically. The same mechanism
+   serves OpenMolcas's MC-PDFT Pi, ChronusQ/DIRAC's noncollinear
+   (rho, m), and any future ingredient class.
 3. **Complex contractions serve two distinct needs**: complex basis
    (HelFEM) and complex densities (ChronusQ GIAO/2c).
 4. **Functional-derivative provenance must be pluggable**: Libxc (most),
