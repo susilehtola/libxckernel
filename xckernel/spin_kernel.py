@@ -111,6 +111,58 @@ def directional_derivative(expr: sp.Expr, family: str, dspin: str,
 
 # --- assembly ---------------------------------------------------------------
 
+# --- response contraction (perturbed-field seeds) ---------------------------
+
+def _pert_grad(spin: str, label: str, ax: str) -> sp.Symbol:
+    return sp.Symbol(f"grad_rho_{spin}_{label}_{ax}", real=True)
+
+
+def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
+    """Perturbed value of a Libxc scalar variable under perturbation ``label``.
+
+    A perturbation carries BOTH spin channels (D^{X,a}, D^{X,b}); the perturbed
+    sigma components mix them: sigma_st^X = grad_s^X . grad_t + grad_s . grad_t^X
+    (which reduces to 2 grad_s . grad_s^X for the same-spin components).
+    """
+    from .basis import AXES
+    if sc.group == "rho":
+        return sp.Symbol(f"rho_{sc.comp}_{label}", real=True)
+    if sc.group == "lapl":
+        return sp.Symbol(f"lapl_rho_{sc.comp}_{label}", real=True)
+    if sc.group == "tau":
+        return sp.Symbol(f"tau_{sc.comp}_{label}", real=True)
+    # sigma
+    from .spin import COMP_SPINS
+    s1, s2 = COMP_SPINS["sigma"][sc.comp]
+    total = sp.Integer(0)
+    for i, ax in enumerate(AXES):
+        total += _pert_grad(s1, label, ax) * GRAD[s2][i] \
+            + GRAD[s1][i] * _pert_grad(s2, label, ax)
+    return total
+
+
+def contracted_derivative(expr: sp.Expr, family: str, label: str) -> sp.Expr:
+    """Apply D_X = sum_s sum_ts D^{X,s}_ts d/dP^s_ts with the contraction
+    folded into spin-resolved perturbed-field symbols."""
+    scalars = family_scalars(family)
+    result = sp.Integer(0)
+    for atom in expr.free_symbols:
+        if atom in _GRAD_INFO:
+            spin, ax = _GRAD_INFO[atom]
+            from .basis import AXES
+            d = _pert_grad(spin, label, AXES[ax])
+        elif atom.name in _SYM_SCALARS:
+            base = _SYM_SCALARS[atom.name]
+            d = sp.Integer(0)
+            for Y in scalars:
+                d += _register(base + (Y,)) * pert_scalar_value(Y, label)
+        else:
+            d = sp.Integer(0)  # basis data, weight, other perturbations' fields
+        if d != 0:
+            result += sp.diff(expr, atom) * d
+    return sp.expand(result)
+
+
 @dataclass
 class SpinIntegrand:
     family: str
@@ -136,3 +188,33 @@ def kernel_spin(family: str, spin1: str, spin2: str,
     fi = fock_spin(family, spin1, u, v)
     expr = directional_derivative(fi.expr, family, spin2, t, s)
     return SpinIntegrand(family, [spin1, spin2], [(u, v), (t, s)], expr)
+
+
+@dataclass
+class SpinResponseIntegrand:
+    """m-th order spin-resolved response Fock integrand: free pair (u,v) in
+    spin channel ``spin``, contracted with perturbations p1..pm (each carrying
+    both spin channels of a perturbed DM pair)."""
+
+    family: str
+    spin: str
+    labels: List[str]
+    index_pairs: List[Tuple[str, str]]
+    expr: sp.Expr
+
+
+def response_fock_spin(family: str, spin: str, order: int = 2,
+                       u: str = "u", v: str = "v") -> SpinResponseIntegrand:
+    """Spin-channel response Fock at a given derivative order.
+
+    order=1: F^s_uv; order=2: the fxc contraction sum_t g^{st} : D^{X,t}
+    (linear response); order=3: quadratic response; etc."""
+    if order < 1:
+        raise ValueError("order must be >= 1")
+    fi = fock_spin(family, spin, u, v)
+    expr = fi.expr
+    labels = [f"p{k}" for k in range(1, order)]
+    for label in labels:
+        expr = contracted_derivative(expr, family, label)
+    return SpinResponseIntegrand(family=family, spin=spin, labels=labels,
+                                 index_pairs=[(u, v)], expr=expr)

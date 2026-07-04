@@ -44,6 +44,9 @@ _LIBXC_SPIN = re.compile(r"^v\w+_\d+$")
 # perturbed fields of the response contraction engine (labels p1, p2, ...)
 _PERT_SCALAR = re.compile(r"^(?:rho|lapl_rho|tau)_(p\d+)$")
 _PERT_GRAD = re.compile(r"^grad_rho_(p\d+)_([xyz])$")
+# spin-resolved perturbed fields (rho_a_p1, grad_rho_a_p1_x, ...)
+_PERT_SCALAR_SPIN = re.compile(r"^(?:rho|lapl_rho|tau)_([ab])_(p\d+)$")
+_PERT_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_(p\d+)_([xyz])$")
 
 
 @dataclass
@@ -76,7 +79,11 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
             f"pgrad:{m.group(1)}"
-    m = _PERT_SCALAR.match(name)
+    m = _PERT_GRAD_SPIN.match(name)
+    if m:
+        lbl = f"{m.group(1)}_{m.group(2)}"
+        return Operand(f"grad_rho_{lbl}[{_AX[m.group(3)]}]", "g"), f"pgrad:{lbl}"
+    m = _PERT_SCALAR.match(name) or _PERT_SCALAR_SPIN.match(name)
     if m:
         # each perturbed scalar field is its own (ng,) parameter
         return Operand(name, "g"), f"pscalar:{name}"
