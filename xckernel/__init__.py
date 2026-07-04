@@ -20,6 +20,8 @@ from .codegen import GeneratedFunction, generate, compile_function
 from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
                        perturbed_variable, response_fock)
+from .algebra import (orbital_rotation_dm, project_ov, tda_sigma,
+                      transition_dm)
 
 __all__ = [
     "AXES",
@@ -55,4 +57,8 @@ __all__ = [
     "pert_field",
     "perturbed_variable",
     "response_fock",
+    "orbital_rotation_dm",
+    "project_ov",
+    "tda_sigma",
+    "transition_dm",
 ]
