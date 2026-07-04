@@ -277,7 +277,15 @@ projector would serve any future MCSCF response work here.
    the worst catalog entry (spin meta-GGA order 4: 130,566 monomials -> 12
    patterns) generates in ~22 s where the sympy.diff path did not finish in
    12 minutes.
-3. **Compiled backend + C ABI** — **first cut DONE** (`cbackend.py`):
+3. **Compiled backend + C ABI** — **libxckernel v0.1.0 BUILDS AND VALIDATES**:
+   `python -m xckernel.catalog <dir> lda,gga,mgga_tau,mgga 4 c` emits the
+   complete source package (84 C kernels + header + xckernel_f03 + CMake +
+   manifest; 23 MB source, 10 s parallel compile, 22.6 MB shared library);
+   ctypes validation vs the NumPy backend at machine precision, including
+   the heaviest kernel (spin mGGA order 4: 130k monomials, 607 scalar
+   operands, rel 6e-16). tests/libxckernel_validate.py exercises the full
+   emit->CMake->load->validate loop. Earlier first-cut notes
+   (`cbackend.py`):
    table-driven C99 emission from the shared `CollapsedKernel` intermediate
    (monomials as static coefficient/factor-id tables + one small fixed
    evaluator, sidestepping both giant inline expressions and CSE); one
