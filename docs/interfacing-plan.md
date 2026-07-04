@@ -235,6 +235,11 @@ projector would serve any future MCSCF response work here.
 | HelFEM | C++ | complex | element block + `bf_ind` | separate Pa, Pb | none (m-blocks) | B2 (complex) |
 | OpenMolcas | Fortran | real | batch `Grid_AO`/`TabAO` (nq_util) | nD=1/2 stacked | `SymAdp_Full` host-side | B2 + C ABI |
 | VeloxChem | Python + C++ | real (Re/Im split) | `mat_chi` blocks (dft_func) | alpha + collapse tables | none (C1) | B1 proto, then B2 |
+| ChronusQ | C++ | real + dcomplex | `double*` point buffers | Pauli spinor (S,Mz,Mx,My) | none | B2 + C++ shim |
+| MRChem | C++ | real | Eigen per-node matrices | R + spin variants | none | B2 (Eigen flavor) |
+| NWChem | Fortran | real | local batch (nq x nbf) | ipol packing | none (GA host-side) | B2/B3 + C ABI |
+| LSDalton | Fortran | real | `GAO(NBLEN,NACTBAST,NTYPSO)` | elms/elmsb | none | B2/B3 + XCFun repack |
+| eT | Fortran | real | batched screened blocks | closed-shell only | none | B3 + C ABI |
 
 ## 6. Phased work plan
 
@@ -270,10 +275,107 @@ independent of each other (parallelizable); 8–9 are largest, are genuinely
 new science-enabling work rather than plumbing, and benefit from the earlier
 phases landing first.
 
-Further hosts under assessment (surveys in flight): ChronusQ (relativistic
-2c/4c — noncollinear magnetization kernels would be a new ingredient set),
-MRChem (multiwavelet — matrix-free, but the pointwise stage-A kernels apply),
-NWChem (large hand-coded functional-derivative library — the historical
-version of what xckernel generates), LSDalton (XCFun-based response — XCFun
-gives raw AD derivatives, the contraction layer is still hand-written), and
-eT (Fortran 2008 OOP).
+## Additional hosts (surveyed 2026-07-04)
+
+### ChronusQ (B2, C++ shim over the C ABI) — effort: medium-to-large
+Boundary already matches: `TwoBodyContraction<T>` (raw `X` in, `AX` out) is
+literally DM-in/Fock-out, LR-TDDFT contracts fxc on the grid behind
+`KohnSham::formFXC` (a 3500-line hand-differentiated header — the prime
+replacement target), and the GauXC switch proves ChronusQ accepts an
+external pointwise XC backend behind a boolean. In-house path is LDA/GGA
+only, fxc-max; **no meta-GGA, no kxc/quadratic response** — all net-new
+value. Two ChronusQ-specific requirements for xckernel:
+1. **Noncollinear-magnetization ingredient set** (2c/4c): variables
+   (ρ, m_x, m_y, m_z, gradients) mapped nonlinearly to Libxc spin variables
+   via |m|, K = m/|m| with a small-|m| regularization branch (JCTC 2017, 13,
+   2591) — a new ingredient class like MC-PDFT's Π; the AD chain must carry
+   the |m|-map derivatives.
+2. **Complex (dcomplex) contraction paths** for GIAO/2-component — complex
+   *densities* (distinct from HelFEM's complex basis), so the complex
+   instantiation serves two hosts.
+Seam: the `mkAuxVar -> loadFXCder -> constructZVarsFXC -> formZ_fxc` middle;
+collocation (`evalDen`) and AO assembly (`formZ`) stay host-side. Buffers
+are plain contiguous `double*`/`dcomplex*` — C-ABI-friendly; a thin C++
+header shim fits the `<MatsT>` templating.
+
+### MRChem (C++/Eigen stage-A kernels) — effort: medium; out-of-family #2
+Multiwavelet, matrix-free — yet the pointwise seam exists *exactly*:
+`Functional::contract_transposed` + the hand-written `xc_mask`/`d_mask`
+chain-rule tables (`xc_utils.cpp`), **hard-capped at order 2 with explicit
+`MSG_ABORT`s for order > 2**. The crispest confirmation of the thesis in
+the whole survey set: MRChem uses XCFun, an AD library that would supply
+derivatives at ANY order — but quadratic/cubic response is absent because
+the *contraction bookkeeping* was never hand-derived. xckernel generates
+precisely that layer. Requirements: a C++/**Eigen** emitter flavor
+(per-node dense matrices in/out), outputs in **grad-rho representation**
+(fold the vsigma->grad-rho chain into the coefficients; MRCPP applies the
+divergence), energy-density convention care (XCFun per-volume vs Libxc
+per-particle), LDA/GGA only (mGGA is rejected host-side). Coordinate with
+the in-flight `FunctionalBackend` refactor, which targets the same seam.
+Payoff: real-space quadratic/cubic response MRChem cannot currently do.
+
+### NWChem (B2/B3 via C ABI at the batch worker) — effort: moderate
+Unusually clean: ALL orders route through one grid driver keyed by
+`calc_type` (SCF=vxc; CPKS/TDDFT fxc = calc_type 2; TDDFT-gradient kxc =
+calc_type 5), with the pointwise contraction + AO assembly in
+`xc_tabcd.F`/`xc_3rd_deriv.F` operating on plain local (nq x nbf) arrays —
+Global Arrays stays entirely host-side. NWChem also has THREE functional
+providers (34 legacy hand-coded fxc files + 18 kxc files; the
+**Maxima-generated `nwxc` library** — NWChem already accepted in-house
+symbolic codegen for the pointwise tower; and a Libxc F03 interface whose
+wrapper is the template for ours). The quantified gap, verbatim from
+`xc_3rd_deriv.F`: *"not yet implemented for meta-GGA functionals"* —
+meta-GGA TDDFT analytic gradients are blocked on exactly the missing
+hand-derived contraction; 4th order absent entirely. Work: map or bypass
+the `Amat*/Cmat*/Mmat*` column-packing macros; clone the Libxc-interface
+wrapper pattern; new/extended `calc_type` for the added orders.
+
+### LSDalton (B2/B3 at the native worker seam) — effort: medium
+Own F90 stack, **XCFun (no Libxc at all)** — the one architectural
+mismatch. The hand-written contraction layer is found precisely:
+`II_dft_ksm_worker.F90` (6540 lines), with the same chain rule duplicated
+per backend (XCFun branch and classic-Dalton-C branch), native response
+capped at kxc, and **no meta-GGA response workers at all**. Marshalling is
+favorable (dense full DMs, ABI-shaped `GAO(NBLEN,NACTBAST,NTYPSO)` batches,
+strong iso_c_binding + CMake external-dependency culture). Design fork to
+resolve: retarget xckernel's functional-symbol registry to XCFun's
+component packing (a manifest repack shim), or add Libxc to LSDalton.
+Note: the OpenRSP/XCint external path already does arbitrary order — the
+native-worker seam adds value without competing with XCint.
+
+### eT (B3 Fortran/C ABI; social wedge) — effort: gated on the compiled backend
+Correction from the survey: the eT-susi checkout is identical to upstream —
+the DFT engine (closed-shell LDA/GGA, Libxc F03, TDDFT with hand-coded fxc
+landed 2026-03) is upstream eT-team code; the fork adds only Libxc CMake
+discovery. The seam is textbook (`construct_ao_W_xc_and_energy_xc`,
+`calculate_td_fxc` — same intermediates xckernel emits), marshalling easy
+(dense AO matrices, batched screened GEMM contraction, iso_c_binding via
+xc_f03 precedent; Cartesian-then-transform convention to match). What
+xckernel adds is everything the young engine lacks: meta-GGA, open shell,
+singlet/triplet, orders 3-4. Adoption needs eT DFT authors' buy-in; the
+clean wedge is offering net-new capability kernels rather than rewriting
+the working LDA/GGA path.
+
+## Cross-cutting findings from the extended survey (11 hosts total)
+
+1. **The gating prerequisite is the compiled backend** (phases 2-3): four
+   Fortran hosts (NWChem, LSDalton, eT, OpenMolcas) and three C++ hosts
+   (ChronusQ, MRChem-Eigen, plus Psi4/ERKALE/HelFEM/VeloxChem) all wait on
+   it. NumPy serves only PySCF and prototyping.
+2. **Ingredient extensibility is a first-class feature, not a roadmap
+   afterthought**: two hosts need new nonlinearly-mapped ingredient sets
+   (OpenMolcas MC-PDFT Pi; ChronusQ noncollinear (rho, m)). Both are maps
+   (base fields) -> (Libxc variables) whose derivatives the tower must
+   carry — the same mechanism, worth designing once.
+3. **Complex contractions serve two distinct needs**: complex basis
+   (HelFEM) and complex densities (ChronusQ GIAO/2c).
+4. **Functional-derivative provenance must be pluggable**: Libxc (most),
+   XCFun (LSDalton mandatory, MRChem optional) — a symbol-registry/manifest
+   repack, not a redesign; NWChem's Amat/Cmat/Mmat is a third packing.
+5. **The order-cap pattern is universal**: every host stops exactly where
+   hand derivation stopped (Psi4 fxc/no-mGGA; ChronusQ fxc; MRChem order 2
+   + aborts; NWChem kxc-no-mGGA; LSDalton kxc, no mGGA response; eT fxc
+   closed-shell; ERKALE LDA-Casida; HelFEM vxc; OpenMolcas vxc). And two
+   communities already accepted generated pointwise code (NWChem's Maxima
+   nwxc; XCFun itself) — the missing piece everywhere is the generated
+   *contraction*, which is xckernel's exact product.
