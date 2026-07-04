@@ -129,6 +129,10 @@ docs/
 `sympy`, `numpy`; `pylibxc` for evaluating anything numerically. The test
 suites additionally use `pyscf` (reference values) and `scipy` (`expm`).
 
+## License
+
+BSD 3-Clause (see `LICENSE`).
+
 ## Status and roadmap
 
 Working and validated: everything in the table. Not yet done: matrix-form

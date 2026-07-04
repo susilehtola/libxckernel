@@ -7,6 +7,8 @@ name = "xckernel"
 version = "0.1.0"
 description = "An automatic-differentiation backend for Libxc: generate arbitrary exchange-correlation kernel elements in LCAO basis sets"
 readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     { name = "Susi Lehtola", email = "susilehtola@gmail.com" },
