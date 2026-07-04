@@ -247,10 +247,19 @@ projector would serve any future MCSCF response work here.
    (`generate_collapsed`, verified bit-identical over 12 kernel classes).
 2. **Catalog + manifest generator**: enumerate §1, emit manifests; NumPy
    backend catalog complete at this point.
-3. **Einsums/C++ backend + C ABI** (real scalar), pinned to Einsums v1.1.x,
-   with a standalone CMake mini-library `libxckernel` and a C test driver
-   validating against the NumPy backend on identical inputs. First action:
-   resolve the TensorView-wraps-external-buffer question (zero-copy ABI).
+3. **Compiled backend + C ABI** (real scalar), now with two flavors and a
+   revised device model:
+   (a) stage-A emitted as a single `__host__ __device__` C++ header
+   (ExchCXX pattern) + thin per-backend launchers -> CPU/CUDA/HIP/SYCL from
+   one emission; stage B via Einsums (pinned v1.1.x; resolve the
+   TensorView-external-buffer question first) or plain BLAS;
+   (b) the standalone CMake `libxckernel` with the C ABI for Fortran hosts;
+   validated against the NumPy backend on identical inputs.
+3b. **GauXC track** (parallel, high leverage): emit `LocalWorkDriver`
+   stage-A kernel bodies (tmat/zmat signatures) for GauXC — fxc parity
+   first (validate against GauXC's own host path), then the net-new
+   kxc/lxc, GKS-fxc, Laplacian-fxc, and HIP-fxc paths; coordinate the
+   ExchCXX KXC/LXC generator extension upstream for the derivative supply.
 4. **PySCF host module** (mostly repackaging existing test wiring).
 5. **Psi4 plugin prototype**: reproduce `compute_Vx` (LDA/GGA) to machine
    precision, then ship the missing meta-GGA path.
@@ -355,6 +364,63 @@ xckernel adds is everything the young engine lacks: meta-GGA, open shell,
 singlet/triplet, orders 3-4. Adoption needs eT DFT authors' buy-in; the
 clean wedge is offering net-new capability kernels rather than rewriting
 the working LDA/GGA path.
+
+## Infrastructure libraries: GauXC and ExchCXX (surveyed 2026-07-04)
+
+These two (Williams-Young/LBNL, NWChemEx-funded) are not hosts but libraries
+in xckernel's own layer — and together they reshape the compiled-backend
+strategy.
+
+### GauXC — the highest-leverage single integration
+GauXC already ships `eval_fxc_contraction` (trial-DM in, Fock-like out) whose
+internals implement **exactly** the stage-A/stage-B pattern: `eval_tmat_*`
+kernels build per-point coefficient vectors from `v2*` arrays x trial fields,
+then GEMM distribution. But those internals are hand-derived, capped at fxc,
+RKS/UKS only (no GKS fxc, Laplacian-fxc throws), and re-implemented
+**three times** (host C++, CUDA, HIP — and HIP has no fxc kernel at all:
+device fxc is CUDA-only today). Steps 1-4 and 6 of its pipeline (load
+balancing, collocation, density-from-DM for arbitrary DMs, distribution) are
+reusable unchanged at ANY derivative order.
+
+**Collaboration shape (preferred): xckernel emits GauXC `LocalWorkDriver`
+stage-A kernel bodies** for host+CUDA+HIP(+SYCL), extending GauXC past its
+2nd-order ceiling to kxc/lxc and filling the GKS-fxc / Laplacian-fxc / HIP
+gaps. In return GauXC provides the entire GPU/CPU pipeline and
+ChronusQ + NWChemEx reach. Caveats: no dynamic pointwise hook exists
+(extension is compile-time via the `LocalWorkDriver` seam — a
+`_kxc_contraction.hpp` sibling is the idiomatic addition); one trial vector
+per call today (no batched multi-trial signature — Dalton's NOSIM lesson
+applies upstream too); and orders >2 need a higher-order derivative
+provider (ExchCXX stops at fxc — see below).
+
+### ExchCXX — fourth provenance at near-zero cost, and a reverse flow
+ExchCXX's builtin kernels are **machine-extracted from Libxc's own
+Maple-generated C** (its `generate_primitive_kernels.py` runs cpp on Libxc
+sources with `XC_DONT_COMPILE_{KXC,LXC}` — the fxc ceiling is a *config
+choice*, not a limitation), so its names, component ordering, and spin
+packing are **Libxc's verbatim**: consuming ExchCXX arrays in generated
+contractions costs nothing at the symbol-registry level. Coverage is larger
+than its README admits (104 builtin kernels incl. SCAN/r2SCAN/TPSS/
+Minnesota/wB97). Device story: kernels written ONCE as `__host__ __device__`
+headers, compiled per backend (CUDA/HIP/SYCL/CPU).
+
+Two consequences:
+1. **The device-portability model for our compiled backend**: emit the
+   stage-A contraction as a single `__host__ __device__` header in ExchCXX's
+   style, with thin per-backend launch wrappers — one emission, all devices.
+   This supersedes "per-backend dialect emission" as the plan of record.
+2. **Reverse flow**: the cheapest way to give the GauXC/ExchCXX ecosystem
+   orders >= 3 is extending ExchCXX's generator command map to stop
+   excluding KXC/LXC (flag upstream first); where Libxc's Maple output is
+   missing or unwieldy, xckernel's symbolic layer can emit
+   `eval_kxc_*_impl` bodies directly into ExchCXX's kernel-traits template
+   (the empty KXC generator macros already define the contract).
+
+**Combined picture**: generated derivatives (ExchCXX, extended) x generated
+contractions (xckernel) x GauXC pipeline = a complete GPU response stack,
+reaching ChronusQ and NWChemEx natively — likely the highest-leverage
+compiled-backend target, ahead of (and complementary to) the standalone
+`libxckernel` C-ABI library that the Fortran hosts still need.
 
 ## Cross-cutting findings from the extended survey (11 hosts total)
 
