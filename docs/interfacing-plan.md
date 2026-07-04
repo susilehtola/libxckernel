@@ -410,6 +410,31 @@ singlet/triplet, orders 3-4. Adoption needs eT DFT authors' buy-in; the
 clean wedge is offering net-new capability kernels rather than rewriting
 the working LDA/GGA path.
 
+### DIRAC (surveyed 2026-07-04) — the code that independently invented us
+The strongest external validation in the survey program: **DIRAC already
+auto-generates its contraction layer** — `src/openrsp/generate_xc_response.py`
+(315 lines of Python 2) emits the unrolled `xc_response_2..5` Fortran over
+XCFun partial-derivative arrays. Facts:
+* XCFun array mode only (`XC_VARS_NS` + taped `XC_D...` indices) — **not**
+  the contracted Taylor mode; no Libxc anywhere in the tree.
+* Two response drivers, one seam: native SDFT (`lr` linear + `sdft_qr`
+  quadratic, hand-coded, capped there) and OpenRSP (generated, to 4th
+  functional derivative but **closed-shell n/z blocks only** — the
+  spin-density/mGGA blocks are disabled because they were never
+  generated). `integrate_xc` is perturbed-DM-in/Fock-out — exactly our
+  contract; grid/AO eval/quaternion Fock distribution stay DIRAC-side.
+* Noncollinear magnetization: s = |m| applied component-wise to the
+  3-vector m, with a separate ALDA/XALDA transverse channel — simpler than
+  ChronusQ's full |m|-map but in the same ingredient family; the
+  quaternion (nz = 1/2/4) real+imag distribution is host-side.
+* What xckernel offers: retire the unmaintained Python-2 generator AND the
+  quadratic-capped native path with one arbitrary-order engine; generate
+  the disabled open-shell/mGGA response blocks; BLAS3/GPU headroom
+  (DIRAC's xc_blas3.F90 shows the appetite); optionally Libxc functional
+  coverage (DIRAC has none). Effort medium-high; the risk item is faithful
+  reproduction of the ALDA/XALDA transverse treatment, and the u-scalar /
+  v-vector output split its distribution consumes.
+
 ## Infrastructure libraries: GauXC and ExchCXX (surveyed 2026-07-04)
 
 These two (Williams-Young/LBNL, NWChemEx-funded) are not hosts but libraries
