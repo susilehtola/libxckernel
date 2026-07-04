@@ -15,7 +15,7 @@ from .fock import FockIntegrand, fock_integrand
 from .deriv import directional_derivative, libxc_deriv_name, libxc_symbol
 from .kernel import KernelIntegrand, kernel_integrand, fock, xc_kernel
 from .spin_kernel import (SpinIntegrand, SpinResponseIntegrand, fock_spin,
-                          kernel_spin, response_fock_spin)
+                          kernel_spin, response_fock_spin, response_fock_st)
 from .codegen import GeneratedFunction, generate, compile_function
 from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
@@ -43,6 +43,7 @@ __all__ = [
     "fock_spin",
     "kernel_spin",
     "response_fock_spin",
+    "response_fock_st",
     "GeneratedFunction",
     "generate",
     "compile_function",

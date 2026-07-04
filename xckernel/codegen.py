@@ -47,6 +47,8 @@ _PERT_GRAD = re.compile(r"^grad_rho_(p\d+)_([xyz])$")
 # spin-resolved perturbed fields (rho_a_p1, grad_rho_a_p1_x, ...)
 _PERT_SCALAR_SPIN = re.compile(r"^(?:rho|lapl_rho|tau)_([ab])_(p\d+)$")
 _PERT_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_(p\d+)_([xyz])$")
+# operand *code* for a perturbed gradient component, e.g. grad_rho_p1[0]
+_PERT_GRAD_CODE = re.compile(r"^grad_rho_(?:[ab]_)?p\d+\[\d\]$")
 
 
 @dataclass
@@ -107,6 +109,7 @@ class GeneratedFunction:
     uses_grad_rho_b: bool = False
     pert_grads: List[str] = None      # perturbation labels needing grad_rho_pN
     pert_scalars: List[str] = None    # perturbed scalar field parameter names
+    batch: bool = False               # perturbed operands carry a batch axis
 
 
 def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
@@ -148,7 +151,16 @@ def _libxc_sort_key(n: str):
     return (int(n[1]) if n[1].isdigit() else 1, n)
 
 
-def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunction:
+def generate(ki: KernelIntegrand, func_name: str = "kernel",
+             batch: bool = False) -> GeneratedFunction:
+    """Generate einsum source for an integrand.
+
+    With ``batch=True`` every perturbed-field operand carries a leading batch
+    axis x (rho_pN: (nx,ng), grad_rho_pN: (nx,3,ng)) shared across all
+    perturbation slots -- the i-th entries pair up, and the output gains a
+    leading batch index (nx, nao, nao). This amortizes basis/ground-state work
+    over many simultaneous perturbations (Dalton's NOSIM batching).
+    """
     out_indices = "".join(lbl for pair in ki.index_pairs for lbl in pair)
 
     terms = sp.Add.make_args(sp.expand(ki.expr))
@@ -161,6 +173,24 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
         for name in libxc:
             libxc_used.setdefault(name, None)
         uses |= term_uses
+        if batch:
+            # add the batch axis to perturbed operands and the output
+            in_subs, out_sub = subs.split("->")
+            parts = in_subs.split(",")
+            new_parts = []
+            any_pert = False
+            for code, sub in zip(codes, parts):
+                if _PERT_SCALAR.match(code) or _PERT_SCALAR_SPIN.match(code) \
+                        or _PERT_GRAD_CODE.match(code):
+                    new_parts.append("x" + sub)
+                    any_pert = True
+                else:
+                    new_parts.append(sub)
+            if any_pert:
+                subs = ",".join(new_parts) + "->x" + out_sub
+            # grad operand indexing: grad_rho_p1[0] -> grad_rho_p1[:, 0]
+            codes = [re.sub(r"^(grad_rho_(?:[ab]_)?p\d+)\[(\d)\]$",
+                            r"\1[:, \2]", c) for c in codes]
         operands = ", ".join(codes)
         c = "" if coeff == 1.0 else f"{coeff!r} * "
         lines.append(f"    out += {c}np.einsum('{subs}', {operands})")
@@ -189,8 +219,16 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
         f"def {func_name}({', '.join(params)}):",
         f"    # F/kernel element with free indices ({', '.join(out_indices)})",
         f"    nao = chi.shape[0]",
-        f"    out = np.zeros(({shape}))",
     ]
+    if batch:
+        if not (pert_scalars or pert_grads):
+            raise ValueError("batch=True requires perturbed-field operands")
+        nx_src = pert_scalars[0] if pert_scalars \
+            else f"grad_rho_{pert_grads[0]}"
+        header += [f"    nx = {nx_src}.shape[0]",
+                   f"    out = np.zeros((nx, {shape}))"]
+    else:
+        header += [f"    out = np.zeros(({shape}))"]
     source = "\n".join(header + lines + ["    return out", ""])
 
     return GeneratedFunction(
@@ -198,7 +236,7 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel") -> GeneratedFunctio
         libxc_args=libxc_args, uses_lapl_chi=("lapl" in uses),
         uses_grad_rho=("grad" in uses),
         uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses),
-        pert_grads=pert_grads, pert_scalars=pert_scalars)
+        pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch)
 
 
 def compile_function(gen: GeneratedFunction):

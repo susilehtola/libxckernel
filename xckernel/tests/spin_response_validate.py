@@ -196,6 +196,68 @@ def check_third_order(family: str):
     return err, err / scale
 
 
+# --- 3. singlet/triplet adaptation vs PySCF nr_rks_fxc_st -------------------
+
+def check_st(family: str, singlet: bool):
+    from pyscf import gto, dft
+    from pyscf.dft import numint
+    from ..spin_kernel import response_fock_st
+
+    xc = {"lda": "LDA_X,", "gga": "PBE"}[family]
+    xctype = {"lda": "LDA", "gga": "GGA"}[family]
+
+    mol = gto.M(atom="O 0 0 0; H 0 0 0.96; H 0 0.93 -0.24", basis="sto-3g",
+                verbose=0)
+    grids = dft.gen_grid.Grids(mol); grids.level = 3; grids.build()
+    mf = dft.RKS(mol); mf.xc = "LDA,VWN"; mf.verbose = 0; mf.kernel()
+    dm = mf.make_rdm1()
+    rng = np.random.default_rng(1)
+    a = rng.standard_normal(dm.shape)
+    dm1 = a + a.T                      # alpha-channel response DM
+
+    deriv = 0 if xctype == "LDA" else 1
+    ao = numint.eval_ao(mol, grids.coords, deriv=deriv)
+    rho = numint.eval_rho(mol, ao, dm, xctype=xctype)
+    # polarized kernel at the closed-shell point (rho/2, rho/2)
+    rho_s = rho * .5
+    exc, vxc, fxc = dft.libxc.eval_xc(xc, (rho_s, rho_s), spin=1, deriv=2)[:3]
+    ng = len(exc)
+
+    def col(arr):
+        arr = np.asarray(arr)
+        return arr if arr.shape[0] == ng else arr.T
+
+    libxc = {}
+    names_v = ["vrho"] if xctype == "LDA" else ["vrho", "vsigma"]
+    names_f = (["v2rho2"] if xctype == "LDA"
+               else ["v2rho2", "v2rhosigma", "v2sigma2"])
+    for name, arr in zip(names_v + names_f, list(vxc[:len(names_v)])
+                         + list(fxc[:len(names_f)])):
+        A = col(arr)
+        for c in range(A.shape[1]):
+            libxc[f"{name}_{c}"] = A[:, c]
+
+    if xctype == "LDA":
+        chi = ao.T; dchi = np.zeros((3,) + chi.shape)
+        base = {"w": grids.weights, "chi": chi, "dchi": dchi}
+    else:
+        chi = ao[0].T; dchi = np.transpose(ao[1:4], (0, 2, 1))
+        base = {"w": grids.weights, "chi": chi, "dchi": dchi,
+                "grad_rho_a": rho[1:4] * .5}   # alpha gradient = half of total
+
+    r1, g1 = _pert_fields(dm1, chi, dchi)
+    pert = {"rho_a_p1": r1, "grad_a_p1": g1}
+
+    gen = generate(response_fock_st(family, 2, (+1 if singlet else -1,)), "st")
+    R = _call(gen, compile_function(gen), base, libxc, pert)
+
+    ni = numint.NumInt()
+    Rref = ni.nr_rks_fxc_st(mol, grids, xc, dm, dm1, singlet=singlet)
+    Rref = np.asarray(Rref).reshape(R.shape)
+    err = np.max(np.abs(R - Rref)); scale = np.max(np.abs(Rref)) or 1
+    return err, err / scale
+
+
 if __name__ == "__main__":
     print("Spin order 2 (fxc) vs PySCF nr_uks_fxc, OH/sto-3g doublet")
     for fam in ("lda", "gga"):
@@ -207,3 +269,10 @@ if __name__ == "__main__":
         err, rel = check_third_order(fam)
         print(f"  [{'OK ' if rel < 1e-4 else 'FAIL'}] {fam:4s} "
               f"abs={err:.3e} rel={rel:.3e}")
+    print("Singlet/triplet adaptation vs PySCF nr_rks_fxc_st, H2O/sto-3g")
+    for fam in ("lda", "gga"):
+        for singlet in (True, False):
+            tag = "singlet" if singlet else "triplet"
+            err, rel = check_st(fam, singlet)
+            print(f"  [{'OK ' if rel < 1e-12 else 'FAIL'}] {fam:4s} {tag:7s} "
+                  f"abs={err:.3e} rel={rel:.3e}")

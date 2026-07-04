@@ -218,3 +218,43 @@ def response_fock_spin(family: str, spin: str, order: int = 2,
         expr = contracted_derivative(expr, family, label)
     return SpinResponseIntegrand(family=family, spin=spin, labels=labels,
                                  index_pairs=[(u, v)], expr=expr)
+
+
+def response_fock_st(family: str, order: int = 2,
+                     parities: Tuple[int, ...] = None,
+                     u: str = "u", v: str = "v") -> SpinResponseIntegrand:
+    """Spin-adapted response Fock from a closed-shell reference.
+
+    Each perturbation carries a spin parity: +1 (singlet-type, D^{X,b} =
+    +D^{X,a}) or -1 (triplet-type, D^{X,b} = -D^{X,a}).  Substituting the
+    parity constraint and the closed-shell ground state (beta fields equal
+    alpha fields) into the alpha-channel spin response produces the
+    singlet/triplet kernel combinations mechanically at any order -- e.g. at
+    order 2 the familiar fxc^{aa} +/- fxc^{ab}, and at order 3 Dalton's
+    spin-parity-bit algebra.  All fields and perturbed fields in the result
+    are ALPHA-channel quantities; the Libxc derivative components are the
+    polarized ones evaluated at the closed-shell density (rho/2, rho/2).
+    """
+    if parities is None:
+        parities = (+1,) * (order - 1)
+    if len(parities) != order - 1:
+        raise ValueError("need one parity per perturbation")
+    if any(p not in (-1, +1) for p in parities):
+        raise ValueError("parities must be +1 (singlet) or -1 (triplet)")
+
+    from .basis import AXES
+    ri = response_fock_spin(family, "a", order, u, v)
+    subs = {}
+    # closed-shell ground state: beta gradient fields -> alpha fields
+    for i in range(3):
+        subs[GRAD["b"][i]] = GRAD["a"][i]
+    # perturbation parity: beta perturbed fields -> parity * alpha fields
+    for label, par in zip(ri.labels, parities):
+        for base in ("rho", "lapl_rho", "tau"):
+            subs[sp.Symbol(f"{base}_b_{label}", real=True)] = \
+                par * sp.Symbol(f"{base}_a_{label}", real=True)
+        for ax in AXES:
+            subs[_pert_grad("b", label, ax)] = par * _pert_grad("a", label, ax)
+    expr = sp.expand(ri.expr.subs(subs, simultaneous=True))
+    return SpinResponseIntegrand(family=family, spin="a", labels=ri.labels,
+                                 index_pairs=[(u, v)], expr=expr)
