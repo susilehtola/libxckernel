@@ -478,12 +478,21 @@ NWChem integration wants it.
    a core maintainer with the meta-GGA response features long promised;
    integration as a standard Psi4 external component like Libxc/Libint/
    gau2grid; the superfunctional.cc triplet-branch tau combinations remain a
-   small in-tree patch, derived from response_fock_st), **ERKALE**
+   small in-tree patch, derived from response_fock_st; psi4numpy is the
+   prototyping/demonstration rung — survey in flight), **ERKALE**
    (all-family Casida), **HelFEM** (complex instantiation + new response
-   module). Other codes adopt on the Libxc trajectory: demonstrably correct,
-   zero-risk to try, dependency-light; vendored blocks remain available as
-   free byproducts of the host-idiom emitters where a maintainer prefers a
-   dependency-free first step.
+   module), and **OpenMolcas** (willing adopter per the user). OpenMolcas
+   adoption runs through the two net-new items its survey identified —
+   generated MC-PDFT translation-layer derivatives (replacing the
+   hand-written Jacobian/Hessian of translatedens.F90, extensible to
+   arbitrary order) and an on-grid MC-PDFT response path built on them —
+   which **promotes the ingredient-extension mechanism (nonlinear maps
+   (rho,Pi) -> functional variables; also serving ChronusQ's noncollinear
+   (rho,m)) from design backlog to scheduled prerequisite.** Other codes
+   adopt on the Libxc trajectory: demonstrably correct, zero-risk to try,
+   dependency-light; vendored blocks remain available as free byproducts of
+   the host-idiom emitters where a maintainer prefers a dependency-free
+   first step.
 2. **Language: C++17 engine, C surface.** Templated over the scalar
    (double / complex<double>: HelFEM complex basis, ChronusQ complex
    densities); single-source __host__ __device__ stage A; constexpr tables.
