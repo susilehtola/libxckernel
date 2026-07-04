@@ -3,7 +3,7 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "xckernel"
+name = "libxckernel"
 version = "0.1.0"
 description = "An automatic-differentiation backend for Libxc: generate arbitrary exchange-correlation kernel elements in LCAO basis sets"
 readme = "README.md"

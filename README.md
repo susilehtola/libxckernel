@@ -1,4 +1,8 @@
-# xckernel
+# libxckernel
+
+> The project (and the generated C library) is **libxckernel**;
+> the Python generator package imports as `xckernel`
+> (as `pylibxc` is to `libxc`).
 
 **An automatic-differentiation backend for [Libxc](https://libxc.gitlab.io/):
 generate arbitrary exchange–correlation kernel elements in LCAO basis sets.**
