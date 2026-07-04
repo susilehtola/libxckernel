@@ -161,6 +161,29 @@ Value: HelFEM currently has NO response module (finite fields only); the
 catalog + a small driver gives fully numerical FEM linear response (atomic
 polarizabilities at the basis-set limit) and beyond, up to 4th order.
 
+### VeloxChem (B2, C++ integrator internals) — effort: medium-large
+VeloxChem's `integrate_{vxc,fxc,kxc,kxclxc}_fock` ladder already *is*
+xckernel's contract (DM lists in, AO Focks out, orders 1–4), so the seam is
+not the API but the internals. The right injection point is between their
+stages: keep the collocation (`SerialDensityGridGenerator`) and the
+distribution (`mat_G` + `serialMultABt`), and replace the middle — the
+~68k lines of `DensityGridQuad/Cubic` pointwise perturbation products, the
+per-property mode strings (`'qrf'`, `'tpa'`, `'thg'`, …16 of them), and the
+closed-shell spin-collapse coefficient tables — with generated stage-A
+coefficient kernels selected by manifest instead of hand-enumerated modes.
+This also removes the known coupling hazard of density-count tables
+duplicated between the Python and C++ layers.
+
+What xckernel adds: triplet nonlinear response (currently absent), uniform
+meta-GGA coverage across orders, new response properties without new C++
+(the mode-string treadmill ends), and 5th order+ if ever wanted. Complex
+(CPP) response: VeloxChem hand-unrolls Re/Im (`prod2_r/prod2_i`); generated
+kernels can either follow that two-real-contractions pattern or use a
+complex instantiation. Caveats: their integrators are MPI/GPU-tuned, so
+this is best done with the VeloxChem developers, and a Python-level
+prototype (their solver layer is Python; swap in NumPy-backend kernels
+behind `_comp_nlr_fock`) can validate the approach before touching C++.
+
 ### OpenMolcas (B2 via C ABI + `ISO_C_BINDING`) — reshaped by the survey
 **Headline finding: OpenMolcas requests only `exc`/`vxc` from Libxc —
 nowhere in the tree is `fxc` or higher called** (only
@@ -211,6 +234,7 @@ projector would serve any future MCSCF response work here.
 | ERKALE | C++ | real | shell-block `bf` (nbf x npts) | separate Pa, Pb | none | B2 |
 | HelFEM | C++ | complex | element block + `bf_ind` | separate Pa, Pb | none (m-blocks) | B2 (complex) |
 | OpenMolcas | Fortran | real | batch `Grid_AO`/`TabAO` (nq_util) | nD=1/2 stacked | `SymAdp_Full` host-side | B2 + C ABI |
+| VeloxChem | Python + C++ | real (Re/Im split) | `mat_chi` blocks (dft_func) | alpha + collapse tables | none (C1) | B1 proto, then B2 |
 
 ## 6. Phased work plan
 
@@ -236,7 +260,20 @@ projector would serve any future MCSCF response work here.
    (fxc+ through the translation map) enabling MC-PDFT linear response —
    a new capability, not an integration.
 
+9. **VeloxChem**: Python-level prototype behind `_comp_nlr_fock` (NumPy
+   backend), then the C++ integrator-internal replacement of
+   DensityGridQuad/Cubic + mode strings, jointly with the VeloxChem
+   developers.
+
 Ordering rationale: 1–3 are the shared substrate; 4 is nearly free; 5–7 are
-independent of each other (parallelizable); 8 is largest, is genuinely new
-science-enabling work rather than plumbing, and benefits from the
-projector/rank-structure items landing first.
+independent of each other (parallelizable); 8–9 are largest, are genuinely
+new science-enabling work rather than plumbing, and benefit from the earlier
+phases landing first.
+
+Further hosts under assessment (surveys in flight): ChronusQ (relativistic
+2c/4c — noncollinear magnetization kernels would be a new ingredient set),
+MRChem (multiwavelet — matrix-free, but the pointwise stage-A kernels apply),
+NWChem (large hand-coded functional-derivative library — the historical
+version of what xckernel generates), LSDalton (XCFun-based response — XCFun
+gives raw AD derivatives, the contraction layer is still hand-written), and
+eT (Fortran 2008 OOP).
