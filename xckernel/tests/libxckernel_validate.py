@@ -80,6 +80,31 @@ def build_and_validate(families=("lda", "gga"), max_order=3,
             if not ok:
                 failures += 1
                 print(f"  [FAIL] {k['name']}")
+
+        # the runtime layer: self-describing dispatch through the same .so
+        from ..runtime import Library
+        rt = Library(str(bld / "libxckernel.so"))
+        name = "xck_gga_r_o2"
+        rng2 = np.random.default_rng(1)
+        chi = rng2.standard_normal((nbf, ng))
+        dchi = rng2.standard_normal((3, nbf, ng))
+        ops = {}
+        for n in rt.scal_names(name):
+            if n == "w":
+                continue
+            base = n[:-2] if n.endswith(("_x", "_y", "_z")) else n
+            if base != n:
+                ops.setdefault(base, rng2.standard_normal((3, ng)))
+            else:
+                ops[n] = rng2.standard_normal(ng)
+        w2 = rng2.uniform(0.1, 1.0, ng)
+        from ..runtime import _NumpyKernel
+        F1 = rt(name, chi=chi, dchi=dchi, w=w2, **ops)
+        F2 = _NumpyKernel(name)(chi=chi, dchi=dchi, w=w2, **ops)
+        tested += 1
+        if not np.allclose(F1, F2, atol=1e-12):
+            failures += 1
+            print("  [FAIL] runtime.Library dispatch")
         return tested, failures
 
 

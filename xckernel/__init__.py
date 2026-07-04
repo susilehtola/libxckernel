@@ -19,6 +19,7 @@ from .spin_kernel import (SpinIntegrand, SpinResponseIntegrand, fock_spin,
 from .codegen import (CollapsedKernel, GeneratedFunction, collapse,
                       compile_function, generate, generate_collapsed)
 from .cbackend import emit_c, scal_order
+from .runtime import Library, get_kernel
 from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
                        perturbed_variable, response_fock)
@@ -54,6 +55,8 @@ __all__ = [
     "collapse",
     "emit_c",
     "scal_order",
+    "Library",
+    "get_kernel",
     "generate",
     "generate_collapsed",
     "compile_function",
