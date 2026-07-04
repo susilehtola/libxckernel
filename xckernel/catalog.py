@@ -199,23 +199,93 @@ def manifest_for(e: CatalogEntry, gen) -> Dict:
 
 # --- builder ------------------------------------------------------------------
 
+def _integrand_for(e: CatalogEntry):
+    """The symbolic integrand behind a (non-energy) catalog entry."""
+    if e.spin == "r":
+        if e.order == 1:
+            from .kernel import fock
+            return fock(e.family)
+        from .response import response_fock
+        return response_fock(e.family, e.order)
+    if e.spin in ("ua", "ub"):
+        s = e.spin[1]
+        if e.order == 1:
+            from .spin_kernel import fock_spin
+            return fock_spin(e.family, s)
+        from .spin_kernel import response_fock_spin
+        return response_fock_spin(e.family, s, e.order)
+    from .spin_kernel import response_fock_st
+    return response_fock_st(e.family, e.order, e.parities)
+
+
+VERSION = "0.1.0"
+
+
 def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
-                  verbose: bool = True) -> Dict:
-    """Generate the full catalog into outdir/kernels/*.py + manifest.json."""
+                  verbose: bool = True, backend: str = "numpy") -> Dict:
+    """Generate the full catalog.
+
+    backend='numpy': outdir/kernels/*.py + manifest.json (batched kernels).
+    backend='c':     the complete libxckernel source package -- outdir/src/*.c,
+                     include/xckernel.h, fortran/xckernel_f03.f90,
+                     CMakeLists.txt, manifest.json. Energy (order-0) entries
+                     are manifest-only in the C package (the contraction
+                     sum(w*rho*zk) is left to the host); response kernels
+                     take one perturbation-batch entry per call.
+    """
     out = Path(outdir)
-    (out / "kernels").mkdir(parents=True, exist_ok=True)
-    manifest: Dict = {"generator": "xckernel", "backend": "numpy",
-                      "max_order": max_order, "kernels": []}
-    for e in entries(families, max_order):
-        t0 = time.time()
-        source, gen = build_entry(e)
-        (out / "kernels" / f"{e.name}.py").write_text(
-            "import numpy as np\n\n" + source)
-        manifest["kernels"].append(manifest_for(e, gen))
-        if verbose:
-            npat = gen.source.count("out +=") if gen else 0
-            print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
-                  f"{npat:3d} patterns", flush=True)
+    manifest: Dict = {"generator": "xckernel", "backend": backend,
+                      "version": VERSION, "max_order": max_order,
+                      "kernels": []}
+
+    if backend == "numpy":
+        (out / "kernels").mkdir(parents=True, exist_ok=True)
+        for e in entries(families, max_order):
+            t0 = time.time()
+            source, gen = build_entry(e)
+            (out / "kernels" / f"{e.name}.py").write_text(
+                "import numpy as np\n\n" + source)
+            manifest["kernels"].append(manifest_for(e, gen))
+            if verbose:
+                npat = gen.source.count("out +=") if gen else 0
+                print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
+                      f"{npat:3d} patterns", flush=True)
+    elif backend == "c":
+        from .cbackend import emit_c, emit_cmake, emit_f03, emit_header
+        from .codegen import collapse, generate_collapsed
+        (out / "src").mkdir(parents=True, exist_ok=True)
+        (out / "include").mkdir(exist_ok=True)
+        (out / "fortran").mkdir(exist_ok=True)
+        names: List[str] = []
+        for e in entries(families, max_order):
+            t0 = time.time()
+            if e.order == 0:
+                m = manifest_for(e, None)
+                m["emitted"] = False
+                m["note"] = "energy contraction sum(w*rho*zk) is host-side"
+                manifest["kernels"].append(m)
+                continue
+            ki = _integrand_for(e)
+            ck = collapse(ki)
+            (out / "src" / f"{e.name}.c").write_text(emit_c(ck, e.name))
+            # manifest from the (unbatched-ABI) generated form
+            gen = generate_collapsed(ki, e.name, batch=False)
+            m = manifest_for(e, gen)
+            m["batch"] = False
+            m["abi"] = "xckernel.h"
+            manifest["kernels"].append(m)
+            names.append(e.name)
+            if verbose:
+                print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
+                      f"{len(ck.patterns):3d} patterns", flush=True)
+        (out / "include" / "xckernel.h").write_text(
+            emit_header(names, VERSION))
+        (out / "fortran" / "xckernel_f03.f90").write_text(
+            emit_f03(names, VERSION))
+        (out / "CMakeLists.txt").write_text(emit_cmake(names, VERSION))
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
+
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1))
     return manifest
 
@@ -225,5 +295,6 @@ if __name__ == "__main__":
     outdir = sys.argv[1] if len(sys.argv) > 1 else "catalog"
     families = sys.argv[2].split(",") if len(sys.argv) > 2 else FAMILIES
     max_order = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-    m = build_catalog(outdir, families, max_order)
-    print(f"{len(m['kernels'])} kernels -> {outdir}/")
+    backend = sys.argv[4] if len(sys.argv) > 4 else "numpy"
+    m = build_catalog(outdir, families, max_order, backend=backend)
+    print(f"{len(m['kernels'])} kernels -> {outdir}/ [{backend}]")
