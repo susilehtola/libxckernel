@@ -82,6 +82,17 @@ def _k_tau(a: Orbital, b: Orbital) -> sp.Expr:
 
 # --- the primitive fields --------------------------------------------------
 
+def _k_jp(ax: int) -> Kernel:
+    # paramagnetic current density j_p = Im(psi* grad psi): a REAL vector
+    # field contracting the ANTISYMMETRIC (imaginary) part of the density
+    # matrix.  Convention: the host passes Im P as a real matrix; the kernel
+    # is the antisymmetric bilinear (1/2)(chi_a d chi_b - d chi_a chi_b).
+    # Zero for a real (current-free) ground state.
+    def kernel(a: Orbital, b: Orbital) -> sp.Expr:
+        return sp.Rational(1, 2) * (a.val * b.grad[ax] - a.grad[ax] * b.val)
+    return kernel
+
+
 RHO = Primitive("rho", sp.Symbol("rho", real=True), _k_rho)
 GRAD_RHO = tuple(
     Primitive(f"grad_rho_{ax}", sp.Symbol(f"grad_rho_{ax}", real=True), _k_grad(i))
@@ -89,10 +100,23 @@ GRAD_RHO = tuple(
 )
 LAPL_RHO = Primitive("lapl_rho", sp.Symbol("lapl_rho", real=True), _k_lapl)
 TAU = Primitive("tau", sp.Symbol("tau", real=True), _k_tau)
+JP = tuple(
+    Primitive(f"jp_{ax}", sp.Symbol(f"jp_{ax}", real=True), _k_jp(i))
+    for i, ax in enumerate(AXES)
+)
+
+# 1/rho as a pseudo-primitive: a host-supplied per-point field whose
+# P-derivative closes rationally, D(inv_rho) = -inv_rho^2 * D(rho).  The seed
+# expression contains field symbols; higher orders differentiate them in turn,
+# so the tower stays polynomial in {fields, seeds} at every order.
+_INV_RHO_SYMBOL = sp.Symbol("inv_rho", real=True)
+INV_RHO = Primitive(
+    "inv_rho", _INV_RHO_SYMBOL,
+    lambda a, b: -_INV_RHO_SYMBOL**2 * a.val * b.val)
 
 #: All primitives keyed by name, for substitution / operand collection.
 PRIMITIVES: Dict[str, Primitive] = {
-    p.name: p for p in (RHO, *GRAD_RHO, LAPL_RHO, TAU)
+    p.name: p for p in (RHO, *GRAD_RHO, LAPL_RHO, TAU, *JP, INV_RHO)
 }
 
 
@@ -137,8 +161,29 @@ def _sigma_seed(u: Orbital, v: Orbital) -> sp.Expr:
 
 SIGMA_ING = Ingredient("sigma", _SIGMA_VALUE, _sigma_seed)
 
+# Gauge-corrected kinetic energy density for current-density DFT:
+#   tau~ = tau - j_p.j_p / (2 rho)
+# (Dobson; Maximoff & Scuseria; Becke).  The functional library is evaluated
+# AT tau~, so a standard Libxc meta-GGA becomes gauge-invariant under magnetic
+# perturbations; the derivative tower below chains through j_p and 1/rho.
+_CTAU_VALUE = TAU.symbol - sp.Rational(1, 2) * INV_RHO.symbol * sum(
+    p.symbol**2 for p in JP)
+
+
+def _ctau_seed(u: Orbital, v: Orbital) -> sp.Expr:
+    total = sp.Integer(0)
+    for p in (TAU, *JP, INV_RHO):
+        total += sp.diff(_CTAU_VALUE, p.symbol) * p.seed(u, v)
+    return sp.expand(total)
+
+
+CTAU_ING = Ingredient("tau", _CTAU_VALUE, _ctau_seed)
+
 
 #: Libxc input variables keyed by name, for chain-rule seeds at any order.
+#: (Default variable set; families may override individual variables with
+#: mapped ingredients such as the gauge-corrected tau -- consumers must use
+#: the Functional's own ingredient list, not this table, when both exist.)
 INGREDIENTS: Dict[str, Ingredient] = {
     "rho": RHO_ING,
     "sigma": SIGMA_ING,
@@ -160,4 +205,7 @@ FAMILIES: Dict[str, List[Ingredient]] = {
     "mgga": [RHO_ING, SIGMA_ING, LAPL_ING, TAU_ING],
     # meta-GGA without the density Laplacian (the common case in Libxc):
     "mgga_tau": [RHO_ING, SIGMA_ING, TAU_ING],
+    # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
+    # tau~ = tau - j_p^2/(2 rho); operands gain jp (3,ng) and inv_rho (ng,).
+    "cmgga_tau": [RHO_ING, SIGMA_ING, CTAU_ING],
 }

@@ -97,16 +97,20 @@ def _atom_derivative(atom: sp.Symbol, func: Functional,
     if prim is not None:
         return prim.seed(u, v)
 
-    # Libxc derivative symbol: bump order by each active variable.
+    # Libxc derivative symbol: bump order by each active variable.  The
+    # ingredient is looked up on the FUNCTIONAL, not the global table, so a
+    # family may map a Libxc variable to a composite ingredient (e.g. the
+    # gauge-corrected tau of current-density DFT).
     ms = LIBXC_MULTISET.get(atom.name)
     if ms is not None:
-        active = {ing.name for ing in func.ingredients}
+        by_name = {ing.name: ing for ing in func.ingredients}
         total = sp.Integer(0)
         for Y in VARS:
-            if Y not in active:
+            ing = by_name.get(Y)
+            if ing is None:
                 continue
             bumped = ms + Counter({Y: 1})
-            total += libxc_symbol(bumped) * INGREDIENTS[Y].seed(u, v)
+            total += libxc_symbol(bumped) * ing.seed(u, v)
         return total
 
     # Basis data (chi, dchi, lapl_chi), weight w: independent of P.

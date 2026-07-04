@@ -55,7 +55,7 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
     for p in ck.params:
         if p in ("chi", "dchi", "lapl_chi"):
             continue
-        if p.startswith("grad_rho"):
+        if p.startswith(("grad_rho", "jp")):
             for ax in ("x", "y", "z"):
                 # grad_rho -> grad_rho_x; grad_rho_a_p1 -> grad_rho_a_p1_x
                 order.append(f"{p}_{ax}")

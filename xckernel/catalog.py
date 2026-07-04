@@ -30,7 +30,10 @@ from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-FAMILIES = ("lda", "gga", "mgga_tau", "mgga")
+FAMILIES = ("lda", "gga", "mgga_tau", "mgga", "cmgga_tau")
+
+#: families whose spin-resolved machinery is not yet wired (unpolarized only).
+UNPOLARIZED_ONLY = {"cmgga_tau"}
 
 #: Libxc input variables per family.
 FAMILY_VARS = {
@@ -38,6 +41,9 @@ FAMILY_VARS = {
     "gga": ["rho", "sigma"],
     "mgga_tau": ["rho", "sigma", "tau"],
     "mgga": ["rho", "sigma", "lapl", "tau"],
+    # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
+    # tau~ = tau - j_p^2/(2 rho); host supplies jp (3,ng) and inv_rho (ng,)
+    "cmgga_tau": ["rho", "sigma", "tau"],
 }
 
 OWNERSHIP = ("xc-only: Coulomb, HF and range-separated exchange are "
@@ -80,6 +86,8 @@ def entries(families=FAMILIES, max_order: int = 4) -> Iterator[CatalogEntry]:
         yield CatalogEntry(fam, "r", 0)                      # exc
         for o in range(1, max_order + 1):                    # unpolarized
             yield CatalogEntry(fam, "r", o, batch=(o >= 2))
+        if fam in UNPOLARIZED_ONLY:
+            continue
         for spin in ("ua", "ub"):                            # unrestricted
             for o in range(1, max_order + 1):
                 yield CatalogEntry(fam, spin, o, batch=(o >= 2))

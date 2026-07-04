@@ -47,8 +47,12 @@ _PERT_GRAD = re.compile(r"^grad_rho_(p\d+)_([xyz])$")
 # spin-resolved perturbed fields (rho_a_p1, grad_rho_a_p1_x, ...)
 _PERT_SCALAR_SPIN = re.compile(r"^(?:rho|lapl_rho|tau)_([ab])_(p\d+)$")
 _PERT_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_(p\d+)_([xyz])$")
-# operand *code* for a perturbed gradient component, e.g. grad_rho_p1[0]
-_PERT_GRAD_CODE = re.compile(r"^grad_rho_(?:[ab]_)?p\d+\[\d\]$")
+# current-density ingredients: jp vector (gs + perturbed) and the inv_rho field
+_JP = re.compile(r"^jp_([xyz])$")
+_PERT_JP = re.compile(r"^jp_(p\d+)_([xyz])$")
+_GS_SCALAR = re.compile(r"^(inv_rho)$")
+# operand *code* for a perturbed vector component, e.g. grad_rho_p1[0]
+_PERT_GRAD_CODE = re.compile(r"^(?:grad_rho|jp)_(?:[ab]_)?p\d+\[\d\]$")
 
 
 @dataclass
@@ -85,6 +89,17 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         lbl = f"{m.group(1)}_{m.group(2)}"
         return Operand(f"grad_rho_{lbl}[{_AX[m.group(3)]}]", "g"), f"pgrad:{lbl}"
+    m = _JP.match(name)
+    if m:
+        return Operand(f"jp[{_AX[m.group(1)]}]", "g"), "jp"
+    m = _PERT_JP.match(name)
+    if m:
+        return Operand(f"jp_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+            f"pjp:{m.group(1)}"
+    m = _GS_SCALAR.match(name)
+    if m:
+        # ground-state scalar field passed as its own (ng,) parameter
+        return Operand(name, "g"), f"gscalar:{name}"
     m = _PERT_SCALAR.match(name) or _PERT_SCALAR_SPIN.match(name)
     if m:
         # each perturbed scalar field is its own (ng,) parameter
@@ -141,9 +156,9 @@ def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
             scalar.append(base.name)
         elif kind == "grad":
             uses.add("grad")
-        elif kind in ("grad_a", "grad_b"):
+        elif kind in ("grad_a", "grad_b", "jp"):
             uses.add(kind)
-        elif kind.startswith(("pgrad:", "pscalar:")):
+        elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "gscalar:")):
             uses.add(kind)
         elif kind == "basis" and op.code == "lapl_chi":
             uses.add("lapl")
@@ -200,7 +215,7 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
             if any_pert:
                 subs = ",".join(new_parts) + "->x" + out_sub
             # grad operand indexing: grad_rho_p1[0] -> grad_rho_p1[:, 0]
-            codes = [re.sub(r"^(grad_rho_(?:[ab]_)?p\d+)\[(\d)\]$",
+            codes = [re.sub(r"^((?:grad_rho|jp)_(?:[ab]_)?p\d+)\[(\d)\]$",
                             r"\1[:, \2]", c) for c in codes]
         operands = ", ".join(codes)
         c = "" if coeff == 1.0 else f"{coeff!r} * "
@@ -219,9 +234,15 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         params.append("grad_rho_b")
     # perturbed fields, grouped per label in sorted order: grad first (3,ng),
     # then the scalar fields (ng,) sorted by name
+    if "jp" in uses:
+        params.append("jp")
+    params += sorted(u.split(":", 1)[1] for u in uses
+                     if u.startswith("gscalar:"))
     pert_grads = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pgrad:"))
     pert_scalars = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pscalar:"))
+    pert_jps = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pjp:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]
+    params += [f"jp_{lbl}" for lbl in pert_jps]
     params += pert_scalars
     params += libxc_args
 
@@ -304,9 +325,10 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                     libxc_used.setdefault(base.name, None)
                 elif kind == "grad":
                     uses.add("grad")
-                elif kind in ("grad_a", "grad_b"):
+                elif kind in ("grad_a", "grad_b", "jp"):
                     uses.add(kind)
-                elif kind.startswith(("pgrad:", "pscalar:")):
+                elif kind.startswith(("pgrad:", "pscalar:", "pjp:",
+                                      "gscalar:")):
                     uses.add(kind)
                 smono.append((base, e))
         if ufac is None or vfac is None:
@@ -332,6 +354,8 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                         if u.startswith("pgrad:"))
     pert_scalars = sorted(u.split(":", 1)[1] for u in uses
                           if u.startswith("pscalar:"))
+    pert_jps = sorted(u.split(":", 1)[1] for u in uses
+                      if u.startswith("pjp:"))
 
     params = ["w", "chi", "dchi"]
     if "lapl" in uses:
@@ -342,7 +366,12 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
         params.append("grad_rho_a")
     if "grad_b" in uses:
         params.append("grad_rho_b")
+    if "jp" in uses:
+        params.append("jp")
+    params += sorted(u.split(":", 1)[1] for u in uses
+                     if u.startswith("gscalar:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]
+    params += [f"jp_{lbl}" for lbl in pert_jps]
     params += pert_scalars
     params += libxc_args
 
@@ -377,7 +406,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     def scalar_code(name: str) -> str:
         op, kind = _classify(name)
         code = op.code
-        if batch and kind.startswith("pgrad:"):
+        if batch and kind.startswith(("pgrad:", "pjp:")):
             code = re.sub(r"\[(\d)\]$", r"[:, \1]", code)
         return code
 

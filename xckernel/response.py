@@ -64,7 +64,34 @@ def pert_field(prim_name: str, label: str) -> sp.Symbol:
         return sp.Symbol(f"lapl_rho_{label}", real=True)
     if prim_name == "tau":
         return sp.Symbol(f"tau_{label}", real=True)
+    if prim_name.startswith("jp_"):
+        ax = prim_name[-1]
+        return sp.Symbol(f"jp_{label}_{ax}", real=True)
     raise ValueError(f"unknown primitive {prim_name!r}")
+
+
+def _pert_atom(prim, label: str) -> sp.Expr:
+    """Perturbation of a primitive-field atom.  Ordinary primitives map to
+    their perturbed-field symbol; the rational pseudo-primitive inv_rho
+    closes through rho: (1/rho)^X = -inv_rho^2 rho^X, so no independent
+    perturbed operand is needed."""
+    if prim.name == "inv_rho":
+        return -prim.symbol**2 * pert_field("rho", label)
+    return pert_field(prim.name, label)
+
+
+def perturbed_ingredient(ing, label: str) -> sp.Expr:
+    """Perturbed value Y^X of a Libxc input variable, generically from the
+    ingredient's value expression: Y^X = sum_p (dY/d p) p^X over the primitive
+    fields p it contains.  Reproduces sigma^X = 2 grad rho . grad rho^X and
+    extends to mapped ingredients (gauge-corrected tau, etc.)."""
+    E = ing.value
+    total = sp.Integer(0)
+    for atom in E.free_symbols:
+        prim = PRIM_BY_SYMBOL.get(atom)
+        if prim is not None:
+            total += sp.diff(E, atom) * _pert_atom(prim, label)
+    return sp.expand(total)
 
 
 def perturbed_variable(var: str, label: str) -> sp.Expr:
@@ -90,21 +117,25 @@ def _seed_fn(func: Functional, label: str):
     from collections import Counter
 
     from .fastpoly import from_expr
-    active = {ing.name for ing in func.ingredients}
+    by_name = {ing.name: ing for ing in func.ingredients}
 
     def seed(atom: sp.Symbol):
         prim = PRIM_BY_SYMBOL.get(atom)
         if prim is not None:
-            # ground-state field -> its perturbed field
-            return {((pert_field(prim.name, label), 1),): sp.Integer(1)}
+            # ground-state field -> its perturbation (rational closure for
+            # inv_rho: no independent operand, folds through rho^X)
+            return from_expr(_pert_atom(prim, label))
         if atom.name in LIBXC_MULTISET:
             # Libxc derivative: bump by each active variable Y, times Y^X
+            # (Y^X derived from the FUNCTIONAL's own ingredient, so mapped
+            # variables like the gauge-corrected tau chain correctly)
             ms = LIBXC_MULTISET[atom.name]
             d = sp.Integer(0)
             for Y in VARS:
-                if Y in active:
+                ing = by_name.get(Y)
+                if ing is not None:
                     d += libxc_symbol(ms + Counter({Y: 1})) \
-                        * perturbed_variable(Y, label)
+                        * perturbed_ingredient(ing, label)
             return from_expr(d)
         return None  # basis data, weight, other perturbations' fields
     return seed
