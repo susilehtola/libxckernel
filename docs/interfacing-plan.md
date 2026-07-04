@@ -471,6 +471,50 @@ Libxc-verbatim on GPU, orders <= 2 today, extendable upstream; **XCFun** =
 order-<= 4 array shim for its native hosts; **nwxc** = packing map only if
 NWChem integration wants it.
 
+## Decisions of record (2026-07-04, with the maintainer)
+
+1. **The library is the product**: package `libxckernel` now; adopt it first
+   in the codes we control or maintain. First adopters: **Psi4** (the user is
+   a core maintainer with the meta-GGA response features long promised;
+   integration as a standard Psi4 external component like Libxc/Libint/
+   gau2grid; the superfunctional.cc triplet-branch tau combinations remain a
+   small in-tree patch, derived from response_fock_st), **ERKALE**
+   (all-family Casida), **HelFEM** (complex instantiation + new response
+   module). Other codes adopt on the Libxc trajectory: demonstrably correct,
+   zero-risk to try, dependency-light; vendored blocks remain available as
+   free byproducts of the host-idiom emitters where a maintainer prefers a
+   dependency-free first step.
+2. **Language: C++17 engine, C surface.** Templated over the scalar
+   (double / complex<double>: HelFEM complex basis, ChronusQ complex
+   densities); single-source __host__ __device__ stage A; constexpr tables.
+   Public ABI: flat extern "C" (+ a generated xckernel_f03 ISO_C_BINDING
+   module, the xc_f03 idiom all four Fortran hosts already use); C++
+   convenience headers for C++ hosts. Precedent: GauXC (C++ core, C API),
+   Libxc (universal C linkability). C++17 not 20 (host toolchain reality).
+3. **Compute backend: no dependency beyond BLAS.** Stage A is generated
+   single-source device-portable code (no library can improve on emitted
+   code); stage B's entire surface is one (batched) GEMM per pattern ->
+   direct cblas / cuBLAS / hipBLAS / oneMKL behind a ~50-line internal
+   dispatch. Eigen3: adapter-level only (Eigen::Map for MRChem), not compute
+   (no production GPU GEMM). Einsums: optional emitter flavor for hosts that
+   want it, never a core dependency (HDF5 requirement, 1.x->2.0 API churn,
+   binary-only einsum, GPU maturity). Note also: in the GauXC and Psi4
+   integrations we do not own stage B at all - hosts distribute.
+4. **Data-model position** (for skeptics): the ABI requires only
+   block-local dense strided arrays of floating point - the one model every
+   surveyed code already implements at the grid-block seam (BLAS forced the
+   convergence decades ago; Libxc's array convention is the adoption
+   precedent). Layout/scalar/batch are manifest-declared parameters;
+   object-model diversity stays host-side in thin adapters; distributed/GPU
+   residency is handled by placing the seam inside the block loop, where
+   data is local in every code.
+5. **Python interface**: the generator package stays pure Python (layer 1);
+   a manifest-driven generic ctypes wrapper discovers and dispatches an
+   installed libxckernel with NumPy-backend fallback (layer 2 - no
+   per-kernel binding code, no compiled Python extension); host modules
+   (PySCF; psi4numpy-style prototyping) sit on top (layer 3). The compiled
+   library never depends on Python.
+
 ## Cross-cutting findings from the extended survey (11 hosts total)
 
 1. **The gating prerequisite is the compiled backend** (phases 2-3): four
