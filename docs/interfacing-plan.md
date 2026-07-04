@@ -124,6 +124,28 @@ arrays transposed once). Value beyond parity: orders 3–4 as first-class
 `vresp`-style closures, which PySCF itself only has buried in TDDFT
 gradients.
 
+### psi4numpy (Python prototyping rung for Psi4) — surveyed 2026-07-04
+All XC content sits in one tutorial directory
+(Tutorials/04_Density_Functional_Theory): hand-written first-order Vxc
+builds for LDA (4b), GGA+mGGA (4c), VV10 (4d), GRAC (4e), plus a reusable
+RKS driver (ks_helper.ks_solver) with a **V_builder callback — the ideal
+injection point for generated kernels**. The repo contains **zero
+second-derivative code**: nothing consumes V_RHO_A_RHO_A etc. (ks_helper
+even allocates deriv=2 and never reads it), and the Response-Theory
+directory is pure HF (CPHF/TDHF/beta/VCD) — the order-cap thesis holds even
+in the tutorial ecosystem. The canonical Python grid-block idiom for our
+adapter is documented there verbatim (Vpot.get_block /
+points_func.compute_points / basis_values()["PHI"...] /
+functions_local_to_global / superfunc.compute_functional).
+
+Plan: (i) parity demos — regenerate the 4b/4c Vxc builds from the catalog
+(each notebook already self-checks against wfn.Va()); (ii) net-new
+tutorials 4f/4g — generated fxc kernels, then an **mGGA TDDFT prototype**
+extending the existing HF TDHF.py machinery with a generated fxc
+contraction. 4g is the public proof of the promised Psi4 capability ahead
+of the C++ VBase integration, and validates the conventions (factor
+placement, singlet adaptation) on Psi4's own grid in pure Python.
+
 ### Psi4 (B2 via plugin) — effort: medium
 Hook point: `VBase::compute_Vx` (libfock/v.cc:1675) — perturbed AO DMs in,
 AO `Vx` out, exactly the catalog's contract. Integration as a Psi4 plugin
