@@ -1,8 +1,9 @@
-"""Quadratic response end-to-end: the XC sigma vector sigma_ia =
-d^3 Exc / db dc dx_ia, assembled by algebra.quadratic_sigma_xc from layer-1
-contractions (orders 1-3) and layer-2 nested-commutator densities, validated
-against pure finite differences of the energy under exp(sign*(b kB + c kC +
-y K_ia)) rotations.  Both sign conventions (odd order => sign matters).
+"""Quadratic and cubic response end-to-end: XC sigma vectors sigma_ia =
+d^{n+1} Exc / dt_1..dt_n dx_ia, assembled by algebra.response_sigma_xc from
+layer-1 contractions (orders 1..n+1) and layer-2 nested-commutator densities,
+validated against Richardson-extrapolated finite differences of the energy
+under exp(sign*(sum t_k kappa_k + y K_ia)) rotations.  Both sign conventions
+(odd total order => sign matters).
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import numpy as np
 from pylibxc import LibXCFunctional
 from scipy.linalg import expm
 
-from ..algebra import quadratic_sigma_xc, unit_rotation
+from ..algebra import quadratic_sigma_xc, response_sigma_xc, unit_rotation
 from ..codegen import compile_function, generate
 from ..kernel import fock
 from ..response import response_fock
@@ -117,10 +118,95 @@ def check(family: str, sign: int, h: float = 1.25e-3):
     return err, err / scale
 
 
+def check_cubic(family: str, sign: int, h: float = 1.25e-3):
+    """Cubic response: sigma_ia = d4Exc/db dc dd dx_ia via response_sigma_xc
+    with contractions up to order 4, vs Richardson-extrapolated 4th-order FD."""
+    nocc, occ = 2, 2.0
+    w, chi, dchi, C, P0, kB, kC = _make_system(nocc=nocc, occ=occ)
+    rng = np.random.default_rng(12)
+    a = rng.standard_normal(C.shape)
+    kD = a - a.T
+    func = LibXCFunctional(NAME[family], "unpolarized")
+
+    def fields(P):
+        rho = np.einsum("uv,ug,vg->g", P, chi, chi)
+        grad = np.einsum("uv,iug,vg->ig", P, dchi, chi) \
+            + np.einsum("uv,ug,ivg->ig", P, chi, dchi)
+        return rho, grad
+
+    def libxc_at(P, **kw):
+        rho, grad = fields(P)
+        inp = {"rho": rho}
+        if "sigma" in VARS[family]:
+            inp["sigma"] = np.einsum("ig,ig->g", grad, grad)
+        out = func.compute(inp, **kw)
+        return {k: v.reshape(-1) for k, v in out.items() if v is not None}
+
+    lib0 = libxc_at(P0, do_fxc=True, do_kxc=True, do_lxc=True)
+    rho0, grad0 = fields(P0)
+
+    gens = {n: generate(response_fock(family, n) if n > 1 else fock(family),
+                        f"g{n}") for n in (1, 2, 3, 4)}
+    fns = {n: compile_function(g) for n, g in gens.items()}
+
+    def fock_contract(Ds):
+        n = len(Ds) + 1
+        gen = gens[n]
+        args = [w, chi, dchi]
+        if gen.uses_grad_rho:
+            args.append(grad0)
+        perts = {f"p{k+1}": dict(zip(("rho", "grad"), fields(D)))
+                 for k, D in enumerate(Ds)}
+        args += [perts[lbl]["grad"] for lbl in (gen.pert_grads or [])]
+        for name in gen.pert_scalars or []:
+            field, lbl = name.rsplit("_", 1)
+            args.append(perts[lbl][field])
+        args += [lib0[name] for name in gen.libxc_args]
+        return fns[n](*args)
+
+    sigma = response_sigma_xc([kB, kC, kD], C, nocc, fock_contract,
+                              occ=occ, sign=sign)
+
+    # ---- FD reference: fourth mixed derivative of the energy ----
+    def exc(P):
+        rho = fields(P)[0]
+        return float(np.sum(w * rho * libxc_at(P, do_exc=True)["zk"]))
+
+    def E(b, c, d, y, K):
+        X = sign * (b * kB + c * kC + d * kD + y * K)
+        Cx = C @ expm(X)
+        return exc(occ * Cx[:, :nocc] @ Cx[:, :nocc].T)
+
+    def fd_at(step, K):
+        tot = 0.0
+        for s in np.ndindex(2, 2, 2, 2):
+            sg = [+1 if b == 0 else -1 for b in s]
+            tot += np.prod(sg) * E(sg[0]*step, sg[1]*step, sg[2]*step,
+                                   sg[3]*step, K)
+        return tot / (16 * step ** 4)
+
+    nvir = C.shape[1] - nocc
+    ref = np.zeros((nocc, nvir))
+    for i in range(nocc):
+        for a_ in range(nvir):
+            K = unit_rotation(i, a_, nocc, C.shape[1])
+            ref[i, a_] = (4 * fd_at(h / 2, K) - fd_at(h, K)) / 3
+
+    err = np.max(np.abs(sigma - ref))
+    scale = np.max(np.abs(ref)) or 1.0
+    return err, err / scale
+
+
 if __name__ == "__main__":
     print("Quadratic-response XC sigma  d3Exc/db dc dx_ia  vs FD of Exc")
     for fam in ("lda", "gga"):
         for sign in (-1, +1):
             err, rel = check(fam, sign)
+            print(f"  [{'OK ' if rel < 1e-4 else 'FAIL'}] {fam:4s} "
+                  f"sign={sign:+d} abs={err:.3e} rel={rel:.3e}")
+    print("Cubic-response XC sigma  d4Exc/db dc dd dx_ia  vs FD of Exc")
+    for fam in ("lda", "gga"):
+        for sign in (-1, +1):
+            err, rel = check_cubic(fam, sign)
             print(f"  [{'OK ' if rel < 1e-4 else 'FAIL'}] {fam:4s} "
                   f"sign={sign:+d} abs={err:.3e} rel={rel:.3e}")

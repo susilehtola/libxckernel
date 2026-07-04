@@ -21,8 +21,8 @@ from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
                        perturbed_variable, response_fock)
 from .algebra import (orbital_rotation_dm, perturbed_dm_order, project_ov,
-                      quadratic_sigma_xc, rpa_sigma, tda_sigma, transition_dm,
-                      unit_rotation)
+                      quadratic_sigma_xc, response_sigma_xc, rpa_sigma,
+                      tda_sigma, transition_dm, unit_rotation)
 
 __all__ = [
     "AXES",
@@ -62,6 +62,7 @@ __all__ = [
     "perturbed_dm_order",
     "project_ov",
     "quadratic_sigma_xc",
+    "response_sigma_xc",
     "rpa_sigma",
     "unit_rotation",
     "tda_sigma",

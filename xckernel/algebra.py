@@ -149,6 +149,72 @@ def unit_rotation(i: int, a: int, nocc: int, nmo: int) -> np.ndarray:
     return K
 
 
+def _set_partitions(items):
+    """All partitions of a list into unordered nonempty blocks."""
+    items = list(items)
+    if not items:
+        yield []
+        return
+    first, rest = items[0], items[1:]
+    for part in _set_partitions(rest):
+        yield [[first]] + part
+        for i in range(len(part)):
+            yield part[:i] + [[first] + part[i]] + part[i + 1:]
+
+
+def response_sigma_xc(kappas, C: np.ndarray, nocc: int, fock_contract,
+                      occ: float = 2.0, sign: int = -1) -> np.ndarray:
+    """XC sigma vector of arbitrary response order,
+    sigma_ia = d^{n+1} Exc / dt_1 ... dt_n dx_ia at 0 for
+    C(x) = C exp(sign * (sum_k t_k kappa_k + sum_ia x_ia K_ia)).
+
+    The Leibniz/Faa-di-Bruno expansion of d^n/dt [ F(P) dP/dx_ia ] gives
+
+      sigma_ia = sum_{S subset of perturbations}
+                 sum_{partitions pi of S}
+                   Tr[ (g_{1+|pi|} : prod_{beta in pi} D^beta)
+                       * d^{|S^c|+1} P(kappa_{S^c}, K_ia) ],
+
+    with D^beta = perturbed_dm_order(block) and g_m the m-th order XC
+    contraction.  n=1 is the linear-response gradient, n=2 quadratic (E[3]),
+    n=3 cubic (E[4]), and so on -- the assembly is the same loop.
+
+    fock_contract(Ds) -> AO matrix: the order-(len(Ds)+1) XC contraction
+    g_{1+m} : D_1 : ... : D_m; an empty list yields the XC Fock matrix.
+    """
+    from itertools import combinations
+    if sign not in (-1, +1):
+        raise ValueError("sign must be -1 or +1")
+    kappas = list(kappas)
+    n = len(kappas)
+    nmo = C.shape[1]
+    nvir = nmo - nocc
+    idx = tuple(range(n))
+
+    # effective Fock matrix per perturbation subset S (Faa di Bruno over S)
+    eff = {}
+    for r in range(n + 1):
+        for S in combinations(idx, r):
+            M = None
+            for part in _set_partitions(S):
+                Ds = [perturbed_dm_order([kappas[j] for j in block], C, nocc,
+                                         occ, sign) for block in part]
+                term = fock_contract(Ds)
+                M = term if M is None else M + term
+            eff[S] = M
+
+    sigma = np.zeros((nocc, nvir))
+    for i in range(nocc):
+        for a in range(nvir):
+            K = unit_rotation(i, a, nocc, nmo)
+            tot = 0.0
+            for S, M in eff.items():
+                rest = [kappas[j] for j in idx if j not in S] + [K]
+                tot += np.sum(M * perturbed_dm_order(rest, C, nocc, occ, sign))
+            sigma[i, a] = tot
+    return sigma
+
+
 def quadratic_sigma_xc(kappa_B: np.ndarray, kappa_C: np.ndarray,
                        C: np.ndarray, nocc: int,
                        fock0, fresp, fresp2,
@@ -173,31 +239,16 @@ def quadratic_sigma_xc(kappa_B: np.ndarray, kappa_C: np.ndarray,
       fresp(D)       -> order-2 contraction  g2 : D        (AO matrix)
       fresp2(D1,D2)  -> order-3 contraction  g3 : D1 : D2  (AO matrix)
 
-    Reference implementation using per-pair traces; a matrix-form lowering
-    (the xi/zeta commutator algebra) is the optimized path for production.
+    Thin wrapper over response_sigma_xc (the arbitrary-order assembly).
     """
-    nmo = C.shape[1]
-    nvir = nmo - nocc
+    def fock_contract(Ds):
+        if len(Ds) == 0:
+            return fock0()
+        if len(Ds) == 1:
+            return fresp(Ds[0])
+        if len(Ds) == 2:
+            return fresp2(Ds[0], Ds[1])
+        raise ValueError("quadratic response needs contractions up to order 3")
 
-    DB = perturbed_dm_order([kappa_B], C, nocc, occ, sign)
-    DC = perturbed_dm_order([kappa_C], C, nocc, occ, sign)
-    DBC = perturbed_dm_order([kappa_B, kappa_C], C, nocc, occ, sign)
-
-    F3 = fresp2(DB, DC) + fresp(DBC)
-    FB = fresp(DB)
-    FC = fresp(DC)
-    F0 = fock0()
-
-    sigma = np.zeros((nocc, nvir))
-    for i in range(nocc):
-        for a in range(nvir):
-            K = unit_rotation(i, a, nocc, nmo)
-            sigma[i, a] = (
-                np.sum(F3 * perturbed_dm_order([K], C, nocc, occ, sign))
-                + np.sum(FB * perturbed_dm_order([kappa_C, K], C, nocc, occ,
-                                                 sign))
-                + np.sum(FC * perturbed_dm_order([kappa_B, K], C, nocc, occ,
-                                                 sign))
-                + np.sum(F0 * perturbed_dm_order([kappa_B, kappa_C, K], C,
-                                                 nocc, occ, sign)))
-    return sigma
+    return response_sigma_xc([kappa_B, kappa_C], C, nocc, fock_contract,
+                             occ=occ, sign=sign)
