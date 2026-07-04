@@ -141,26 +141,35 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     return total
 
 
-def contracted_derivative(expr: sp.Expr, family: str, label: str) -> sp.Expr:
-    """Apply D_X = sum_s sum_ts D^{X,s}_ts d/dP^s_ts with the contraction
-    folded into spin-resolved perturbed-field symbols."""
+def _seed_fn_spin(family: str, label: str):
+    """Monomial-level seed map for the spin engine (fastpoly)."""
+    from .basis import AXES
+    from .fastpoly import from_expr
     scalars = family_scalars(family)
-    result = sp.Integer(0)
-    for atom in expr.free_symbols:
+
+    def seed(atom: sp.Symbol):
         if atom in _GRAD_INFO:
             spin, ax = _GRAD_INFO[atom]
-            from .basis import AXES
-            d = _pert_grad(spin, label, AXES[ax])
-        elif atom.name in _SYM_SCALARS:
+            return {((_pert_grad(spin, label, AXES[ax]), 1),): sp.Integer(1)}
+        if atom.name in _SYM_SCALARS:
             base = _SYM_SCALARS[atom.name]
             d = sp.Integer(0)
             for Y in scalars:
                 d += _register(base + (Y,)) * pert_scalar_value(Y, label)
-        else:
-            d = sp.Integer(0)  # basis data, weight, other perturbations' fields
-        if d != 0:
-            result += sp.diff(expr, atom) * d
-    return sp.expand(result)
+            return from_expr(d)
+        return None  # basis data, weight, other perturbations' fields
+    return seed
+
+
+def contracted_derivative(expr: sp.Expr, family: str, label: str) -> sp.Expr:
+    """Apply D_X = sum_s sum_ts D^{X,s}_ts d/dP^s_ts with the contraction
+    folded into spin-resolved perturbed-field symbols.
+
+    Implemented monomial-wise (fastpoly); the generic sympy.diff path is
+    intractable at high order."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    return to_expr(seeded_derivative(from_expr(expr),
+                                     _seed_fn_spin(family, label)))
 
 
 @dataclass
@@ -211,13 +220,14 @@ def response_fock_spin(family: str, spin: str, order: int = 2,
     (linear response); order=3: quadratic response; etc."""
     if order < 1:
         raise ValueError("order must be >= 1")
+    from .fastpoly import from_expr, seeded_derivative, to_expr
     fi = fock_spin(family, spin, u, v)
-    expr = fi.expr
     labels = [f"p{k}" for k in range(1, order)]
+    poly = from_expr(fi.expr)
     for label in labels:
-        expr = contracted_derivative(expr, family, label)
+        poly = seeded_derivative(poly, _seed_fn_spin(family, label))
     return SpinResponseIntegrand(family=family, spin=spin, labels=labels,
-                                 index_pairs=[(u, v)], expr=expr)
+                                 index_pairs=[(u, v)], expr=to_expr(poly))
 
 
 def response_fock_st(family: str, order: int = 2,

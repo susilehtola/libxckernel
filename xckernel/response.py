@@ -85,32 +85,40 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
     raise ValueError(f"unknown libxc variable {var!r}")
 
 
-def contracted_derivative(expr: sp.Expr, func: Functional,
-                          label: str) -> sp.Expr:
-    """Apply D_X = sum_ts D^X_ts d/dP_ts to an integrand, with the contraction
-    folded into perturbed-field symbols labelled ``label``."""
+def _seed_fn(func: Functional, label: str):
+    """Monomial-level seed map for fastpoly.seeded_derivative."""
+    from collections import Counter
+
+    from .fastpoly import from_expr
     active = {ing.name for ing in func.ingredients}
-    result = sp.Integer(0)
-    for atom in expr.free_symbols:
+
+    def seed(atom: sp.Symbol):
         prim = PRIM_BY_SYMBOL.get(atom)
         if prim is not None:
             # ground-state field -> its perturbed field
-            d = pert_field(prim.name, label)
-        elif atom.name in LIBXC_MULTISET:
+            return {((pert_field(prim.name, label), 1),): sp.Integer(1)}
+        if atom.name in LIBXC_MULTISET:
             # Libxc derivative: bump by each active variable Y, times Y^X
             ms = LIBXC_MULTISET[atom.name]
             d = sp.Integer(0)
             for Y in VARS:
                 if Y in active:
-                    from collections import Counter
                     d += libxc_symbol(ms + Counter({Y: 1})) \
                         * perturbed_variable(Y, label)
-        else:
-            # basis data, weight, or another perturbation's field: constant
-            d = sp.Integer(0)
-        if d != 0:
-            result += sp.diff(expr, atom) * d
-    return sp.expand(result)
+            return from_expr(d)
+        return None  # basis data, weight, other perturbations' fields
+    return seed
+
+
+def contracted_derivative(expr: sp.Expr, func: Functional,
+                          label: str) -> sp.Expr:
+    """Apply D_X = sum_ts D^X_ts d/dP_ts to an integrand, with the contraction
+    folded into perturbed-field symbols labelled ``label``.
+
+    Implemented monomial-wise (fastpoly) -- the generic sympy.diff-per-atom
+    path is intractable for high-order kernels."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    return to_expr(seeded_derivative(from_expr(expr), _seed_fn(func, label)))
 
 
 @dataclass
@@ -134,11 +142,12 @@ def response_fock(family: str, order: int = 2,
     """
     if order < 1:
         raise ValueError("order must be >= 1")
+    from .fastpoly import from_expr, seeded_derivative, to_expr
     fi = fock_integrand(family, u, v)
     func = fi.functional
-    expr = fi.expr
     labels = [f"p{k}" for k in range(1, order)]
+    poly = from_expr(fi.expr)
     for label in labels:
-        expr = contracted_derivative(expr, func, label)
+        poly = seeded_derivative(poly, _seed_fn(func, label))
     return ResponseIntegrand(functional=func, labels=labels,
-                             index_pairs=[(u, v)], expr=expr)
+                             index_pairs=[(u, v)], expr=to_expr(poly))
