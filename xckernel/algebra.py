@@ -78,3 +78,63 @@ def tda_sigma(zs: np.ndarray, e_ia: np.ndarray, Co: np.ndarray,
     for k, z in enumerate(zs):
         out[k] = e_ia * z + project_ov(v1[k], Co, Cv)
     return out
+
+
+def rpa_sigma(xys: np.ndarray, e_ia: np.ndarray, Co: np.ndarray,
+              Cv: np.ndarray, vresp, occ: float = 2.0) -> np.ndarray:
+    """Full RPA/TDHF sigma vectors: the action of [[A, B], [-B, -A]] on (X, Y)
+    for real orbitals.
+
+    The (X, Y) pair enters through ONE AO density matrix per vector,
+        dm = occ (C_v X^T C_o^T + C_o Y C_v^T),
+    (the Y block is the transpose slot), so a single vresp call serves both
+    blocks; the result is projected two ways:
+        top    (A X + B Y)_ia = e_ia X_ia + (C_o^T V^T C_v)_ia
+        bottom (B X + A Y)_ia = e_ia Y_ia + (C_o^T V   C_v)_ia
+    and the bottom is negated per the [[A,B],[-B,-A]] supervector convention.
+
+    xys: (nz, 2, nocc, nvir).  Returns the same shape.
+    """
+    xys = np.asarray(xys)
+    dms = np.array([transition_dm(x, Co, Cv, occ)
+                    + occ * (Co @ y @ Cv.T) for x, y in xys])
+    v1 = vresp(dms)
+    out = np.empty_like(xys)
+    for k, (x, y) in enumerate(xys):
+        out[k, 0] = e_ia * x + project_ov(v1[k], Co, Cv)      # A X + B Y
+        out[k, 1] = -(e_ia * y + Co.T @ v1[k] @ Cv)           # -(B X + A Y)
+    return out
+
+
+def perturbed_dm_order(kappas, C: np.ndarray, nocc: int,
+                       occ: float = 2.0, sign: int = -1) -> np.ndarray:
+    """Mixed n-th order density response to C(x) = C exp(sign * sum_i x_i k_i).
+
+    Returns  d^n P / dx_1 ... dx_n  at x = 0, which by the BCH expansion of
+    e^{K} Pi e^{-K} is the permutation-symmetrized nested commutator
+
+        sign^n / n! * occ * C [ sum_perm [k_p1, [k_p2, ... [k_pn, Pi]]] ] C^T.
+
+    This is the universal higher-order perturbed-density builder (survey S2):
+    at n=1 it reduces to orbital_rotation_dm; at n=2 it is the mathematical
+    content of VeloxChem's D_bc = [k_b, D_c] + [k_c, D_b] and Dalton's
+    commute_d_x chains (up to each code's normalization convention, which is
+    why the factor here is the *true mixed derivative* -- adapters rescale).
+    """
+    from itertools import permutations
+    from math import factorial
+    if sign not in (-1, +1):
+        raise ValueError("sign must be -1 or +1")
+    kappas = list(kappas)
+    n = len(kappas)
+    Pi = np.zeros((C.shape[1], C.shape[1]))
+    Pi[:nocc, :nocc] = np.eye(nocc)
+    total = np.zeros_like(Pi)
+    for perm in permutations(range(n)):
+        M = Pi
+        for idx in reversed(perm):
+            k = kappas[idx]
+            M = k @ M - M @ k
+        total += M
+    fac = (sign ** n) / factorial(n)
+    return fac * occ * (C @ total @ C.T)

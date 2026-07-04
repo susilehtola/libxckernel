@@ -1,4 +1,4 @@
-"""End-to-end layer-2 validation: reproduce PySCF's TDA sigma vector.
+"""End-to-end layer-2 validation: reproduce PySCF's TDA and RPA sigma vectors.
 
 (A z)_ia = (e_a - e_i) z_ia + [2(ia|jb) + (ia|fxc_singlet|jb)] z_jb
 
@@ -13,12 +13,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..algebra import tda_sigma
+from ..algebra import perturbed_dm_order, rpa_sigma, tda_sigma
 from ..codegen import compile_function, generate
 from ..spin_kernel import response_fock_st
 
 
-def check_tda(family: str, nz: int = 3):
+def _setup(family: str):
+    """Converged RKS + grid data + polarized Libxc arrays + vresp closure."""
     from pyscf import gto, dft
     from pyscf.dft import numint
 
@@ -29,13 +30,6 @@ def check_tda(family: str, nz: int = 3):
                 verbose=0)
     mf = dft.RKS(mol); mf.xc = xc; mf.verbose = 0; mf.kernel()
 
-    mo_occ = mf.mo_occ
-    Co = mf.mo_coeff[:, mo_occ > 0]
-    Cv = mf.mo_coeff[:, mo_occ == 0]
-    nocc, nvir = Co.shape[1], Cv.shape[1]
-    e_ia = mf.mo_energy[mo_occ == 0] - mf.mo_energy[mo_occ > 0, None]
-
-    # ---- grid data + polarized Libxc arrays at the closed-shell point ----
     grids = mf.grids
     deriv = 0 if xctype == "LDA" else 1
     ao = numint.eval_ao(mol, grids.coords, deriv=deriv)
@@ -64,7 +58,6 @@ def check_tda(family: str, nz: int = 3):
     else:
         chi = ao[0].T; dchi = np.transpose(ao[1:4], (0, 2, 1))
 
-    # ---- batched singlet fxc contraction (layer 1) ----
     gen = generate(response_fock_st(family, 2, (+1,)), "st", batch=True)
     fn = compile_function(gen)
 
@@ -86,7 +79,17 @@ def check_tda(family: str, nz: int = 3):
         # PySCF convention: the singlet kernel is halved (alpha+beta folding)
         return vj + 0.5 * vxc_st(dms)
 
-    # ---- compare against PySCF's own TDA sigma ----
+    return mol, mf, vresp
+
+
+def check_tda(family: str, nz: int = 3):
+    mol, mf, vresp = _setup(family)
+    mo_occ = mf.mo_occ
+    Co = mf.mo_coeff[:, mo_occ > 0]
+    Cv = mf.mo_coeff[:, mo_occ == 0]
+    nocc, nvir = Co.shape[1], Cv.shape[1]
+    e_ia = mf.mo_energy[mo_occ == 0] - mf.mo_energy[mo_occ > 0, None]
+
     td = mf.TDA(); td.singlet = True
     vind, hdiag = td.gen_vind(mf)
 
@@ -99,9 +102,78 @@ def check_tda(family: str, nz: int = 3):
     return err, err / scale
 
 
+def check_rpa(family: str, nz: int = 3):
+    mol, mf, vresp = _setup(family)
+    mo_occ = mf.mo_occ
+    Co = mf.mo_coeff[:, mo_occ > 0]
+    Cv = mf.mo_coeff[:, mo_occ == 0]
+    nocc, nvir = Co.shape[1], Cv.shape[1]
+    e_ia = mf.mo_energy[mo_occ == 0] - mf.mo_energy[mo_occ > 0, None]
+
+    # NOTE: mf.TDDFT() for pure functionals is TDDFTNoHybrid, whose gen_vind
+    # implements the Casida (A-B)^1/2(A+B)(A-B)^1/2 product, not the
+    # supervector. gen_tdhf_operation is the [[A,B],[-B,-A]] reference.
+    from pyscf.tdscf.rhf import gen_tdhf_operation
+    vind, hdiag = gen_tdhf_operation(mf, singlet=True)
+
+    rng = np.random.default_rng(5)
+    xys = rng.standard_normal((nz, 2, nocc, nvir))
+    ref = vind(xys.reshape(nz, -1)).reshape(nz, 2, nocc, nvir)
+    ours = rpa_sigma(xys, e_ia, Co, Cv, vresp)
+
+    err = np.max(np.abs(ours - ref)); scale = np.max(np.abs(ref)) or 1
+    return err, err / scale
+
+
+def check_commutator_dm(order: int, h: float = 5e-4):
+    """perturbed_dm_order vs FD of P(x) = occ C(x)_occ C(x)_occ^T with
+    C(x) = C exp(sign * sum x_i kappa_i), for both sign conventions."""
+    from scipy.linalg import expm
+    rng = np.random.default_rng(8)
+    nbf, nocc, occ = 5, 2, 2.0
+    C, _ = np.linalg.qr(rng.standard_normal((nbf, nbf)))
+
+    def antisym():
+        a = rng.standard_normal((nbf, nbf))
+        return a - a.T
+
+    kappas = [antisym() for _ in range(order)]
+
+    worst = 0.0
+    for sign in (-1, +1):
+        def P_of(x):
+            K = sign * sum(xi * k for xi, k in zip(x, kappas))
+            Cx = C @ expm(K)
+            return occ * Cx[:, :nocc] @ Cx[:, :nocc].T
+
+        # mixed central FD over all `order` directions
+        fd = np.zeros((nbf, nbf))
+        for signs in np.ndindex(*(2,) * order):
+            s = np.array([+1 if b == 0 else -1 for b in signs], dtype=float)
+            fd += np.prod(s) * P_of(s * h)
+        fd /= (2 * h) ** order
+
+        ana = perturbed_dm_order(kappas, C, nocc, occ, sign=sign)
+        err = np.max(np.abs(ana - fd))
+        scale = np.max(np.abs(fd)) or 1
+        worst = max(worst, err / scale)
+    return worst
+
+
 if __name__ == "__main__":
     print("TDA sigma vector (A z) vs PySCF TDA.gen_vind, H2O/sto-3g")
     for fam in ("lda", "gga"):
         err, rel = check_tda(fam)
         print(f"  [{'OK ' if rel < 1e-12 else 'FAIL'}] {fam:4s} "
               f"abs={err:.3e} rel={rel:.3e}")
+    print("RPA sigma vector [[A,B],[-B,-A]](X,Y) vs PySCF TDDFT.gen_vind")
+    for fam in ("lda", "gga"):
+        err, rel = check_rpa(fam)
+        print(f"  [{'OK ' if rel < 1e-12 else 'FAIL'}] {fam:4s} "
+              f"abs={err:.3e} rel={rel:.3e}")
+    print("Nested-commutator perturbed DM vs FD of expm, orders 1-3, both signs")
+    for order in (1, 2, 3):
+        rel = check_commutator_dm(order)
+        # FD-truncation-limited (verified h^2 scaling)
+        print(f"  [{'OK ' if rel < 1e-4 else 'FAIL'}] order {order} "
+              f"max_rel={rel:.3e}")
