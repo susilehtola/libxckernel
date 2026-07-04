@@ -138,3 +138,66 @@ def perturbed_dm_order(kappas, C: np.ndarray, nocc: int,
         total += M
     fac = (sign ** n) / factorial(n)
     return fac * occ * (C @ total @ C.T)
+
+
+def unit_rotation(i: int, a: int, nocc: int, nmo: int) -> np.ndarray:
+    """The antisymmetric unit generator K_ia = e_a e_i^T - e_i e_a^T
+    (a counted within the virtual block)."""
+    K = np.zeros((nmo, nmo))
+    K[nocc + a, i] = 1.0
+    K[i, nocc + a] = -1.0
+    return K
+
+
+def quadratic_sigma_xc(kappa_B: np.ndarray, kappa_C: np.ndarray,
+                       C: np.ndarray, nocc: int,
+                       fock0, fresp, fresp2,
+                       occ: float = 2.0, sign: int = -1) -> np.ndarray:
+    """XC part of the quadratic-response sigma vector,
+    sigma_ia = d^3 Exc / db dc dx_ia at 0 for C(x) = C exp(sign*(b kB + c kC
+    + sum x_ia K_ia)).
+
+    Assembled purely from the derivative tower and the nested-commutator
+    density builder -- the total-derivative identity
+
+      sigma_ia = Tr[F3^{BC} dP(K)] + Tr[F^B d2P(kC,K)] + Tr[F^C d2P(kB,K)]
+               + Tr[F0 d3P(kB,kC,K)],
+      F3^{BC}  = g3[D^B, D^C] + g2[D^{BC}]
+
+    reproduces the closed forms every surveyed code hand-derives (VeloxChem's
+    xi/zeta, Dalton's Q3FOCK one-index chains) without deriving them: each
+    trace term IS one of those contributions.
+
+    Callables supplied by the host (layer 1 provides the XC ones):
+      fock0()        -> AO XC Fock matrix at the reference density
+      fresp(D)       -> order-2 contraction  g2 : D        (AO matrix)
+      fresp2(D1,D2)  -> order-3 contraction  g3 : D1 : D2  (AO matrix)
+
+    Reference implementation using per-pair traces; a matrix-form lowering
+    (the xi/zeta commutator algebra) is the optimized path for production.
+    """
+    nmo = C.shape[1]
+    nvir = nmo - nocc
+
+    DB = perturbed_dm_order([kappa_B], C, nocc, occ, sign)
+    DC = perturbed_dm_order([kappa_C], C, nocc, occ, sign)
+    DBC = perturbed_dm_order([kappa_B, kappa_C], C, nocc, occ, sign)
+
+    F3 = fresp2(DB, DC) + fresp(DBC)
+    FB = fresp(DB)
+    FC = fresp(DC)
+    F0 = fock0()
+
+    sigma = np.zeros((nocc, nvir))
+    for i in range(nocc):
+        for a in range(nvir):
+            K = unit_rotation(i, a, nocc, nmo)
+            sigma[i, a] = (
+                np.sum(F3 * perturbed_dm_order([K], C, nocc, occ, sign))
+                + np.sum(FB * perturbed_dm_order([kappa_C, K], C, nocc, occ,
+                                                 sign))
+                + np.sum(FC * perturbed_dm_order([kappa_B, K], C, nocc, occ,
+                                                 sign))
+                + np.sum(F0 * perturbed_dm_order([kappa_B, kappa_C, K], C,
+                                                 nocc, occ, sign)))
+    return sigma
