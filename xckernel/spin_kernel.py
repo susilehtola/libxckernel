@@ -203,13 +203,23 @@ def kernel_spin(family: str, spin1: str, spin2: str,
 class SpinResponseIntegrand:
     """m-th order spin-resolved response Fock integrand: free pair (u,v) in
     spin channel ``spin``, contracted with perturbations p1..pm (each carrying
-    both spin channels of a perturbed DM pair)."""
+    both spin channels of a perturbed DM pair).
+
+    Carries the monomial dictionary (``poly``); ``expr`` materialized lazily."""
 
     family: str
     spin: str
     labels: List[str]
     index_pairs: List[Tuple[str, str]]
-    expr: sp.Expr
+    _expr: "sp.Expr | None" = None
+    poly: "dict | None" = None
+
+    @property
+    def expr(self) -> sp.Expr:
+        if self._expr is None and self.poly is not None:
+            from .fastpoly import to_expr
+            self._expr = to_expr(self.poly)
+        return self._expr
 
 
 def response_fock_spin(family: str, spin: str, order: int = 2,
@@ -227,7 +237,7 @@ def response_fock_spin(family: str, spin: str, order: int = 2,
     for label in labels:
         poly = seeded_derivative(poly, _seed_fn_spin(family, label))
     return SpinResponseIntegrand(family=family, spin=spin, labels=labels,
-                                 index_pairs=[(u, v)], expr=to_expr(poly))
+                                 index_pairs=[(u, v)], poly=poly)
 
 
 def response_fock_st(family: str, order: int = 2,
@@ -253,18 +263,20 @@ def response_fock_st(family: str, order: int = 2,
         raise ValueError("parities must be +1 (singlet) or -1 (triplet)")
 
     from .basis import AXES
+    from .fastpoly import subs_signed
     ri = response_fock_spin(family, "a", order, u, v)
-    subs = {}
+    mapping = {}
     # closed-shell ground state: beta gradient fields -> alpha fields
     for i in range(3):
-        subs[GRAD["b"][i]] = GRAD["a"][i]
+        mapping[GRAD["b"][i]] = (GRAD["a"][i], +1)
     # perturbation parity: beta perturbed fields -> parity * alpha fields
     for label, par in zip(ri.labels, parities):
         for base in ("rho", "lapl_rho", "tau"):
-            subs[sp.Symbol(f"{base}_b_{label}", real=True)] = \
-                par * sp.Symbol(f"{base}_a_{label}", real=True)
+            mapping[sp.Symbol(f"{base}_b_{label}", real=True)] = \
+                (sp.Symbol(f"{base}_a_{label}", real=True), par)
         for ax in AXES:
-            subs[_pert_grad("b", label, ax)] = par * _pert_grad("a", label, ax)
-    expr = sp.expand(ri.expr.subs(subs, simultaneous=True))
+            mapping[_pert_grad("b", label, ax)] = \
+                (_pert_grad("a", label, ax), par)
+    poly = subs_signed(ri.poly, mapping)
     return SpinResponseIntegrand(family=family, spin="a", labels=ri.labels,
-                                 index_pairs=[(u, v)], expr=expr)
+                                 index_pairs=[(u, v)], poly=poly)

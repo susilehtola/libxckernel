@@ -245,8 +245,16 @@ projector would serve any future MCSCF response work here.
 
 1. **Pattern-collapse lowering pass** in `codegen.py` — **DONE**
    (`generate_collapsed`, verified bit-identical over 12 kernel classes).
-2. **Catalog + manifest generator**: enumerate §1, emit manifests; NumPy
-   backend catalog complete at this point.
+2. **Catalog + manifest generator** — **DONE** (`xckernel/catalog.py`):
+   enumerates exc + Fock + response orders 2-4 x 4 families x spin cases
+   (r/ua/ub/st parity multisets), generates pattern-collapsed batched NumPy
+   sources + per-kernel JSON manifests (params with shapes/kinds, Libxc
+   arrays by name, packing notes, XC-only ownership). Made tractable by the
+   fastpoly rewrite: the derivative tower and codegen now run monomial-wise
+   on {powers: coeff} dicts end to end (no expression materialization);
+   the worst catalog entry (spin meta-GGA order 4: 130,566 monomials -> 12
+   patterns) generates in ~22 s where the sympy.diff path did not finish in
+   12 minutes.
 3. **Compiled backend + C ABI** (real scalar), now with two flavors and a
    revised device model:
    (a) stage-A emitted as a single `__host__ __device__` C++ header

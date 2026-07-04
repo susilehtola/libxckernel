@@ -112,19 +112,30 @@ class GeneratedFunction:
     batch: bool = False               # perturbed operands carry a batch axis
 
 
-def _term_einsum(term: sp.Expr, out_indices: str) -> Tuple[str, float,
+def _iter_terms(ki: KernelIntegrand):
+    """Yield (coeff, [(symbol, int_exp), ...]) monomials from an integrand,
+    straight from its Poly dict when present (avoiding expression
+    materialization), else from the expanded expression."""
+    poly = getattr(ki, "poly", None)
+    if poly is not None:
+        for key, coeff in poly.items():
+            yield coeff, list(key)
+        return
+    for term in sp.Add.make_args(sp.expand(ki.expr)):
+        coeff, rest = term.as_coeff_Mul()
+        powers = rest.as_powers_dict() if rest != 1 else {}
+        yield coeff, [(s, int(e)) for s, e in powers.items()]
+
+
+def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
                                                            List[str], bool, bool]:
     """Build the einsum ('subs', [operand codes]) for one monomial term."""
-    coeff, rest = term.as_coeff_Mul()
-    powers = rest.as_powers_dict() if rest != 1 else {}
-
     subs: List[str] = []
     codes: List[str] = []
     scalar: List[str] = []       # Libxc derivative components: own (ng,) params
     uses: set = set()
 
-    for base, exp in powers.items():
-        e = int(exp)
+    for base, e in powers:
         op, kind = _classify(base.name)
         if kind == "libxc":
             scalar.append(base.name)
@@ -163,13 +174,13 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
     """
     out_indices = "".join(lbl for pair in ki.index_pairs for lbl in pair)
 
-    terms = sp.Add.make_args(sp.expand(ki.expr))
     lines: List[str] = []
     libxc_used: Dict[str, None] = {}
     uses: set = set()
 
-    for term in terms:
-        subs, coeff, codes, libxc, term_uses = _term_einsum(term, out_indices)
+    for tcoeff, tpowers in _iter_terms(ki):
+        subs, coeff, codes, libxc, term_uses = _term_einsum(
+            tcoeff, tpowers, out_indices)
         for name in libxc:
             libxc_used.setdefault(name, None)
         uses |= term_uses
@@ -260,18 +271,17 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         raise ValueError("pattern collapse requires exactly one free pair")
     (u_lbl, v_lbl), = ki.index_pairs
 
-    terms = sp.Add.make_args(sp.expand(ki.expr))
-    patterns: Dict[Tuple[str, str], sp.Expr] = {}
+    # patterns: (ufac, vfac) -> {scalar-monomial: coefficient}
+    patterns: Dict[Tuple[str, str], Dict] = {}
     libxc_used: Dict[str, None] = {}
     uses: set = set()
+    n_terms = 0
 
-    for term in terms:
-        coeff, rest = term.as_coeff_Mul()
-        powers = rest.as_powers_dict() if rest != 1 else {}
+    for coeff, powers in _iter_terms(ki):
+        n_terms += 1
         ufac = vfac = None
-        scalar = sp.Integer(1) * coeff
-        for base, exp in powers.items():
-            e = int(exp)
+        smono: List[Tuple[sp.Symbol, int]] = []
+        for base, e in powers:
             op, kind = _classify(base.name)
             if kind == "basis":
                 lbl = op.subscript[:-1]      # 'u' or 'v'
@@ -294,11 +304,13 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:")):
                     uses.add(kind)
-                scalar *= base ** e
+                smono.append((base, e))
         if ufac is None or vfac is None:
-            raise ValueError(f"term without both basis factors: {term}")
+            raise ValueError(f"term without both basis factors: {powers}")
         key = (ufac, vfac)
-        patterns[key] = patterns.get(key, sp.Integer(0)) + scalar
+        skey = tuple(sorted(smono, key=lambda p: p[0].name))
+        pat = patterns.setdefault(key, {})
+        pat[skey] = pat.get(skey, sp.Integer(0)) + coeff
 
     libxc_args = sorted(libxc_used, key=_libxc_sort_key)
     pert_grads = sorted(u.split(":", 1)[1] for u in uses
@@ -327,11 +339,18 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
             code = re.sub(r"\[(\d)\]$", r"[:, \1]", code)
         return code
 
+    def mono_code(skey, coeff) -> str:
+        """One scalar monomial as python source, e.g. '2.0*w*vsigma*rho_p1'."""
+        factors = [repr(float(coeff))]
+        for s, e in skey:
+            c = scalar_code(s.name)
+            factors.append(f"{c}**{e}" if e > 1 else c)
+        return "*".join(factors)
+
     lines: List[str] = []
-    for k, ((ufac, vfac), cexpr) in enumerate(sorted(patterns.items())):
-        sub = {s: sp.Symbol(scalar_code(s.name))
-               for s in cexpr.free_symbols}
-        code = str(sp.expand(cexpr.subs(sub, simultaneous=True)))
+    for (ufac, vfac), cpoly in sorted(patterns.items()):
+        code = " + ".join(mono_code(skey, coeff)
+                          for skey, coeff in cpoly.items())
         lines.append(f"    c = {code}")
         if batch:
             lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ufac}, "
@@ -342,7 +361,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     header = [
         f"def {func_name}({', '.join(params)}):",
         f"    # pattern-collapsed: {len(patterns)} patterns "
-        f"from {len(terms)} terms",
+        f"from {n_terms} terms",
         f"    nao = chi.shape[0]",
     ]
     if batch:

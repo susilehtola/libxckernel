@@ -124,12 +124,24 @@ def contracted_derivative(expr: sp.Expr, func: Functional,
 @dataclass
 class ResponseIntegrand:
     """Per-grid integrand of an m-th order response Fock matrix element with
-    free orbital pair (u, v) and perturbation labels p1..pm."""
+    free orbital pair (u, v) and perturbation labels p1..pm.
+
+    High-order integrands carry the monomial dictionary (``poly``) instead of
+    a materialized SymPy expression -- building the expression costs more than
+    the derivative itself.  ``expr`` is computed lazily on access."""
 
     functional: Functional
     labels: List[str]
     index_pairs: List[Tuple[str, str]]   # single free pair, for codegen
-    expr: sp.Expr
+    _expr: "sp.Expr | None" = None
+    poly: "dict | None" = None
+
+    @property
+    def expr(self) -> sp.Expr:
+        if self._expr is None and self.poly is not None:
+            from .fastpoly import to_expr
+            self._expr = to_expr(self.poly)
+        return self._expr
 
 
 def response_fock(family: str, order: int = 2,
@@ -150,4 +162,4 @@ def response_fock(family: str, order: int = 2,
     for label in labels:
         poly = seeded_derivative(poly, _seed_fn(func, label))
     return ResponseIntegrand(functional=func, labels=labels,
-                             index_pairs=[(u, v)], expr=to_expr(poly))
+                             index_pairs=[(u, v)], poly=poly)

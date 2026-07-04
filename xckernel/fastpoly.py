@@ -52,6 +52,28 @@ def _mul_mono(a: Mono, b: Mono) -> Mono:
                         key=lambda p: p[0].name))
 
 
+def subs_signed(poly: Poly, mapping: Dict[sp.Symbol,
+                                          Tuple[sp.Symbol, int]]) -> Poly:
+    """Substitute symbols by (symbol, sign) pairs: s -> sign * new_symbol.
+
+    Signs enter as sign**exponent. Used for the closed-shell spin-adaptation
+    (beta fields -> parity * alpha fields) without materializing expressions.
+    """
+    out: Poly = {}
+    for key, coeff in poly.items():
+        c = coeff
+        d: Dict[sp.Symbol, int] = {}
+        for s, e in key:
+            ns, sign = mapping.get(s, (s, 1))
+            if sign == -1 and e % 2:
+                c = -c
+            d[ns] = d.get(ns, 0) + e
+        nk = tuple(sorted(((s, e) for s, e in d.items() if e != 0),
+                          key=lambda p: p[0].name))
+        out[nk] = out.get(nk, sp.Integer(0)) + c
+    return {k: c for k, c in out.items() if c != 0}
+
+
 def seeded_derivative(poly: Poly,
                       seed: Callable[[sp.Symbol], "Poly | None"]) -> Poly:
     """Total derivative sum_atoms (d poly / d atom) * seed(atom).
