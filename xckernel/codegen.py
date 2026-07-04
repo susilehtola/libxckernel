@@ -250,23 +250,27 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch)
 
 
-def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
-                       batch: bool = False) -> GeneratedFunction:
-    """Pattern-collapsed emission (the production lowering).
+@dataclass
+class CollapsedKernel:
+    """Structured pattern-collapsed form, consumed by all emitters.
 
-    Every monomial of a one-free-pair integrand factorizes as
-    (basis factor at u) x (basis factor at v) x (per-point scalar), and only a
-    handful of basis-pair patterns exist at ANY derivative order (chi*chi,
-    chi*dchi_c, dchi_c*dchi_c', chi*lapl_chi, ...).  Grouping by pattern and
-    factoring out the scalar yields the three-stage form every production code
-    hand-writes: (A) pointwise coefficient vectors, (B) one GEMM-shaped
-    distribute per pattern.  The order-4 GGA kernel collapses from 862 einsum
-    terms to 16 patterns.
-
-    Drop-in replacement for generate(): same parameters, same output,
-    different (faster) body.  Only single-free-pair integrands (Fock/response
-    kernels) are supported; multi-pair kernels keep the per-term path.
+    patterns: sorted list of (ufac_code, vfac_code, monomials) with
+    monomials = list of (float_coeff, ((scalar_name, exp), ...)).
     """
+    u_lbl: str
+    v_lbl: str
+    patterns: List[Tuple[str, str, List[Tuple[float, Tuple]]]]
+    params: List[str]
+    libxc_args: List[str]
+    pert_grads: List[str]
+    pert_scalars: List[str]
+    uses: set
+    n_terms: int
+
+
+def collapse(ki: KernelIntegrand) -> CollapsedKernel:
+    """Group integrand monomials by basis-pair pattern, factoring out the
+    per-point scalar coefficient (the production three-stage lowering)."""
     if len(ki.index_pairs) != 1:
         raise ValueError("pattern collapse requires exactly one free pair")
     (u_lbl, v_lbl), = ki.index_pairs
@@ -331,7 +335,34 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     params += pert_scalars
     params += libxc_args
 
-    # map scalar symbols to python expressions for coefficient printing
+    plist = []
+    for (ufac, vfac), cpoly in sorted(patterns.items()):
+        monos = [(float(coeff), tuple((s.name, e) for s, e in skey))
+                 for skey, coeff in cpoly.items()]
+        plist.append((ufac, vfac, monos))
+
+    return CollapsedKernel(u_lbl=u_lbl, v_lbl=v_lbl, patterns=plist,
+                           params=params, libxc_args=libxc_args,
+                           pert_grads=pert_grads, pert_scalars=pert_scalars,
+                           uses=uses, n_terms=n_terms)
+
+
+def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
+                       batch: bool = False) -> GeneratedFunction:
+    """Pattern-collapsed NumPy emission (the production lowering).
+
+    Every monomial of a one-free-pair integrand factorizes as
+    (basis factor at u) x (basis factor at v) x (per-point scalar), and only a
+    handful of basis-pair patterns exist at ANY derivative order.  See
+    collapse() for the structured intermediate shared with other backends.
+    """
+    ck = collapse(ki)
+    u_lbl, v_lbl = ck.u_lbl, ck.v_lbl
+    libxc_args = ck.libxc_args
+    pert_grads, pert_scalars = ck.pert_grads, ck.pert_scalars
+    uses, params, n_terms = ck.uses, ck.params, ck.n_terms
+
+    # map scalar symbol names to python expressions for coefficient printing
     def scalar_code(name: str) -> str:
         op, kind = _classify(name)
         code = op.code
@@ -339,18 +370,17 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
             code = re.sub(r"\[(\d)\]$", r"[:, \1]", code)
         return code
 
-    def mono_code(skey, coeff) -> str:
+    def mono_code(coeff, factors_) -> str:
         """One scalar monomial as python source, e.g. '2.0*w*vsigma*rho_p1'."""
-        factors = [repr(float(coeff))]
-        for s, e in skey:
-            c = scalar_code(s.name)
+        factors = [repr(coeff)]
+        for name, e in factors_:
+            c = scalar_code(name)
             factors.append(f"{c}**{e}" if e > 1 else c)
         return "*".join(factors)
 
     lines: List[str] = []
-    for (ufac, vfac), cpoly in sorted(patterns.items()):
-        code = " + ".join(mono_code(skey, coeff)
-                          for skey, coeff in cpoly.items())
+    for ufac, vfac, monos in ck.patterns:
+        code = " + ".join(mono_code(coeff, fac) for coeff, fac in monos)
         lines.append(f"    c = {code}")
         if batch:
             lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ufac}, "
@@ -360,7 +390,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
 
     header = [
         f"def {func_name}({', '.join(params)}):",
-        f"    # pattern-collapsed: {len(patterns)} patterns "
+        f"    # pattern-collapsed: {len(ck.patterns)} patterns "
         f"from {n_terms} terms",
         f"    nao = chi.shape[0]",
     ]

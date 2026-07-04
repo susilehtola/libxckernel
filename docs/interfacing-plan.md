@@ -255,7 +255,14 @@ projector would serve any future MCSCF response work here.
    the worst catalog entry (spin meta-GGA order 4: 130,566 monomials -> 12
    patterns) generates in ~22 s where the sympy.diff path did not finish in
    12 minutes.
-3. **Compiled backend + C ABI** (real scalar), now with two flavors and a
+3. **Compiled backend + C ABI** — **first cut DONE** (`cbackend.py`):
+   table-driven C99 emission from the shared `CollapsedKernel` intermediate
+   (monomials as static coefficient/factor-id tables + one small fixed
+   evaluator, sidestepping both giant inline expressions and CSE); one
+   perturbation-batch entry per call; validated via cc -O2 + ctypes against
+   the NumPy backend at machine epsilon over 11 kernel classes including
+   order-4 meta-GGA (emitted kernels are 67-254 LOC regardless of monomial
+   count). Remaining in this phase, per the original two flavors and the
    revised device model:
    (a) stage-A emitted as a single `__host__ __device__` C++ header
    (ExchCXX pattern) + thin per-backend launchers -> CPU/CUDA/HIP/SYCL from

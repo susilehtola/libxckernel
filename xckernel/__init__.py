@@ -16,8 +16,9 @@ from .deriv import directional_derivative, libxc_deriv_name, libxc_symbol
 from .kernel import KernelIntegrand, kernel_integrand, fock, xc_kernel
 from .spin_kernel import (SpinIntegrand, SpinResponseIntegrand, fock_spin,
                           kernel_spin, response_fock_spin, response_fock_st)
-from .codegen import (GeneratedFunction, compile_function, generate,
-                      generate_collapsed)
+from .codegen import (CollapsedKernel, GeneratedFunction, collapse,
+                      compile_function, generate, generate_collapsed)
+from .cbackend import emit_c, scal_order
 from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
                        perturbed_variable, response_fock)
@@ -48,7 +49,11 @@ __all__ = [
     "kernel_spin",
     "response_fock_spin",
     "response_fock_st",
+    "CollapsedKernel",
     "GeneratedFunction",
+    "collapse",
+    "emit_c",
+    "scal_order",
     "generate",
     "generate_collapsed",
     "compile_function",
