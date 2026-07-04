@@ -239,6 +239,131 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch)
 
 
+def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
+                       batch: bool = False) -> GeneratedFunction:
+    """Pattern-collapsed emission (the production lowering).
+
+    Every monomial of a one-free-pair integrand factorizes as
+    (basis factor at u) x (basis factor at v) x (per-point scalar), and only a
+    handful of basis-pair patterns exist at ANY derivative order (chi*chi,
+    chi*dchi_c, dchi_c*dchi_c', chi*lapl_chi, ...).  Grouping by pattern and
+    factoring out the scalar yields the three-stage form every production code
+    hand-writes: (A) pointwise coefficient vectors, (B) one GEMM-shaped
+    distribute per pattern.  The order-4 GGA kernel collapses from 862 einsum
+    terms to 16 patterns.
+
+    Drop-in replacement for generate(): same parameters, same output,
+    different (faster) body.  Only single-free-pair integrands (Fock/response
+    kernels) are supported; multi-pair kernels keep the per-term path.
+    """
+    if len(ki.index_pairs) != 1:
+        raise ValueError("pattern collapse requires exactly one free pair")
+    (u_lbl, v_lbl), = ki.index_pairs
+
+    terms = sp.Add.make_args(sp.expand(ki.expr))
+    patterns: Dict[Tuple[str, str], sp.Expr] = {}
+    libxc_used: Dict[str, None] = {}
+    uses: set = set()
+
+    for term in terms:
+        coeff, rest = term.as_coeff_Mul()
+        powers = rest.as_powers_dict() if rest != 1 else {}
+        ufac = vfac = None
+        scalar = sp.Integer(1) * coeff
+        for base, exp in powers.items():
+            e = int(exp)
+            op, kind = _classify(base.name)
+            if kind == "basis":
+                lbl = op.subscript[:-1]      # 'u' or 'v'
+                if e != 1:
+                    raise ValueError(f"unexpected basis power {base}**{e}")
+                if lbl == u_lbl:
+                    ufac = op.code
+                elif lbl == v_lbl:
+                    vfac = op.code
+                else:
+                    raise ValueError(f"unknown basis label in {base}")
+                if op.code == "lapl_chi":
+                    uses.add("lapl")
+            else:
+                if kind == "libxc":
+                    libxc_used.setdefault(base.name, None)
+                elif kind == "grad":
+                    uses.add("grad")
+                elif kind in ("grad_a", "grad_b"):
+                    uses.add(kind)
+                elif kind.startswith(("pgrad:", "pscalar:")):
+                    uses.add(kind)
+                scalar *= base ** e
+        if ufac is None or vfac is None:
+            raise ValueError(f"term without both basis factors: {term}")
+        key = (ufac, vfac)
+        patterns[key] = patterns.get(key, sp.Integer(0)) + scalar
+
+    libxc_args = sorted(libxc_used, key=_libxc_sort_key)
+    pert_grads = sorted(u.split(":", 1)[1] for u in uses
+                        if u.startswith("pgrad:"))
+    pert_scalars = sorted(u.split(":", 1)[1] for u in uses
+                          if u.startswith("pscalar:"))
+
+    params = ["w", "chi", "dchi"]
+    if "lapl" in uses:
+        params.append("lapl_chi")
+    if "grad" in uses:
+        params.append("grad_rho")
+    if "grad_a" in uses:
+        params.append("grad_rho_a")
+    if "grad_b" in uses:
+        params.append("grad_rho_b")
+    params += [f"grad_rho_{lbl}" for lbl in pert_grads]
+    params += pert_scalars
+    params += libxc_args
+
+    # map scalar symbols to python expressions for coefficient printing
+    def scalar_code(name: str) -> str:
+        op, kind = _classify(name)
+        code = op.code
+        if batch and kind.startswith("pgrad:"):
+            code = re.sub(r"\[(\d)\]$", r"[:, \1]", code)
+        return code
+
+    lines: List[str] = []
+    for k, ((ufac, vfac), cexpr) in enumerate(sorted(patterns.items())):
+        sub = {s: sp.Symbol(scalar_code(s.name))
+               for s in cexpr.free_symbols}
+        code = str(sp.expand(cexpr.subs(sub, simultaneous=True)))
+        lines.append(f"    c = {code}")
+        if batch:
+            lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ufac}, "
+                         f"c, {vfac}, optimize=True)")
+        else:
+            lines.append(f"    out += ({ufac} * c) @ {vfac}.T")
+
+    header = [
+        f"def {func_name}({', '.join(params)}):",
+        f"    # pattern-collapsed: {len(patterns)} patterns "
+        f"from {len(terms)} terms",
+        f"    nao = chi.shape[0]",
+    ]
+    if batch:
+        if not (pert_scalars or pert_grads):
+            raise ValueError("batch=True requires perturbed-field operands")
+        nx_src = pert_scalars[0] if pert_scalars \
+            else f"grad_rho_{pert_grads[0]}"
+        header += [f"    nx = {nx_src}.shape[0]",
+                   f"    out = np.zeros((nx, nao, nao))"]
+    else:
+        header += ["    out = np.zeros((nao, nao))"]
+    source = "\n".join(header + lines + ["    return out", ""])
+
+    return GeneratedFunction(
+        name=func_name, source=source, out_indices=u_lbl + v_lbl,
+        libxc_args=libxc_args, uses_lapl_chi=("lapl" in uses),
+        uses_grad_rho=("grad" in uses),
+        uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses),
+        pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch)
+
+
 def compile_function(gen: GeneratedFunction):
     """exec the generated source and return the live callable."""
     import numpy as np
