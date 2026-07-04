@@ -422,6 +422,40 @@ reaching ChronusQ and NWChemEx natively — likely the highest-leverage
 compiled-backend target, ahead of (and complementary to) the standalone
 `libxckernel` C-ABI library that the Fortran hosts still need.
 
+### XCFun as a Libxc alternative (surveyed 2026-07-04) — complement, not replacement
+
+Verdict: viable as a **second array-based provenance**, not a Libxc
+replacement, and its headline arbitrary-order mode is architecturally
+misaligned with xckernel. Specifics:
+
+* **`XC_PARTIAL_DERIVATIVES`** (the Libxc-like mode) is **capped at order
+  4** — the same practical ceiling class as Libxc, so no arbitrary-order
+  win in the array-consumption path xckernel needs. Packing is graded
+  reverse-lexicographic over the chosen variable set: lossless to map onto
+  the Libxc-named registry via a variable-permutation shim, PROVIDED XCFun
+  is run in the sigma variable set (`*_GAA_GAB_GBB`), not the
+  gradient-component set. This shim is what the XCFun-native hosts
+  (LSDalton mandatory, MRChem default) need regardless.
+* **`XC_CONTRACTED`** (the Taylor/perturbed-density mode, where the
+  arbitrary order lives — bitmask-packed ctaylor coefficients, one scalar
+  out per point per perturbation combination) **competes with, rather than
+  feeds, xckernel's engine**: it folds the functional derivatives AND the
+  perturbed-variable products into one number, destroying the per-point
+  coefficient that pattern-collapse factors out per basis-pair pattern, and
+  it would still need xckernel's front end to build the perturbed variables
+  from DMs. Right granularity for a host that wants a pointwise black box;
+  wrong granularity for a contraction generator. Not adopted.
+* Practicalities: ~78 functional components (vs Libxc's ~600; SCAN/TPSS/M06
+  present, coverage thin elsewhere); **no GPU**; dormant since 2022;
+  MPL-2.0 (compatible); one xcfun_t per thread + single-threaded warmup
+  required (non-atomic lazy global init).
+
+Provenance summary after all three infrastructure surveys: **Libxc remains
+canonical** (registry-native, deepest coverage, orders to 4); **ExchCXX** =
+Libxc-verbatim on GPU, orders <= 2 today, extendable upstream; **XCFun** =
+order-<= 4 array shim for its native hosts; **nwxc** = packing map only if
+NWChem integration wants it.
+
 ## Cross-cutting findings from the extended survey (11 hosts total)
 
 1. **The gating prerequisite is the compiled backend** (phases 2-3): four
