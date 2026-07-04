@@ -311,6 +311,17 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                 smono.append((base, e))
         if ufac is None or vfac is None:
             raise ValueError(f"term without both basis factors: {powers}")
+        # The mixing contract: every monomial must carry EXACTLY ONE
+        # functional-derivative factor (to first power), so kernels are
+        # jointly linear in the derivative arrays and hosts may pass
+        # coefficient-mixed (superfunctional) arrays. Provable from the
+        # tower structure; enforced here so extensions cannot break it.
+        n_deriv = sum(e for s, e in smono
+                      if _classify(s.name)[1] == "libxc")
+        if n_deriv != 1:
+            raise ValueError(
+                f"monomial with {n_deriv} functional-derivative factors "
+                f"violates the linear-mixing contract: {powers}")
         key = (ufac, vfac)
         skey = tuple(sorted(smono, key=lambda p: p[0].name))
         pat = patterns.setdefault(key, {})

@@ -251,11 +251,15 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
                       f"{npat:3d} patterns", flush=True)
     elif backend == "c":
-        from .cbackend import emit_c, emit_cmake, emit_f03, emit_header
+        from .cbackend import (_EVALUATOR_HPP, emit_cmake, emit_f03,
+                               emit_header, emit_kernel_cpp, emit_kernel_hpp)
         from .codegen import collapse, generate_collapsed
         (out / "src").mkdir(parents=True, exist_ok=True)
-        (out / "include").mkdir(exist_ok=True)
+        (out / "include" / "xckernel" / "kernels").mkdir(parents=True,
+                                                         exist_ok=True)
         (out / "fortran").mkdir(exist_ok=True)
+        (out / "include" / "xckernel" / "evaluator.hpp").write_text(
+            _EVALUATOR_HPP)
         names: List[str] = []
         for e in entries(families, max_order):
             t0 = time.time()
@@ -267,7 +271,10 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 continue
             ki = _integrand_for(e)
             ck = collapse(ki)
-            (out / "src" / f"{e.name}.c").write_text(emit_c(ck, e.name))
+            (out / "include" / "xckernel" / "kernels"
+             / f"{e.name}.hpp").write_text(emit_kernel_hpp(ck, e.name))
+            (out / "src" / f"{e.name}.cpp").write_text(
+                emit_kernel_cpp(ck, e.name))
             # manifest from the (unbatched-ABI) generated form
             gen = generate_collapsed(ki, e.name, batch=False)
             m = manifest_for(e, gen)

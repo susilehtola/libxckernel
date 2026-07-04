@@ -105,6 +105,69 @@ def build_and_validate(families=("lda", "gga"), max_order=3,
         if not np.allclose(F1, F2, atol=1e-12):
             failures += 1
             print("  [FAIL] runtime.Library dispatch")
+
+        # datatype templating: instantiate a kernel at long double through
+        # the header-only path and compare against the double ABI result
+        prog = pkg / "ld_test.cpp"
+        prog.write_text(r'''
+#include "xckernel/kernels/xck_gga_r_o2.hpp"
+#include <cstdio>
+#include <vector>
+extern "C" int xck_gga_r_o2(int64_t, int64_t, const double*, const double*,
+                            const double*, const double* const*, double*);
+extern "C" const int xck_gga_r_o2_n_scal;
+int main() {
+    const int64_t nbf = 3, ng = 20;
+    const int ns = xck_gga_r_o2_n_scal;
+    std::vector<double> chi(nbf*ng), dchi(3*nbf*ng);
+    std::vector<std::vector<double>> scal(ns, std::vector<double>(ng));
+    unsigned s = 12345;
+    auto rnd = [&]() { s = 1664525u*s + 1013904223u;
+                       return (double)(s % 1000) / 500.0 - 1.0; };
+    for (auto& x : chi) x = rnd();
+    for (auto& x : dchi) x = rnd();
+    for (auto& v : scal) for (auto& x : v) x = rnd();
+    std::vector<const double*> sp(ns);
+    for (int i = 0; i < ns; i++) sp[i] = scal[i].data();
+    std::vector<double> outd(nbf*nbf, 0.0);
+    xck_gga_r_o2(ng, nbf, chi.data(), dchi.data(), nullptr, sp.data(),
+                 outd.data());
+    // long double instantiation
+    std::vector<long double> chiL(chi.begin(), chi.end()),
+        dchiL(dchi.begin(), dchi.end()), outL(nbf*nbf, 0.0L);
+    std::vector<std::vector<long double>> scalL(ns);
+    std::vector<const long double*> spL(ns);
+    for (int i = 0; i < ns; i++) {
+        scalL[i].assign(scal[i].begin(), scal[i].end());
+        spL[i] = scalL[i].data();
+    }
+    xckernel::xck_gga_r_o2_t<long double>(ng, nbf, chiL.data(), dchiL.data(),
+                                          nullptr, spL.data(), outL.data());
+    long double maxerr = 0.0L;
+    for (int i = 0; i < nbf*nbf; i++) {
+        long double d = outL[i] - (long double)outd[i];
+        if (d < 0) d = -d;
+        if (d > maxerr) maxerr = d;
+    }
+    std::printf("%Lg\n", maxerr);
+    return maxerr < 1e-12L ? 0 : 1;
+}
+''')
+        r = subprocess.run(
+            ["c++", "-std=c++17", "-O2", "-I", str(pkg / "include"),
+             str(prog), str(bld / "libxckernel.so"), "-o",
+             str(pkg / "ld_test")], capture_output=True, text=True)
+        tested += 1
+        if r.returncode != 0:
+            failures += 1
+            print("  [FAIL] long-double compile:", r.stderr[-300:])
+        else:
+            r2 = subprocess.run([str(pkg / "ld_test")],
+                                capture_output=True, text=True,
+                                env={"LD_LIBRARY_PATH": str(bld)})
+            if r2.returncode != 0:
+                failures += 1
+                print("  [FAIL] long-double mismatch:", r2.stdout)
         return tested, failures
 
 
