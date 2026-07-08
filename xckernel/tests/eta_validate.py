@@ -3,8 +3,10 @@ gradient-projected density Hessian
 
     eta = grad rho^T . (grad grad^T rho) . grad rho
 
-of Schattenberg & Kaupp, J. Phys. Chem. A 125, 2697 (2021), Eq. (10), as a
-functional variable alongside the full meta-GGA set (rho, sigma, lapl, tau).
+[Z_{sigma,sigmasigma} of Maier et al., Phys. Chem. Chem. Phys. 18, 21133
+(2016), Eqs. (22)-(23); eta in the notation of Schattenberg & Kaupp,
+J. Phys. Chem. A 125, 2697 (2021), Eq. (10)] as a functional variable
+alongside the full meta-GGA set (rho, sigma, lapl, tau).
 
 eta is CUBIC in P-linear primitives (two gradient factors and one
 density-Hessian factor), one factor deeper than sigma, so its derivative

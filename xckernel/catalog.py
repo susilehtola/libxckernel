@@ -44,8 +44,9 @@ FAMILY_VARS = {
     # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
     # tau~ = tau - j_p^2/(2 rho); host supplies jp (3,ng) and inv_rho (ng,)
     "cmgga_tau": ["rho", "sigma", "tau"],
-    # local-hybrid calibration-function set (Arbuznikov & Kaupp 2014;
-    # Maier et al. 2016; Schattenberg & Kaupp 2021): the
+    # local-hybrid calibration-function set (CF concept: Arbuznikov & Kaupp
+    # 2014; the density-Hessian variable: Maier et al. 2016, Eqs. 22-23;
+    # eta notation: Schattenberg & Kaupp 2021): the
     # meta-GGA variables plus eta = grad rho . (grad grad rho) . grad rho.
     # eta is beyond Libxc; its derivative arrays (veta, v2rhoeta, ...) follow
     # the same naming scheme and are supplied by the host's functional

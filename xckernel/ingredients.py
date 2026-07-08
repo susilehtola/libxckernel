@@ -197,10 +197,13 @@ def _ctau_seed(u: Orbital, v: Orbital) -> sp.Expr:
 
 CTAU_ING = Ingredient("tau", _CTAU_VALUE, _ctau_seed)
 
-# The gradient-projected density Hessian entering the calibration functions
-# of modern local hybrids [Arbuznikov & Kaupp, J. Chem. Phys. 141, 204101
-# (2014); Maier et al., Phys. Chem. Chem. Phys. 18, 21133 (2016); notation
-# of Schattenberg & Kaupp, J. Phys. Chem. A 125, 2697 (2021), Eq. (10)]:
+# The gradient-projected density Hessian behind the reduced density Hessian
+# of local-hybrid calibration functions -- introduced as Z_{sigma,sigmasigma}
+# by Maier, Haasler, Arbuznikov & Kaupp, Phys. Chem. Chem. Phys. 18, 21133
+# (2016), Eqs. (22)-(23) (calibration-function concept: Arbuznikov & Kaupp,
+# J. Chem. Phys. 141, 204101 (2014); renamed eta by Schattenberg & Kaupp,
+# J. Phys. Chem. A 125, 2697 (2021), Eq. (10); its dimensionless form is the
+# u parameter of GGA exchange potentials since Perdew & Wang 1986):
 #   eta = grad rho^T . (grad grad^T rho) . grad rho,
 # the raw variable behind the "reduced density Hessian"
 # p = eta / (k^2 gamma rho^{5/3}) (the reduction is the functional's
