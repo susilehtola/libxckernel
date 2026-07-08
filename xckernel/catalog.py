@@ -30,10 +30,10 @@ from itertools import combinations_with_replacement
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
-FAMILIES = ("lda", "gga", "mgga_tau", "mgga", "cmgga_tau")
+FAMILIES = ("lda", "gga", "mgga_tau", "mgga", "cmgga_tau", "hmgga")
 
 #: families whose spin-resolved machinery is not yet wired (unpolarized only).
-UNPOLARIZED_ONLY = {"cmgga_tau"}
+UNPOLARIZED_ONLY = {"cmgga_tau", "hmgga"}
 
 #: Libxc input variables per family.
 FAMILY_VARS = {
@@ -44,11 +44,23 @@ FAMILY_VARS = {
     # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
     # tau~ = tau - j_p^2/(2 rho); host supplies jp (3,ng) and inv_rho (ng,)
     "cmgga_tau": ["rho", "sigma", "tau"],
+    # local-hybrid calibration-function set (Arbuznikov & Kaupp 2014;
+    # Maier et al. 2016; Schattenberg & Kaupp 2021): the
+    # meta-GGA variables plus eta = grad rho . (grad grad rho) . grad rho.
+    # eta is beyond Libxc; its derivative arrays (veta, v2rhoeta, ...) follow
+    # the same naming scheme and are supplied by the host's functional
+    # implementation.  Host supplies hess_rho (6,ng) and hess_chi (6,nbf,ng).
+    "hmgga": ["rho", "sigma", "lapl", "tau", "eta"],
 }
 
 OWNERSHIP = ("xc-only: Coulomb, HF and range-separated exchange are "
              "host-owned; kernels contain exclusively density-functional "
              "exchange-correlation terms")
+
+#: per-family cap on the shipped derivative order.  eta (hmgga) is cubic in
+#: P-linear primitives, so its order-4 contraction has ~5e5 monomials
+#: (~30 MB of source); orders above the cap remain generatable on demand.
+FAMILY_MAX_ORDER = {"hmgga": 3}
 
 
 @dataclass
@@ -83,15 +95,16 @@ class CatalogEntry:
 def entries(families=FAMILIES, max_order: int = 4) -> Iterator[CatalogEntry]:
     """Enumerate the catalog."""
     for fam in families:
+        fmax = min(max_order, FAMILY_MAX_ORDER.get(fam, max_order))
         yield CatalogEntry(fam, "r", 0)                      # exc
-        for o in range(1, max_order + 1):                    # unpolarized
+        for o in range(1, fmax + 1):                         # unpolarized
             yield CatalogEntry(fam, "r", o, batch=(o >= 2))
         if fam in UNPOLARIZED_ONLY:
             continue
         for spin in ("ua", "ub"):                            # unrestricted
-            for o in range(1, max_order + 1):
+            for o in range(1, fmax + 1):
                 yield CatalogEntry(fam, spin, o, batch=(o >= 2))
-        for o in range(2, max_order + 1):                    # spin-adapted
+        for o in range(2, fmax + 1):                         # spin-adapted
             for pars in combinations_with_replacement((+1, -1), o - 1):
                 yield CatalogEntry(fam, "st", o, parities=pars, batch=True)
 
@@ -148,10 +161,19 @@ def _param_meta(name: str, batch: bool) -> Dict[str, str]:
         return {"shape": "(3, nbf, ng)", "kind": "collocation_gradient"}
     if name == "lapl_chi":
         return {"shape": "(nbf, ng)", "kind": "collocation_laplacian"}
-    if re.match(r"^grad_rho(_[ab])?$", name):
+    if name == "hess_chi":
+        return {"shape": "(6, nbf, ng)", "kind": "collocation_hessian"}
+    if re.match(r"^grad_rho(_[ab])?$", name) or name == "jp":
         return {"shape": "(3, ng)", "kind": "gs_field"}
-    if re.match(r"^grad_rho(_[ab])?_p\d+$", name):
+    if name == "hess_rho":
+        return {"shape": "(6, ng)", "kind": "gs_field"}
+    if name == "inv_rho":
+        return {"shape": "(ng,)", "kind": "gs_field"}
+    if re.match(r"^(grad_rho(_[ab])?|jp)_p\d+$", name):
         return {"shape": "(nx, 3, ng)" if batch else "(3, ng)",
+                "kind": "pert_field"}
+    if re.match(r"^hess_rho_p\d+$", name):
+        return {"shape": "(nx, 6, ng)" if batch else "(6, ng)",
                 "kind": "pert_field"}
     if re.match(r"^(rho|lapl_rho|tau)(_[ab])?_p\d+$", name):
         return {"shape": "(nx, ng)" if batch else "(ng,)",

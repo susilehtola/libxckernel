@@ -23,27 +23,35 @@ from ..response import response_fock
 from ..spin_kernel import fock_spin, response_fock_spin, response_fock_st
 
 
+_H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")
+
+
 def _operands(ck, nbf, ng, seed):
     rng = np.random.default_rng(seed)
     chi = np.ascontiguousarray(rng.standard_normal((nbf, ng)))
     dchi = np.ascontiguousarray(rng.standard_normal((3, nbf, ng)))
     lapl_chi = np.ascontiguousarray(rng.standard_normal((nbf, ng)))
+    hess_chi = np.ascontiguousarray(rng.standard_normal((6, nbf, ng)))
     scal = {}
     for name in scal_order(ck):
         scal[name] = np.ascontiguousarray(rng.standard_normal(ng))
     scal["w"] = np.abs(scal["w"]) + 0.1
-    return chi, dchi, lapl_chi, scal
+    return chi, dchi, lapl_chi, hess_chi, scal
 
 
-def _numpy_args(gen, ck, chi, dchi, lapl_chi, scal):
+def _numpy_args(gen, ck, chi, dchi, lapl_chi, hess_chi, scal):
     args = [scal["w"], chi, dchi]
     if gen.uses_lapl_chi:
         args.append(lapl_chi)
+    if "hess_chi" in ck.params:
+        args.append(hess_chi)
     # vector params, in the same order the generator emits them
     for p in ck.params:
-        if p in ("w", "chi", "dchi", "lapl_chi"):
+        if p in ("w", "chi", "dchi", "lapl_chi", "hess_chi"):
             continue
-        if p.startswith("grad_rho"):
+        if p.startswith("hess_rho"):
+            args.append(np.stack([scal[f"{p}_{c}"] for c in _H6_COMPS]))
+        elif p.startswith(("grad_rho", "jp")):
             args.append(np.stack([scal[f"{p}_{ax}"] for ax in "xyz"]))
         else:
             args.append(scal[p])
@@ -55,8 +63,8 @@ def check(name, ki, nbf=4, ng=60, seed=11):
     gen = generate_collapsed(ki, "npk", batch=False)
     fn_np = compile_function(gen)
 
-    chi, dchi, lapl_chi, scal = _operands(ck, nbf, ng, seed)
-    ref = fn_np(*_numpy_args(gen, ck, chi, dchi, lapl_chi, scal))
+    chi, dchi, lapl_chi, hess_chi, scal = _operands(ck, nbf, ng, seed)
+    ref = fn_np(*_numpy_args(gen, ck, chi, dchi, lapl_chi, hess_chi, scal))
 
     csrc = emit_c(ck, name)
     with tempfile.TemporaryDirectory() as td:
@@ -75,8 +83,8 @@ def check(name, ki, nbf=4, ng=60, seed=11):
         out = np.zeros((nbf, nbf))
         rc = f(ctypes.c_int64(ng), ctypes.c_int64(nbf),
                chi.ctypes.data_as(P), dchi.ctypes.data_as(P),
-               lapl_chi.ctypes.data_as(P), scal_ptrs,
-               out.ctypes.data_as(P))
+               lapl_chi.ctypes.data_as(P), hess_chi.ctypes.data_as(P),
+               scal_ptrs, out.ctypes.data_as(P))
         assert rc == 0
 
     err = np.max(np.abs(out - ref))
@@ -97,6 +105,10 @@ if __name__ == "__main__":
         ("xck_gga_ua_o3", response_fock_spin("gga", "a", 3)),
         ("xck_gga_st_o2_m", response_fock_st("gga", 2, (-1,))),
         ("xck_gga_st_o3_pm", response_fock_st("gga", 3, (+1, -1))),
+        ("xck_cmgga_tau_r_o2", response_fock("cmgga_tau", 2)),
+        ("xck_hmgga_r_o1", fock("hmgga")),
+        ("xck_hmgga_r_o2", response_fock("hmgga", 2)),
+        ("xck_hmgga_r_o3", response_fock("hmgga", 3)),
     ]
     print("C backend (table-driven, cc -O2) vs NumPy backend")
     for name, ki in cases:

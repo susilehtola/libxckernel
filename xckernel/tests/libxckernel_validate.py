@@ -20,7 +20,10 @@ from ..cbackend import scal_order
 from ..codegen import collapse, compile_function, generate_collapsed
 
 
-def build_and_validate(families=("lda", "gga"), max_order=3,
+_H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")
+
+
+def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                        nbf=4, ng=50, seed=3, verbose=False):
     with tempfile.TemporaryDirectory() as td:
         pkg = Path(td) / "libxck"
@@ -51,15 +54,20 @@ def build_and_validate(families=("lda", "gga"), max_order=3,
             chi = np.ascontiguousarray(rng.standard_normal((nbf, ng)))
             dchi = np.ascontiguousarray(rng.standard_normal((3, nbf, ng)))
             lapl = np.ascontiguousarray(rng.standard_normal((nbf, ng)))
+            hess = np.ascontiguousarray(rng.standard_normal((6, nbf, ng)))
             scal = {n: np.ascontiguousarray(rng.standard_normal(ng))
                     for n in scal_order(ck)}
 
             args = [scal["w"], chi, dchi] \
-                + ([lapl] if gen.uses_lapl_chi else [])
+                + ([lapl] if gen.uses_lapl_chi else []) \
+                + ([hess] if "hess_chi" in ck.params else [])
             for p in ck.params:
-                if p in ("w", "chi", "dchi", "lapl_chi"):
+                if p in ("w", "chi", "dchi", "lapl_chi", "hess_chi"):
                     continue
-                if p.startswith("grad_rho"):
+                if p.startswith("hess_rho"):
+                    args.append(np.stack([scal[f"{p}_{c}"]
+                                          for c in _H6_COMPS]))
+                elif p.startswith(("grad_rho", "jp")):
                     args.append(np.stack([scal[f"{p}_{ax}"]
                                           for ax in "xyz"]))
                 else:
@@ -74,7 +82,8 @@ def build_and_validate(families=("lda", "gga"), max_order=3,
             out = np.zeros((nbf, nbf))
             rc = f(ctypes.c_int64(ng), ctypes.c_int64(nbf),
                    chi.ctypes.data_as(P), dchi.ctypes.data_as(P),
-                   lapl.ctypes.data_as(P), sp, out.ctypes.data_as(P))
+                   lapl.ctypes.data_as(P), hess.ctypes.data_as(P),
+                   sp, out.ctypes.data_as(P))
             ok = rc == 0 and np.allclose(out, ref, atol=1e-12, rtol=1e-12)
             tested += 1
             if not ok:
@@ -114,7 +123,8 @@ def build_and_validate(families=("lda", "gga"), max_order=3,
 #include <cstdio>
 #include <vector>
 extern "C" int xck_gga_r_o2(int64_t, int64_t, const double*, const double*,
-                            const double*, const double* const*, double*);
+                            const double*, const double*,
+                            const double* const*, double*);
 extern "C" const int xck_gga_r_o2_n_scal;
 int main() {
     const int64_t nbf = 3, ng = 20;
@@ -130,8 +140,8 @@ int main() {
     std::vector<const double*> sp(ns);
     for (int i = 0; i < ns; i++) sp[i] = scal[i].data();
     std::vector<double> outd(nbf*nbf, 0.0);
-    xck_gga_r_o2(ng, nbf, chi.data(), dchi.data(), nullptr, sp.data(),
-                 outd.data());
+    xck_gga_r_o2(ng, nbf, chi.data(), dchi.data(), nullptr, nullptr,
+                 sp.data(), outd.data());
     // long double instantiation
     std::vector<long double> chiL(chi.begin(), chi.end()),
         dchiL(dchi.begin(), dchi.end()), outL(nbf*nbf, 0.0L);
@@ -146,7 +156,7 @@ int main() {
     std::vector<const double*> xcp(sp.begin() + nfld, sp.end());
     std::vector<const long double*> fldL(spL.begin(), spL.begin() + nfld);
     xckernel::xck_gga_r_o2_t<long double, double>(
-        ng, nbf, chiL.data(), dchiL.data(), nullptr,
+        ng, nbf, chiL.data(), dchiL.data(), nullptr, nullptr,
         fldL.data(), xcp.data(), outL.data());
     long double maxerr = 0.0L;
     for (int i = 0; i < nbf*nbf; i++) {

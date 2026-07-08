@@ -37,7 +37,7 @@ from typing import Callable, Dict, List, Tuple
 
 import sympy as sp
 
-from .basis import AXES, Orbital, dot
+from .basis import AXES, HESS_COMPS, Orbital, dot
 
 #: A bilinear kernel Q(a, b): given two orbitals, return the coefficient that
 #: multiplies P_ab in a primitive field's microscopic definition.
@@ -93,6 +93,15 @@ def _k_jp(ax: int) -> Kernel:
     return kernel
 
 
+def _k_hess(i: int, j: int) -> Kernel:
+    # density-Hessian component rho_ij = d_i d_j rho: the full second
+    # derivative of the bilinear chi_a chi_b (its trace is the Laplacian).
+    def kernel(a: Orbital, b: Orbital) -> sp.Expr:
+        return (a.hess_ij(i, j) * b.val + a.grad[i] * b.grad[j]
+                + a.grad[j] * b.grad[i] + a.val * b.hess_ij(i, j))
+    return kernel
+
+
 RHO = Primitive("rho", sp.Symbol("rho", real=True), _k_rho)
 GRAD_RHO = tuple(
     Primitive(f"grad_rho_{ax}", sp.Symbol(f"grad_rho_{ax}", real=True), _k_grad(i))
@@ -103,6 +112,14 @@ TAU = Primitive("tau", sp.Symbol("tau", real=True), _k_tau)
 JP = tuple(
     Primitive(f"jp_{ax}", sp.Symbol(f"jp_{ax}", real=True), _k_jp(i))
     for i, ax in enumerate(AXES)
+)
+
+# the six independent density-Hessian components, packed xx,xy,xz,yy,yz,zz.
+HESS_RHO = tuple(
+    Primitive(f"hess_rho_{AXES[i]}{AXES[j]}",
+              sp.Symbol(f"hess_rho_{AXES[i]}{AXES[j]}", real=True),
+              _k_hess(i, j))
+    for (i, j) in HESS_COMPS
 )
 
 # 1/rho as a pseudo-primitive: a host-supplied per-point field whose
@@ -116,7 +133,8 @@ INV_RHO = Primitive(
 
 #: All primitives keyed by name, for substitution / operand collection.
 PRIMITIVES: Dict[str, Primitive] = {
-    p.name: p for p in (RHO, *GRAD_RHO, LAPL_RHO, TAU, *JP, INV_RHO)
+    p.name: p for p in (RHO, *GRAD_RHO, LAPL_RHO, TAU, *JP, *HESS_RHO,
+                        INV_RHO)
 }
 
 
@@ -179,6 +197,31 @@ def _ctau_seed(u: Orbital, v: Orbital) -> sp.Expr:
 
 CTAU_ING = Ingredient("tau", _CTAU_VALUE, _ctau_seed)
 
+# The gradient-projected density Hessian entering the calibration functions
+# of modern local hybrids [Arbuznikov & Kaupp, J. Chem. Phys. 141, 204101
+# (2014); Maier et al., Phys. Chem. Chem. Phys. 18, 21133 (2016); notation
+# of Schattenberg & Kaupp, J. Phys. Chem. A 125, 2697 (2021), Eq. (10)]:
+#   eta = grad rho^T . (grad grad^T rho) . grad rho,
+# the raw variable behind the "reduced density Hessian"
+# p = eta / (k^2 gamma rho^{5/3}) (the reduction is the functional's
+# business, like the reduced gradient s is built from sigma and rho).
+# Cubic in P-linear primitives -- one factor deeper than sigma -- so its
+# derivative tower exercises second-order seeds against BOTH the gradient
+# and the Hessian primitives.
+_ETA_VALUE = sum(
+    (1 if i == j else 2) * GRAD_RHO[i].symbol * GRAD_RHO[j].symbol * h.symbol
+    for h, (i, j) in zip(HESS_RHO, HESS_COMPS))
+
+
+def _eta_seed(u: Orbital, v: Orbital) -> sp.Expr:
+    total = sp.Integer(0)
+    for p in (*GRAD_RHO, *HESS_RHO):
+        total += sp.diff(_ETA_VALUE, p.symbol) * p.seed(u, v)
+    return sp.expand(total)
+
+
+ETA_ING = Ingredient("eta", _ETA_VALUE, _eta_seed)
+
 
 #: Libxc input variables keyed by name, for chain-rule seeds at any order.
 #: (Default variable set; families may override individual variables with
@@ -189,6 +232,7 @@ INGREDIENTS: Dict[str, Ingredient] = {
     "sigma": SIGMA_ING,
     "lapl": LAPL_ING,
     "tau": TAU_ING,
+    "eta": ETA_ING,
 }
 
 #: Primitive field keyed by its total-field symbol, for seeding P-atoms that
@@ -208,4 +252,9 @@ FAMILIES: Dict[str, List[Ingredient]] = {
     # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
     # tau~ = tau - j_p^2/(2 rho); operands gain jp (3,ng) and inv_rho (ng,).
     "cmgga_tau": [RHO_ING, SIGMA_ING, CTAU_ING],
+    # local-hybrid calibration-function set (Arbuznikov & Kaupp 2014;
+    # Maier et al. 2016): the full meta-GGA variables plus the gradient-projected
+    # density Hessian eta; operands gain hess_rho (6,ng) and the
+    # second-derivative collocation hess_chi (6,nbf,ng).
+    "hmgga": [RHO_ING, SIGMA_ING, LAPL_ING, TAU_ING, ETA_ING],
 }

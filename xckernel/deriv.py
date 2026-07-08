@@ -44,8 +44,12 @@ from .functional import Functional
 from .ingredients import INGREDIENTS, PRIM_BY_SYMBOL
 
 #: Canonical Libxc variable order.  Derivative names concatenate variables in
-#: this order, so it must match Libxc exactly.
-VARS: Tuple[str, ...] = ("rho", "sigma", "lapl", "tau")
+#: this order, so it must match Libxc exactly.  Extension variables beyond
+#: the Libxc set (eta: the gradient-projected density Hessian of local-hybrid
+#: calibration functions) are appended AFTER the Libxc variables, so every
+#: Libxc-only derivative name is unchanged and extension arrays get
+#: self-describing names by the same scheme (veta, v2rhoeta, ...).
+VARS: Tuple[str, ...] = ("rho", "sigma", "lapl", "tau", "eta")
 _VAR_INDEX = {v: i for i, v in enumerate(VARS)}
 
 

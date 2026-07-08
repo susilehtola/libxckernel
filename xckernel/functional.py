@@ -25,6 +25,11 @@ VNAME: Dict[str, str] = {
     "sigma": "vsigma",
     "lapl": "vlapl",
     "tau": "vtau",
+    # beyond-Libxc extension variable (local-hybrid calibration functions):
+    # the gradient-projected density Hessian.  Array names follow the same
+    # scheme; the derivative arrays are supplied by the host's functional
+    # implementation until a functional library exposes them.
+    "eta": "veta",
 }
 
 

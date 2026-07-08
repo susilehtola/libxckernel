@@ -67,6 +67,9 @@ def pert_field(prim_name: str, label: str) -> sp.Symbol:
     if prim_name.startswith("jp_"):
         ax = prim_name[-1]
         return sp.Symbol(f"jp_{label}_{ax}", real=True)
+    if prim_name.startswith("hess_rho_"):
+        comp = prim_name[len("hess_rho_"):]
+        return sp.Symbol(f"hess_rho_{label}_{comp}", real=True)
     raise ValueError(f"unknown primitive {prim_name!r}")
 
 
@@ -109,6 +112,9 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
             ax = p.name[-1]
             total += 2 * p.symbol * sp.Symbol(f"grad_rho_{label}_{ax}", real=True)
         return total
+    if var == "eta":
+        from .ingredients import ETA_ING
+        return perturbed_ingredient(ETA_ING, label)
     raise ValueError(f"unknown libxc variable {var!r}")
 
 

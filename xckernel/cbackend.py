@@ -42,7 +42,12 @@ _BASIS = {
     "dchi[1]": ("dchi + (int64_t)1*nbf*npts", None),
     "dchi[2]": ("dchi + (int64_t)2*nbf*npts", None),
     "lapl_chi": ("lapl_chi", "lapl"),
+    **{f"hess_chi[{k}]": (f"hess_chi + (int64_t){k}*nbf*npts", "hess")
+       for k in range(6)},
 }
+
+#: packed symmetric-tensor components (density Hessian), canonical order.
+_H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")
 
 
 def scal_order(ck: CollapsedKernel) -> List[str]:
@@ -53,9 +58,13 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
     """
     order: List[str] = []
     for p in ck.params:
-        if p in ("chi", "dchi", "lapl_chi"):
+        if p in ("chi", "dchi", "lapl_chi", "hess_chi"):
             continue
-        if p.startswith(("grad_rho", "jp")):
+        if p.startswith("hess_rho"):
+            # packed symmetric tensor: six components
+            for comp in _H6_COMPS:
+                order.append(f"{p}_{comp}")
+        elif p.startswith(("grad_rho", "jp")):
             for ax in ("x", "y", "z"):
                 # grad_rho -> grad_rho_x; grad_rho_a_p1 -> grad_rho_a_p1_x
                 order.append(f"{p}_{ax}")
@@ -144,7 +153,7 @@ def emit_c(ck: CollapsedKernel, name: str) -> str:
         "",
         f"int {name}(int64_t npts, int64_t nbf,",
         "           const double* chi, const double* dchi,",
-        "           const double* lapl_chi,",
+        "           const double* lapl_chi, const double* hess_chi,",
         "           const double* const* scal, double* out) {",
         "    double* c = (double*)malloc((size_t)npts * sizeof(double));",
         "    if (!c) return 1;",
@@ -271,6 +280,7 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
         "template <typename T, typename Txc = T>",
         f"int {name}_t(int64_t npts, int64_t nbf,",
         "             const T* chi, const T* dchi, const T* lapl_chi,",
+        "             const T* hess_chi,",
         "             const T* const* fields, const Txc* const* xc,",
         "             T* out, T* work = nullptr) {",
         "    T* c = work;",
@@ -278,15 +288,15 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
         "    if (!c) { c = new (std::nothrow) T[npts]; own = true; }",
         "    if (!c) return 1;",
     ]
+    _bexpr = {"chi": "chi", "lapl_chi": "lapl_chi",
+              "dchi[0]": "dchi + (int64_t)0*nbf*npts",
+              "dchi[1]": "dchi + (int64_t)1*nbf*npts",
+              "dchi[2]": "dchi + (int64_t)2*nbf*npts",
+              **{f"hess_chi[{k}]": f"hess_chi + (int64_t){k}*nbf*npts"
+                 for k in range(6)}}
     for ip, ufac, vfac, nm in pat_meta:
-        uexpr = {"chi": "chi", "lapl_chi": "lapl_chi",
-                 "dchi[0]": "dchi + (int64_t)0*nbf*npts",
-                 "dchi[1]": "dchi + (int64_t)1*nbf*npts",
-                 "dchi[2]": "dchi + (int64_t)2*nbf*npts"}[ufac]
-        vexpr = {"chi": "chi", "lapl_chi": "lapl_chi",
-                 "dchi[0]": "dchi + (int64_t)0*nbf*npts",
-                 "dchi[1]": "dchi + (int64_t)1*nbf*npts",
-                 "dchi[2]": "dchi + (int64_t)2*nbf*npts"}[vfac]
+        uexpr = _bexpr[ufac]
+        vexpr = _bexpr[vfac]
         lines += [
             f"    stage_a<T, Txc>(npts, {nm}, {ns}::c{ip}, {ns}::o{ip}, "
             f"{ns}::f{ip}, {ns}::NFLD, fields, xc, c);",
@@ -325,10 +335,10 @@ def emit_kernel_cpp(ck: CollapsedKernel, name: str) -> str:
         f" * {name}_n_fields. */",
         f"int {name}(int64_t npts, int64_t nbf,",
         "           const double* chi, const double* dchi,",
-        "           const double* lapl_chi,",
+        "           const double* lapl_chi, const double* hess_chi,",
         "           const double* const* scal, double* out) {",
         f"    return xckernel::{name}_t<double, double>(",
-        "        npts, nbf, chi, dchi, lapl_chi,",
+        "        npts, nbf, chi, dchi, lapl_chi, hess_chi,",
         f"        scal, scal + {len(names) - len(ck.libxc_args)}, out);",
         "}",
         "",
@@ -342,7 +352,7 @@ def emit_kernel_cpp(ck: CollapsedKernel, name: str) -> str:
 
 _KERNEL_PROTO = ("int {name}(int64_t npts, int64_t nbf,\n"
                  "           const double* chi, const double* dchi,\n"
-                 "           const double* lapl_chi,\n"
+                 "           const double* lapl_chi, const double* hess_chi,\n"
                  "           const double* const* scal, double* out);")
 
 
@@ -356,6 +366,9 @@ def emit_header(kernel_names: List[str], version: str) -> str:
         " * ABI: one perturbation-batch entry per call; `scal` is an ordered",
         " * array of per-point scalar operands (see <name>_scal_names /",
         " * manifest.json); `out` is accumulated (+=). Returns 0 on success.",
+        " * lapl_chi is the basis Laplacian collocation and hess_chi the",
+        " * packed second-derivative collocation (6 blocks: xx,xy,xz,yy,",
+        " * yz,zz); pass NULL when the kernel's family does not use them.",
         " * Kernels contain XC terms only: Coulomb, HF and range-separated",
         " * exchange are host-owned.",
         " *",
@@ -422,11 +435,11 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
             continue
         lines += [
             f"    integer(c_int) function {name}(npts, nbf, chi, dchi, "
-            f"lapl_chi, scal, out) bind(C, name='{name}')",
+            f"lapl_chi, hess_chi, scal, out) bind(C, name='{name}')",
             "      import :: c_int, c_int64_t, c_double, c_ptr",
             "      integer(c_int64_t), value :: npts, nbf",
             "      real(c_double), intent(in) :: chi(*), dchi(*)",
-            "      type(c_ptr), value :: lapl_chi",
+            "      type(c_ptr), value :: lapl_chi, hess_chi",
             "      type(c_ptr), intent(in) :: scal(*)",
             "      real(c_double), intent(inout) :: out(*)",
             f"    end function {name}",

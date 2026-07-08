@@ -29,6 +29,22 @@ import numpy as np
 
 _P = ctypes.POINTER(ctypes.c_double)
 
+#: packed symmetric-tensor components (density Hessian), canonical order.
+_H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")
+
+
+def _expand_vector(scal, key, val, ng):
+    """Expand a (3,ng) vector / (6,ng) packed-tensor operand to components."""
+    if val.ndim == 2 and val.shape == (3, ng):
+        for i, ax in enumerate("xyz"):
+            scal[f"{key}_{ax}"] = np.ascontiguousarray(val[i])
+        return True
+    if val.ndim == 2 and val.shape == (6, ng):
+        for i, comp in enumerate(_H6_COMPS):
+            scal[f"{key}_{comp}"] = np.ascontiguousarray(val[i])
+        return True
+    return False
+
 
 class Library:
     """A loaded libxckernel with generic, self-describing dispatch."""
@@ -53,13 +69,14 @@ class Library:
             self._scal_cache[name] = [s.decode() for s in arr]
         return self._scal_cache[name]
 
-    def __call__(self, name: str, *, chi, dchi, w, lapl_chi=None, out=None,
-                 **operands) -> np.ndarray:
+    def __call__(self, name: str, *, chi, dchi, w, lapl_chi=None,
+                 hess_chi=None, out=None, **operands) -> np.ndarray:
         """Call a kernel with named operands; returns the (nbf,nbf) matrix.
 
         chi: (nbf, ng); dchi: (3, nbf, ng); w: (ng,); scalar operands by the
         names in scal_names(name) (vector families may be passed whole, e.g.
-        grad_rho=(3,ng)). ``out`` is accumulated into when provided.
+        grad_rho=(3,ng), hess_rho=(6,ng)). ``out`` is accumulated into when
+        provided.
         """
         chi = np.ascontiguousarray(chi, dtype=np.float64)
         dchi = np.ascontiguousarray(dchi, dtype=np.float64)
@@ -71,14 +88,13 @@ class Library:
         scal: Dict[str, np.ndarray] = {"w": np.ascontiguousarray(w)}
         for key, val in operands.items():
             val = np.asarray(val, dtype=np.float64)
-            if val.ndim == 2 and val.shape == (3, ng):
-                for i, ax in enumerate("xyz"):
-                    scal[f"{key}_{ax}"] = np.ascontiguousarray(val[i])
+            if _expand_vector(scal, key, val, ng):
+                pass
             elif val.shape == (ng,):
                 scal[key] = np.ascontiguousarray(val)
             else:
-                raise ValueError(f"operand {key!r}: expected ({ng},) or "
-                                 f"(3,{ng}), got {val.shape}")
+                raise ValueError(f"operand {key!r}: expected ({ng},), "
+                                 f"(3,{ng}) or (6,{ng}), got {val.shape}")
 
         names = self.scal_names(name)
         missing = [n for n in names if n not in scal]
@@ -96,12 +112,17 @@ class Library:
             lapl_ptr = lapl_chi.ctypes.data_as(_P)
         else:
             lapl_ptr = None
+        if hess_chi is not None:
+            hess_chi = np.ascontiguousarray(hess_chi, dtype=np.float64)
+            hess_ptr = hess_chi.ctypes.data_as(_P)
+        else:
+            hess_ptr = None
 
         fn = getattr(self._dll, name)
         fn.restype = ctypes.c_int
         rc = fn(ctypes.c_int64(ng), ctypes.c_int64(nbf),
                 chi.ctypes.data_as(_P), dchi.ctypes.data_as(_P),
-                lapl_ptr, ptrs, out.ctypes.data_as(_P))
+                lapl_ptr, hess_ptr, ptrs, out.ctypes.data_as(_P))
         if rc != 0:
             raise RuntimeError(f"{name} returned {rc}")
         return out
@@ -123,23 +144,25 @@ class _NumpyKernel:
         self._fn = compile_function(self._gen)
         self.scal_names = scal_order(self._ck)
 
-    def __call__(self, *, chi, dchi, w, lapl_chi=None, out=None, **operands):
+    def __call__(self, *, chi, dchi, w, lapl_chi=None, hess_chi=None,
+                 out=None, **operands):
         ng = np.asarray(w).shape[0]
         scal = {"w": np.asarray(w)}
         for key, val in operands.items():
             val = np.asarray(val)
-            if val.ndim == 2 and val.shape == (3, ng):
-                for i, ax in enumerate("xyz"):
-                    scal[f"{key}_{ax}"] = val[i]
-            else:
+            if not _expand_vector(scal, key, val, ng):
                 scal[key] = val
         args = [scal["w"], np.asarray(chi), np.asarray(dchi)]
         if self._gen.uses_lapl_chi:
             args.append(np.asarray(lapl_chi))
+        if "hess_chi" in self._ck.params:
+            args.append(np.asarray(hess_chi))
         for p in self._ck.params:
-            if p in ("w", "chi", "dchi", "lapl_chi"):
+            if p in ("w", "chi", "dchi", "lapl_chi", "hess_chi"):
                 continue
-            if p.startswith("grad_rho"):
+            if p.startswith("hess_rho"):
+                args.append(np.stack([scal[f"{p}_{c}"] for c in _H6_COMPS]))
+            elif p.startswith(("grad_rho", "jp")):
                 args.append(np.stack([scal[f"{p}_{ax}"] for ax in "xyz"]))
             else:
                 args.append(scal[p])

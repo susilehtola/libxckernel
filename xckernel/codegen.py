@@ -35,9 +35,12 @@ from .deriv import LIBXC_MULTISET
 from .kernel import KernelIntegrand
 
 _AX = {ax: i for i, ax in enumerate(AXES)}
+#: packed symmetric-tensor component -> index (xx,xy,xz,yy,yz,zz)
+_H6 = {"xx": 0, "xy": 1, "xz": 2, "yy": 3, "yz": 4, "zz": 5}
 _CHI = re.compile(r"^chi_(\w+)$")
 _DCHI = re.compile(r"^dchi_(\w+)_([xyz])$")
 _LAPL = re.compile(r"^lapl_chi_(\w+)$")
+_HESS_CHI = re.compile(r"^hess_chi_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
 _GRAD = re.compile(r"^grad_rho_([xyz])$")
 _GRAD_SPIN = re.compile(r"^grad_rho_([ab])_([xyz])$")
 _LIBXC_SPIN = re.compile(r"^v\w+_\d+$")
@@ -50,9 +53,13 @@ _PERT_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_(p\d+)_([xyz])$")
 # current-density ingredients: jp vector (gs + perturbed) and the inv_rho field
 _JP = re.compile(r"^jp_([xyz])$")
 _PERT_JP = re.compile(r"^jp_(p\d+)_([xyz])$")
+# density-Hessian ingredients: the packed 6-component tensor (gs + perturbed)
+_HRHO = re.compile(r"^hess_rho_(xx|xy|xz|yy|yz|zz)$")
+_PERT_HRHO = re.compile(r"^hess_rho_(p\d+)_(xx|xy|xz|yy|yz|zz)$")
 _GS_SCALAR = re.compile(r"^(inv_rho)$")
-# operand *code* for a perturbed vector component, e.g. grad_rho_p1[0]
-_PERT_GRAD_CODE = re.compile(r"^(?:grad_rho|jp)_(?:[ab]_)?p\d+\[\d\]$")
+# operand *code* for a perturbed vector/tensor component, e.g. grad_rho_p1[0]
+_PERT_GRAD_CODE = re.compile(
+    r"^(?:grad_rho|jp|hess_rho)_(?:[ab]_)?p\d+\[\d\]$")
 
 
 @dataclass
@@ -74,6 +81,10 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _LAPL.match(name)
     if m:
         return Operand("lapl_chi", f"{m.group(1)}g"), "basis"
+    m = _HESS_CHI.match(name)
+    if m:
+        return Operand(f"hess_chi[{_H6[m.group(2)]}]",
+                       f"{m.group(1)}g"), "basis"
     m = _GRAD.match(name)
     if m:
         return Operand(f"grad_rho[{_AX[m.group(1)]}]", "g"), "grad"
@@ -96,6 +107,13 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"jp_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
             f"pjp:{m.group(1)}"
+    m = _HRHO.match(name)
+    if m:
+        return Operand(f"hess_rho[{_H6[m.group(1)]}]", "g"), "hrho"
+    m = _PERT_HRHO.match(name)
+    if m:
+        return Operand(f"hess_rho_{m.group(1)}[{_H6[m.group(2)]}]", "g"), \
+            f"phrho:{m.group(1)}"
     m = _GS_SCALAR.match(name)
     if m:
         # ground-state scalar field passed as its own (ng,) parameter
@@ -156,12 +174,15 @@ def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
             scalar.append(base.name)
         elif kind == "grad":
             uses.add("grad")
-        elif kind in ("grad_a", "grad_b", "jp"):
+        elif kind in ("grad_a", "grad_b", "jp", "hrho"):
             uses.add(kind)
-        elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "gscalar:")):
+        elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
+                              "gscalar:")):
             uses.add(kind)
         elif kind == "basis" and op.code == "lapl_chi":
             uses.add("lapl")
+        elif kind == "basis" and op.code.startswith("hess_chi"):
+            uses.add("hess")
         for _ in range(e):
             subs.append(op.subscript)
             codes.append(op.code)
@@ -215,8 +236,9 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
             if any_pert:
                 subs = ",".join(new_parts) + "->x" + out_sub
             # grad operand indexing: grad_rho_p1[0] -> grad_rho_p1[:, 0]
-            codes = [re.sub(r"^((?:grad_rho|jp)_(?:[ab]_)?p\d+)\[(\d)\]$",
-                            r"\1[:, \2]", c) for c in codes]
+            codes = [re.sub(
+                r"^((?:grad_rho|jp|hess_rho)_(?:[ab]_)?p\d+)\[(\d)\]$",
+                r"\1[:, \2]", c) for c in codes]
         operands = ", ".join(codes)
         c = "" if coeff == 1.0 else f"{coeff!r} * "
         lines.append(f"    out += {c}np.einsum('{subs}', {operands})")
@@ -226,6 +248,8 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
     params = ["w", "chi", "dchi"]
     if "lapl" in uses:
         params.append("lapl_chi")
+    if "hess" in uses:
+        params.append("hess_chi")
     if "grad" in uses:
         params.append("grad_rho")
     if "grad_a" in uses:
@@ -236,13 +260,17 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
     # then the scalar fields (ng,) sorted by name
     if "jp" in uses:
         params.append("jp")
+    if "hrho" in uses:
+        params.append("hess_rho")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     pert_grads = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pgrad:"))
     pert_scalars = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pscalar:"))
     pert_jps = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pjp:"))
+    pert_hrhos = sorted(u.split(":", 1)[1] for u in uses if u.startswith("phrho:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]
     params += [f"jp_{lbl}" for lbl in pert_jps]
+    params += [f"hess_rho_{lbl}" for lbl in pert_hrhos]
     params += pert_scalars
     params += libxc_args
 
@@ -320,14 +348,16 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                     raise ValueError(f"unknown basis label in {base}")
                 if op.code == "lapl_chi":
                     uses.add("lapl")
+                elif op.code.startswith("hess_chi"):
+                    uses.add("hess")
             else:
                 if kind == "libxc":
                     libxc_used.setdefault(base.name, None)
                 elif kind == "grad":
                     uses.add("grad")
-                elif kind in ("grad_a", "grad_b", "jp"):
+                elif kind in ("grad_a", "grad_b", "jp", "hrho"):
                     uses.add(kind)
-                elif kind.startswith(("pgrad:", "pscalar:", "pjp:",
+                elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                                       "gscalar:")):
                     uses.add(kind)
                 smono.append((base, e))
@@ -356,10 +386,14 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                           if u.startswith("pscalar:"))
     pert_jps = sorted(u.split(":", 1)[1] for u in uses
                       if u.startswith("pjp:"))
+    pert_hrhos = sorted(u.split(":", 1)[1] for u in uses
+                        if u.startswith("phrho:"))
 
     params = ["w", "chi", "dchi"]
     if "lapl" in uses:
         params.append("lapl_chi")
+    if "hess" in uses:
+        params.append("hess_chi")
     if "grad" in uses:
         params.append("grad_rho")
     if "grad_a" in uses:
@@ -368,10 +402,13 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
         params.append("grad_rho_b")
     if "jp" in uses:
         params.append("jp")
+    if "hrho" in uses:
+        params.append("hess_rho")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]
     params += [f"jp_{lbl}" for lbl in pert_jps]
+    params += [f"hess_rho_{lbl}" for lbl in pert_hrhos]
     params += pert_scalars
     params += libxc_args
 
@@ -406,7 +443,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     def scalar_code(name: str) -> str:
         op, kind = _classify(name)
         code = op.code
-        if batch and kind.startswith(("pgrad:", "pjp:")):
+        if batch and kind.startswith(("pgrad:", "pjp:", "phrho:")):
             code = re.sub(r"\[(\d)\]$", r"[:, \1]", code)
         return code
 
