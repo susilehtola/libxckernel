@@ -21,9 +21,11 @@ libxckernel {version}
 
 Generated exchange-correlation kernel contractions in LCAO basis sets --
 an automatic-differentiation backend for Libxc. This package contains
-GENERATED C++17 SOURCE (templated on the floating-point type;
-extern "C" double instantiations provide the stable C ABI) (do not edit; regenerate with the xckernel Python
-package). Building requires only CMake >= 3.16 and a C++17 compiler
+GENERATED C++17 SOURCE: kernels are header-only templates over the
+floating-point type (double, long double, __float128, ...), with
+extern "C" double instantiations providing the stable C ABI. Do not
+edit; regenerate with the xckernel Python package.
+Building requires only CMake >= 3.16 and a C++17 compiler
 (plus a Fortran compiler for the optional xckernel_f03 module):
 
     cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
