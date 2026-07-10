@@ -95,8 +95,8 @@ def _transform_monomials(monos, operands):
     return out
 
 
-def _cxx_sum(monos_t, weight: float, indent: str) -> List[str]:
-    """Emit `c = ...;` accumulation statements grouped by ansatz guard."""
+def _cxx_sum(monos_t, weight: float, indent: str, var: str = "c") -> List[str]:
+    """Emit `<var> += ...;` accumulation statements grouped by ansatz guard."""
     by_guard: Dict[int, List[str]] = {}
     for guard, c, exprs in monos_t:
         cw = weight * c
@@ -109,11 +109,11 @@ def _cxx_sum(monos_t, weight: float, indent: str) -> List[str]:
         if guard > 0:
             lines.append(f"{indent}if (ansatz >= {guard}) {{")
             for t in terms:
-                lines.append(f"{indent}    c += {t};")
+                lines.append(f"{indent}    {var} += {t};")
             lines.append(f"{indent}}}")
         else:
             for t in terms:
-                lines.append(f"{indent}c += {t};")
+                lines.append(f"{indent}{var} += {t};")
     return lines
 
 
@@ -571,11 +571,54 @@ def emit_rv_fx_contraction(family: str = "mgga_tau") -> str:
     return "\n".join(L)
 
 
+# --- grid-motion class of the XC gradient -------------------------------------
+
+PSI4_RV_GRIDMOTION_OPERANDS: Dict[str, Tuple[str, float]] = {
+    "drho_g": ("drho_g", 1.0),
+    "dgrad_rho_g_x": ("dgrad_g[0]", 1.0),
+    "dgrad_rho_g_y": ("dgrad_g[1]", 1.0),
+    "dgrad_rho_g_z": ("dgrad_g[2]", 1.0),
+    "dtau_g": ("dtau_g", 1.0),
+    "grad_rho_x": ("rho_g[0][P]", 1.0),
+    "grad_rho_y": ("rho_g[1][P]", 1.0),
+    "grad_rho_z": ("rho_g[2][P]", 1.0),
+    "vrho": ("v_rho[P]", 1.0),
+    "vsigma": ("v_gamma[P]", 1.0),
+    "vtau": ("v_tau[P]", 2.0),
+}
+
+
+def emit_rv_gradient_gridmotion(family: str = "mgga_tau") -> str:
+    """The generated scalar d_d e(r) of the gradient's grid-motion class:
+    per (point, direction) after the plumbing computed drho_g, the
+    density-Hessian row dgrad_g[3], and dtau_g."""
+    from .fastpoly import from_expr
+    from .geometric import spatial_energy_gradient
+    expr = spatial_energy_gradient(family)
+    monos = [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
+             for key, c in from_expr(expr).items()]
+    monos, dots = contract_dots(monos)
+    ind = "                    "
+    defs, ops = _emit_intermediates(dots, {}, PSI4_RV_GRIDMOTION_OPERANDS, ind)
+    L: List[str] = []
+    A = L.append
+    A("                    // ==> BEGIN GENERATED CODE"
+      " [xckernel psi4backend: spatial_energy_gradient(%s)] <==" % family)
+    A("                    // Reproduce with: python -m xckernel.psi4backend --gridmotion")
+    L.extend(defs)
+    A("                    double de = 0.0;")
+    L.extend(_cxx_sum(_transform_monomials(monos, ops), 1.0, ind, var="de"))
+    A("                    // ==> END GENERATED CODE <==")
+    return "\n".join(L)
+
+
 if __name__ == "__main__":
     import sys
     if "--uv" in sys.argv:
         print(emit_uv_vx_contraction())
     elif "--fx" in sys.argv:
         print(emit_rv_fx_contraction())
+    elif "--gridmotion" in sys.argv:
+        print(emit_rv_gradient_gridmotion())
     else:
         print(emit_rv_vx_contraction())

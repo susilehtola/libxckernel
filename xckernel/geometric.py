@@ -140,6 +140,18 @@ def spatial_gradient(ki: KernelIntegrand) -> KernelIntegrand:
                            expr=to_expr(out))
 
 
+def spatial_energy_gradient(family: str) -> sp.Expr:
+    """d_d of the XC energy density e(fields(r)): the per-point scalar
+    sum_k v_k d_d field_k, in direction-resolved operands. This is the
+    grid-motion class of the ENERGY derivative (the XC gradient): the host
+    contracts it with w * M^A over the parent atom's points."""
+    func = Functional.of_family(family)
+    total = sp.Integer(0)
+    for ing in func.ingredients:
+        total += func.vsymbol(ing) * _spatial_field_gradient(ing.name)
+    return sp.expand(total)
+
+
 # --- the basis (fixed-grid) class --------------------------------------------
 
 def _geometric_seed(func: Functional):
