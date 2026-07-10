@@ -56,7 +56,13 @@ _PERT_JP = re.compile(r"^jp_(p\d+)_([xyz])$")
 # density-Hessian ingredients: the packed 6-component tensor (gs + perturbed)
 _HRHO = re.compile(r"^hess_rho_(xx|xy|xz|yy|yz|zz)$")
 _PERT_HRHO = re.compile(r"^hess_rho_(p\d+)_(xx|xy|xz|yy|yz|zz)$")
-_GS_SCALAR = re.compile(r"^(inv_rho)$")
+_GS_SCALAR = re.compile(r"^(inv_rho|drho_g|dtau_g)$")
+# geometric operands: spatial-gradient basis factors (dchi_g, ddchi_g), their
+# atom-masked fixed-grid analogues (dchi_gA, ddchi_gA), and the direction-
+# resolved density-Hessian row dgrad_rho_g
+_DCHI_G = re.compile(r"^dchi_(g|gA)_(\w+)$")
+_DDCHI_G = re.compile(r"^ddchi_(g|gA)_(\w+)_([xyz])$")
+_DGRAD_G = re.compile(r"^dgrad_rho_g_([xyz])$")
 # operand *code* for a perturbed vector/tensor component, e.g. grad_rho_p1[0]
 _PERT_GRAD_CODE = re.compile(
     r"^(?:grad_rho|jp|hess_rho)_(?:[ab]_)?p\d+\[\d\]$")
@@ -85,6 +91,16 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"hess_chi[{_H6[m.group(2)]}]",
                        f"{m.group(1)}g"), "basis"
+    m = _DDCHI_G.match(name)
+    if m:
+        return Operand(f"ddchi_{m.group(1)}[{_AX[m.group(3)]}]",
+                       f"{m.group(2)}g"), "basis"
+    m = _DCHI_G.match(name)
+    if m:
+        return Operand(f"dchi_{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _DGRAD_G.match(name)
+    if m:
+        return Operand(f"dgrad_rho_g[{_AX[m.group(1)]}]", "g"), "dgrad_g"
     m = _GRAD.match(name)
     if m:
         return Operand(f"grad_rho[{_AX[m.group(1)]}]", "g"), "grad"
@@ -174,7 +190,7 @@ def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
             scalar.append(base.name)
         elif kind == "grad":
             uses.add("grad")
-        elif kind in ("grad_a", "grad_b", "jp", "hrho"):
+        elif kind in ("grad_a", "grad_b", "jp", "hrho", "dgrad_g"):
             uses.add(kind)
         elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                               "gscalar:")):
@@ -183,6 +199,8 @@ def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
             uses.add("lapl")
         elif kind == "basis" and op.code.startswith("hess_chi"):
             uses.add("hess")
+        elif kind == "basis" and op.code.startswith(("dchi_g", "ddchi_g")):
+            uses.add(op.code.split("[", 1)[0])
         for _ in range(e):
             subs.append(op.subscript)
             codes.append(op.code)
@@ -250,6 +268,9 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         params.append("lapl_chi")
     if "hess" in uses:
         params.append("hess_chi")
+    for b in ("dchi_g", "ddchi_g", "dchi_gA", "ddchi_gA"):
+        if b in uses:
+            params.append(b)
     if "grad" in uses:
         params.append("grad_rho")
     if "grad_a" in uses:
@@ -262,6 +283,8 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         params.append("jp")
     if "hrho" in uses:
         params.append("hess_rho")
+    if "dgrad_g" in uses:
+        params.append("dgrad_rho_g")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     pert_grads = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pgrad:"))
@@ -350,12 +373,14 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                     uses.add("lapl")
                 elif op.code.startswith("hess_chi"):
                     uses.add("hess")
+                elif op.code.startswith(("dchi_g", "ddchi_g")):
+                    uses.add(op.code.split("[", 1)[0])
             else:
                 if kind == "libxc":
                     libxc_used.setdefault(base.name, None)
                 elif kind == "grad":
                     uses.add("grad")
-                elif kind in ("grad_a", "grad_b", "jp", "hrho"):
+                elif kind in ("grad_a", "grad_b", "jp", "hrho", "dgrad_g"):
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                                       "gscalar:")):
@@ -394,6 +419,9 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
         params.append("lapl_chi")
     if "hess" in uses:
         params.append("hess_chi")
+    for b in ("dchi_g", "ddchi_g", "dchi_gA", "ddchi_gA"):
+        if b in uses:
+            params.append(b)
     if "grad" in uses:
         params.append("grad_rho")
     if "grad_a" in uses:
@@ -404,6 +432,8 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
         params.append("jp")
     if "hrho" in uses:
         params.append("hess_rho")
+    if "dgrad_g" in uses:
+        params.append("dgrad_rho_g")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]
