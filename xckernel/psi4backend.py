@@ -29,6 +29,7 @@ from __future__ import annotations
 from typing import Dict, List, Tuple
 
 from .codegen import CollapsedKernel, collapse
+from .compact import VECTOR_GROUPS, contract_dots, hoist_common
 
 #: our operand name -> (psi4 expression at point P, numeric factor)
 PSI4_RV_VX_OPERANDS: Dict[str, Tuple[str, float]] = {
@@ -116,58 +117,97 @@ def _cxx_sum(monos_t, weight: float, indent: str) -> List[str]:
     return lines
 
 
+def _compact_patterns(phiphi, mixed, diag):
+    """Run the IR compaction passes; returns compacted monomials plus the
+    dot / hoist definition tables."""
+    dots = {}
+    phiphi, dd = contract_dots([(float(c), tuple(f)) for c, f in phiphi])
+    dots.update(dd)
+    mixed_c = {}
+    for i in range(3):
+        mixed_c[i], dd = contract_dots([(float(c), tuple(f)) for c, f in mixed[i]])
+        dots.update(dd)
+    hoists, mixed_c = hoist_common(mixed_c)
+    diag_c = {}
+    for i in diag:
+        diag_c[i], dd = contract_dots([(float(c), tuple(f)) for c, f in diag[i]])
+        dots.update(dd)
+    return phiphi, mixed_c, diag_c, dots, hoists
+
+
+def _emit_intermediates(dots, hoists, ops, indent) -> Tuple[List[str], Dict[str, Tuple[str, float]]]:
+    """Per-point intermediate definitions (dot products, hoisted sums),
+    ansatz-guarded; extends the operand map with the new names."""
+    ops = dict(ops)
+    lines: List[str] = []
+    for name in sorted(dots):
+        g1, g2 = dots[name]
+        comps = [f"{ops[a][0]} * {ops[b][0]}"
+                 for a, b in zip(VECTOR_GROUPS[g1], VECTOR_GROUPS[g2])]
+        guard = max(_ansatz_of(a) for a in VECTOR_GROUPS[g1] + VECTOR_GROUPS[g2])
+        if guard > 0:
+            lines.append(f"{indent}double {name} = 0.0;")
+            lines.append(f"{indent}if (ansatz >= {guard}) {name} = "
+                         + " + ".join(comps) + ";")
+        else:
+            lines.append(f"{indent}const double {name} = " + " + ".join(comps) + ";")
+        ops[name] = (name, 1.0)
+    for name in sorted(hoists):
+        g, rem = hoists[name]
+        monos_t = _transform_monomials(rem, ops)
+        lines.append(f"{indent}double {name} = 0.0;")
+        by_guard: Dict[int, List[str]] = {}
+        for guard, c, exprs in monos_t:
+            pre = [] if c == 1.0 else [f"{c:.17g}"]
+            by_guard.setdefault(guard, []).append(" * ".join(pre + exprs) or "1.0")
+        for guard in sorted(by_guard):
+            terms = by_guard[guard]
+            if guard > 0:
+                lines.append(f"{indent}if (ansatz >= {guard}) {{")
+                for t in terms:
+                    lines.append(f"{indent}    {name} += {t};")
+                lines.append(f"{indent}}}")
+            else:
+                for t in terms:
+                    lines.append(f"{indent}{name} += {t};")
+        ops[name] = (name, 1.0)
+    return lines, ops
+
+
 def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
     """The generated contraction region of RV::compute_Vx_full: per-point
-    coefficient assembly into the right-factor accumulator T, the
-    completion GEMM + adjoint, and the diagonal (dphi_i, dphi_i) block.
-
-    Drop-in for the region between the perturbed-field construction and
-    the unpacking, using the surrounding function's variable names."""
+    intermediates (dot products, hoisted common factors) and coefficient
+    assembly into the right-factor accumulator T, the completion GEMM +
+    adjoint, and the diagonal (dphi_i, dphi_i) block."""
     from .response import response_fock
     ck = collapse(response_fock(family, 2))
-    (u_lbl, v_lbl) = (ck.u_lbl, ck.v_lbl)
+    phiphi, mixed, diag = _split_patterns(ck)
+    phiphi, mixed, diag, dots, hoists = _compact_patterns(phiphi, mixed, diag)
+    ind = "                "
+    defs, ops = _emit_intermediates(dots, hoists, PSI4_RV_VX_OPERANDS, ind)
 
-    # organize patterns
-    pat = {(u, v): monos for (u, v, monos) in ck.patterns}
-    mixed = {}   # i -> monomials (merged transpose pair)
-    diag = {}    # i -> monomials
-    for (u, v), monos in pat.items():
-        if u == "chi" and v == "chi":
-            continue
-        if u == "chi" and v.startswith("dchi["):
-            i = int(v[5])
-            mixed[i] = monos
-        elif v == "chi" and u.startswith("dchi["):
-            i = int(u[5])
-            # transpose partner of the (chi, dchi) pattern: coefficients are
-            # identical by construction; the adjoint completion supplies it.
-            continue
-        elif u == v and u.startswith("dchi["):
-            diag[int(u[5])] = monos
-        else:
-            raise ValueError(f"psi4backend: unsupported pattern {(u, v)}")
-
-    ops = PSI4_RV_VX_OPERANDS
     L: List[str] = []
     A = L.append
     A("            // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: response_fock(%s, order=2), restricted] <==" % family)
     A("            // Reproduce with: python -m xckernel.psi4backend")
-    A("            // Physics source: the symbolic derivative tower; every")
-    A("            // coefficient below is IR output, not hand-derived.")
+    A("            // Physics source: the symbolic derivative tower; the")
+    A("            // intermediates below are IR compaction output (dot")
+    A("            // contraction + common-factor hoisting), not hand-derived.")
     A("            for (int P = 0; P < npoints; P++) {")
     A("                std::fill(Tp[P], Tp[P] + nlocal, 0.0);")
     A("                // Do a simple screen: ignore contributions where rho is too small.")
     A("                if (rho_a[P] < v2_rho_cutoff_) continue;")
+    L.extend(defs)
     A("                double c;")
     A("                // (phi, phi) pattern at half weight (adjoint completion doubles)")
     A("                c = 0.0;")
-    L.extend(_cxx_sum(_transform_monomials(pat[("chi", "chi")], ops), 0.5, "                "))
+    L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.5, ind))
     A("                C_DAXPY(nlocal, c, phi[P], 1, Tp[P], 1);")
     for i, nm in enumerate(("phi_x", "phi_y", "phi_z")):
         A(f"                // (phi, dphi_{'xyz'[i]}) + transpose at full weight")
         A("                c = 0.0;")
-        L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, "                "))
+        L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind))
         A(f"                C_DAXPY(nlocal, c, {nm}[P], 1, Tp[P], 1);")
     A("            }")
     A("")
@@ -181,26 +221,29 @@ def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
     A("            }")
     A("")
     if diag:
-        guards = {g for i in diag for (g, c, e) in _transform_monomials(diag[i], ops)}
-        outer = min(guards)
-        A(f"            // (dphi_i, dphi_i) diagonal patterns: symmetric on their own,")
-        A(f"            // contracted after the adjoint completion at full weight")
-        A(f"            if (ansatz >= {outer}) {{")
-        A("                double** phi_i[3] = {phi_x, phi_y, phi_z};")
-        A("                for (int i = 0; i < 3; i++) {")
-        A("                    for (int P = 0; P < npoints; P++) {")
-        A("                        std::fill(Tp[P], Tp[P] + nlocal, 0.0);")
-        A("                        if (rho_a[P] < v2_rho_cutoff_) continue;")
-        A("                        double c;")
-        # all three diagonal patterns carry identical monomials; assert and emit once
         m0 = _transform_monomials(diag[0], ops)
         for i in (1, 2):
             mi = _transform_monomials(diag[i], ops)
             if sorted((g, c, tuple(e)) for g, c, e in mi) != \
                     sorted((g, c, tuple(e)) for g, c, e in m0):
                 raise ValueError("psi4backend: anisotropic diagonal patterns")
+        used = {n for c, f in diag[0] for n, e in f if n in dots}
+        ind2 = "                        "
+        defs2, ops2 = _emit_intermediates({k: dots[k] for k in used}, {},
+                                          PSI4_RV_VX_OPERANDS, ind2)
+        guards = {g for (g, c, e) in _transform_monomials(diag[0], ops2)}
+        A(f"            // (dphi_i, dphi_i) diagonal patterns: symmetric on their own,")
+        A(f"            // contracted after the adjoint completion at full weight")
+        A(f"            if (ansatz >= {min(guards)}) {{")
+        A("                double** phi_i[3] = {phi_x, phi_y, phi_z};")
+        A("                for (int i = 0; i < 3; i++) {")
+        A("                    for (int P = 0; P < npoints; P++) {")
+        A("                        std::fill(Tp[P], Tp[P] + nlocal, 0.0);")
+        A("                        if (rho_a[P] < v2_rho_cutoff_) continue;")
+        L.extend(defs2)
+        A("                        double c;")
         A("                        c = 0.0;")
-        L.extend(_cxx_sum(m0, 1.0, "                        "))
+        L.extend(_cxx_sum(_transform_monomials(diag[0], ops2), 1.0, ind2))
         A("                        C_DAXPY(nlocal, c, phi_i[i][P], 1, Tp[P], 1);")
         A("                    }")
         A("                    C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, phi_i[i][0], coll_funcs, Tp[0],")
@@ -209,9 +252,6 @@ def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
         A("            }")
     A("            // ==> END GENERATED CODE <==")
     return "\n".join(L)
-
-
-
 
 # --- unrestricted (UV) conventions -------------------------------------------
 
@@ -283,38 +323,54 @@ def _split_patterns(ck):
 
 
 def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
-    """The generated contraction region of UV::compute_Vx: both spin
-    channels assembled per point into Tap/Tbp, completion GEMMs + adjoint,
-    and the diagonal (dphi_i, dphi_i) blocks."""
+    """The generated contraction region of UV::compute_Vx: per-point
+    intermediates and both spin coefficient assemblies fused in one
+    point loop, per-spin completion GEMMs + adjoint, and the diagonal
+    (dphi_i, dphi_i) blocks."""
     from .spin_kernel import response_fock_spin
-    ops = _uv_operands()
+    base_ops = _uv_operands()
     chan = {}
+    dots_all, hoists_all = {}, {}
     for s_ in ("a", "b"):
         ck = collapse(response_fock_spin(family, s_, 2))
-        chan[s_] = _split_patterns(ck)
+        phiphi, mixed, diag = _split_patterns(ck)
+        phiphi, mixed, diag, dots, hoists = _compact_patterns(phiphi, mixed, diag)
+        # keep hoist names distinct per spin channel
+        ren = {name: f"{name}_{s_}" for name in hoists}
+        hoists = {ren[k]: v for k, v in hoists.items()}
+        for i in range(3):
+            mixed[i] = [(c, tuple(sorted((ren.get(n, n), e) for n, e in f)))
+                        for c, f in mixed[i]]
+        chan[s_] = (phiphi, mixed, diag)
+        dots_all.update(dots)
+        hoists_all.update(hoists)
+    ind = "                "
+    defs, ops = _emit_intermediates(dots_all, hoists_all, base_ops, ind)
 
     L: List[str] = []
     A = L.append
     A("            // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: response_fock_spin(%s, order=2)] <==" % family)
     A("            // Reproduce with: python -m xckernel.psi4backend --uv")
-    A("            // Physics source: the symbolic derivative tower; every")
-    A("            // coefficient below is IR output, not hand-derived.")
+    A("            // Physics source: the symbolic derivative tower; the")
+    A("            // intermediates below are IR compaction output (dot")
+    A("            // contraction + common-factor hoisting), not hand-derived.")
     A("            for (int P = 0; P < npoints; P++) {")
     A("                std::fill(Tap[P], Tap[P] + nlocal, 0.0);")
     A("                std::fill(Tbp[P], Tbp[P] + nlocal, 0.0);")
     A("                if (rho_a[P] + rho_b[P] < v2_rho_cutoff_) continue;")
+    L.extend(defs)
     A("                double c;")
     for s_, T in (("a", "Tap"), ("b", "Tbp")):
         phiphi, mixed, diag = chan[s_]
         A(f"                // spin {s_}: (phi, phi) pattern at half weight")
         A("                c = 0.0;")
-        L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.5, "                "))
+        L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.5, ind))
         A(f"                C_DAXPY(nlocal, c, phi[P], 1, {T}[P], 1);")
         for i, nm in enumerate(("phi_x", "phi_y", "phi_z")):
             A(f"                // spin {s_}: (phi, dphi_{'xyz'[i]}) + transpose at full weight")
             A("                c = 0.0;")
-            L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, "                "))
+            L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind))
             A(f"                C_DAXPY(nlocal, c, {nm}[P], 1, {T}[P], 1);")
     A("            }")
     A("")
@@ -338,8 +394,13 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
                 if sorted((g, c, tuple(e)) for g, c, e in mi) != \
                         sorted((g, c, tuple(e)) for g, c, e in m0):
                     raise ValueError("psi4backend: anisotropic diagonal patterns")
+        used = {n for s_ in ("a", "b") for c, f in chan[s_][2][0]
+                for n, e in f if n in dots_all}
+        ind2 = "                        "
+        defs2, ops2 = _emit_intermediates({k: dots_all[k] for k in used}, {},
+                                          base_ops, ind2)
         guards = {g for s_ in ("a", "b")
-                  for (g, c, e) in _transform_monomials(chan[s_][2][0], ops)}
+                  for (g, c, e) in _transform_monomials(chan[s_][2][0], ops2)}
         A(f"            // (dphi_i, dphi_i) diagonal patterns: symmetric on their own,")
         A(f"            // contracted after the adjoint completion at full weight")
         A(f"            if (ansatz >= {min(guards)}) {{")
@@ -349,11 +410,11 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
         A("                        std::fill(Tap[P], Tap[P] + nlocal, 0.0);")
         A("                        std::fill(Tbp[P], Tbp[P] + nlocal, 0.0);")
         A("                        if (rho_a[P] + rho_b[P] < v2_rho_cutoff_) continue;")
+        L.extend(defs2)
         A("                        double c;")
         for s_, T in (("a", "Tap"), ("b", "Tbp")):
             A("                        c = 0.0;")
-            L.extend(_cxx_sum(_transform_monomials(chan[s_][2][0], ops), 1.0,
-                              "                        "))
+            L.extend(_cxx_sum(_transform_monomials(chan[s_][2][0], ops2), 1.0, ind2))
             A(f"                        C_DAXPY(nlocal, c, phi_i[i][P], 1, {T}[P], 1);")
         A("                    }")
         for T, V in (("Tap", "Vax_localp"), ("Tbp", "Vbx_localp")):
@@ -363,7 +424,6 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
         A("            }")
     A("            // ==> END GENERATED CODE <==")
     return "\n".join(L)
-
 
 
 if __name__ == "__main__":
