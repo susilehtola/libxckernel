@@ -31,8 +31,11 @@ VECTOR_GROUPS: Dict[str, Tuple[str, str, str]] = {}
 for _g in ("grad_rho", "grad_rho_a", "grad_rho_b"):
     VECTOR_GROUPS[_g] = tuple(f"{_g}_{ax}" for ax in "xyz")
     VECTOR_GROUPS[f"{_g}_p1"] = tuple(f"{_g}_p1_{ax}" for ax in "xyz")
-#: direction-resolved density-Hessian row (spatial-gradient operands)
+#: direction-resolved density-Hessian rows (spatial-gradient operands)
 VECTOR_GROUPS["dgrad_rho_g"] = tuple(f"dgrad_rho_g_{ax}" for ax in "xyz")
+for _s in ("a", "b"):
+    VECTOR_GROUPS[f"dgrad_rho_{_s}_g"] = \
+        tuple(f"dgrad_rho_{_s}_g_{ax}" for ax in "xyz")
 
 _COMPONENT_OF = {comp: (g, i) for g, comps in VECTOR_GROUPS.items()
                  for i, comp in enumerate(comps)}

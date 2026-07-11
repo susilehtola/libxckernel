@@ -152,6 +152,39 @@ def spatial_energy_gradient(family: str) -> sp.Expr:
     return sp.expand(total)
 
 
+# --- spin-polarized spatial gradient (grid-motion class) ----------------------
+
+def _spatial_field_gradient_spin(K) -> sp.Expr:
+    """d_d of a polarized Libxc scalar variable, in per-channel
+    direction-resolved operands (drho_a_g, dgrad_rho_a_g_i, dtau_a_g and
+    the beta twins)."""
+    from .spin import COMP_SPINS, GRAD
+    if K.group == "rho":
+        return sp.Symbol(f"drho_{K.comp}_g", real=True)
+    if K.group == "tau":
+        return sp.Symbol(f"dtau_{K.comp}_g", real=True)
+    if K.group == "sigma":
+        s1, s2 = COMP_SPINS["sigma"][K.comp]
+        dg = {s: [sp.Symbol(f"dgrad_rho_{s}_g_{ax}", real=True) for ax in AXES]
+              for s in (s1, s2)}
+        return sum(GRAD[s1][i] * dg[s2][i] + GRAD[s2][i] * dg[s1][i]
+                   for i in range(3))
+    raise ValueError(f"spatial gradient of {K.group!r} not supported yet "
+                     "(lda/gga/mgga_tau families)")
+
+
+def spatial_energy_gradient_spin(family: str) -> sp.Expr:
+    """d_d of the polarized XC energy density: the per-point scalar
+    sum_K v_K d_d field_K over the polarized scalar variables. The
+    grid-motion class of the UKS XC gradient."""
+    from .spin import family_scalars
+    from .spin_kernel import _register
+    total = sp.Integer(0)
+    for K in family_scalars(family):
+        total += _register((K,)) * _spatial_field_gradient_spin(K)
+    return sp.expand(total)
+
+
 # --- the basis (fixed-grid) class --------------------------------------------
 
 def _geometric_seed(func: Functional):

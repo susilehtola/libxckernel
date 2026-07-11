@@ -1157,6 +1157,49 @@ def emit_uv_hessian(family: str = "mgga_tau") -> dict:
     regions["classIII"] = "\n".join(ind4 + line for line in r4)
     return regions
 
+# --- grid-motion class of the UKS XC gradient ----------------------------------
+
+def _uv_gridmotion_operands() -> Dict[str, Tuple[str, float]]:
+    """Per-(point, direction) locals of UV::compute_gradient's
+    grid-motion block, plus the polarized first-derivative arrays."""
+    ops: Dict[str, Tuple[str, float]] = {"w": ("w[P]", 1.0)}
+    for s_ in ("a", "b"):
+        ops[f"drho_{s_}_g"] = (f"drho_{s_}_g", 1.0)
+        ops[f"dtau_{s_}_g"] = (f"dtau_{s_}_g", 1.0)
+        for i, ax in enumerate("xyz"):
+            ops[f"dgrad_rho_{s_}_g_{ax}"] = (f"dgrad_{s_}[{i}]", 1.0)
+            ops[f"grad_rho_{s_}_{ax}"] = (f"rho_{s_}g[{i}][P]", 1.0)
+    for i, t in enumerate(("a", "b")):
+        ops[f"vrho_{i}"] = (f"v_rho_{t}[P]", 1.0)
+        ops[f"vtau_{i}"] = (f"v_tau_{t}[P]", 2.0)
+    for i, g in enumerate(("aa", "ab", "bb")):
+        ops[f"vsigma_{i}"] = (f"v_gamma_{g}[P]", 1.0)
+    return ops
+
+
+def emit_uv_gradient_gridmotion(family: str = "mgga_tau") -> str:
+    """The generated scalar d_d e(r) of the UKS gradient's grid-motion
+    class: per (point, direction) after the plumbing computed the
+    per-channel drho_s_g, dgrad_s[3], and dtau_s_g."""
+    from .fastpoly import from_expr
+    from .geometric import spatial_energy_gradient_spin
+    expr = spatial_energy_gradient_spin(family)
+    monos = [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
+             for key, c in from_expr(expr).items()]
+    monos, dots = contract_dots(monos)
+    ind = "                    "
+    defs, ops = _emit_intermediates(dots, {}, _uv_gridmotion_operands(), ind)
+    L: List[str] = []
+    A = L.append
+    A("                    // ==> BEGIN GENERATED CODE"
+      " [xckernel psi4backend: spatial_energy_gradient_spin(%s)] <==" % family)
+    A("                    // Reproduce with: python -m xckernel.psi4backend --uvgridmotion")
+    L.extend(defs)
+    A("                    double de = 0.0;")
+    L.extend(_cxx_sum(_transform_monomials(monos, ops), 1.0, ind, var="de"))
+    A("                    // ==> END GENERATED CODE <==")
+    return "\n".join(L)
+
 
 
 if __name__ == "__main__":
@@ -1169,6 +1212,8 @@ if __name__ == "__main__":
         print(emit_rv_gradient_gridmotion())
     elif "--uvfx" in sys.argv:
         print(emit_uv_fx_contraction())
+    elif "--uvgridmotion" in sys.argv:
+        print(emit_uv_gradient_gridmotion())
     elif "--uvhessian" in sys.argv:
         for _name, _region in emit_uv_hessian().items():
             print(f"### {_name}")
