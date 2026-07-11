@@ -56,7 +56,7 @@ _PERT_JP = re.compile(r"^jp_(p\d+)_([xyz])$")
 # density-Hessian ingredients: the packed 6-component tensor (gs + perturbed)
 _HRHO = re.compile(r"^hess_rho_(xx|xy|xz|yy|yz|zz)$")
 _PERT_HRHO = re.compile(r"^hess_rho_(p\d+)_(xx|xy|xz|yy|yz|zz)$")
-_GS_SCALAR = re.compile(r"^(inv_rho|drho_g|dtau_g)$")
+_GS_SCALAR = re.compile(r"^(inv_rho|drho_g|dtau_g|drho_[ab]_g|dtau_[ab]_g)$")
 # geometric operands: spatial-gradient basis factors (dchi_g, ddchi_g), their
 # atom-masked fixed-grid analogues (dchi_gA, ddchi_gA), and the direction-
 # resolved density-Hessian row dgrad_rho_g
@@ -70,6 +70,7 @@ _UROW = re.compile(r"^U(0|[123])_(\w+)$")
 # the local density-matrix pair factor (two free labels)
 _DPAIR = re.compile(r"^D_(\w+)_(\w+)$")
 _DGRAD_G = re.compile(r"^dgrad_rho_g_([xyz])$")
+_DGRAD_G_SPIN = re.compile(r"^dgrad_rho_([ab])_g_([xyz])$")
 # operand *code* for a perturbed vector/tensor component, e.g. grad_rho_p1[0]
 _PERT_GRAD_CODE = re.compile(
     r"^(?:grad_rho|jp|hess_rho)_(?:[ab]_)?p\d+\[\d\]$")
@@ -120,6 +121,10 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _DGRAD_G.match(name)
     if m:
         return Operand(f"dgrad_rho_g[{_AX[m.group(1)]}]", "g"), "dgrad_g"
+    m = _DGRAD_G_SPIN.match(name)
+    if m:
+        return Operand(f"dgrad_rho_{m.group(1)}_g[{_AX[m.group(2)]}]", "g"), \
+            f"dgrad_g_{m.group(1)}"
     m = _GRAD.match(name)
     if m:
         return Operand(f"grad_rho[{_AX[m.group(1)]}]", "g"), "grad"

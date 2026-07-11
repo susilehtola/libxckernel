@@ -16,9 +16,9 @@ import numpy as np
 import sympy as sp
 
 from ..geometric import (_geo_rows_spin, spatial_energy_hessian_spin,
-                         spatial_row_gradient_spin)
+                         spatial_gradient_spin, spatial_row_gradient_spin)
 from ..spin import family_scalars
-from ..spin_kernel import _register
+from ..spin_kernel import _register, fock_spin
 from .geometric2_validate import ALPHA, colloc
 from .geometric_spin_validate import (_ARGS, _F, _deriv_arrays, _spin_fields,
                                       evaluate)
@@ -174,6 +174,50 @@ def main():
         failures += not ok
         print(f"  [{'OK' if ok else 'FAIL'}] mb(x={'xyz'[xd]},h={'xyz'[yd]}): "
               f"max rel {rel:.2e}")
+
+    # ---- spatial_gradient_spin: d_d of the spin Fock integrand vs FD --------
+    def fock_env(pts_, extra=None):
+        chi_, dchi_, d2chi_, _ = colloc(centers, pts_)
+        _, grad_, _, vals_ = _spin_fields(Da, Db, chi_, dchi_)
+        env = {"w": np.ones(pts_.shape[0])}
+        env.update(_deriv_arrays(all_names, vals_))
+        for s in "ab":
+            for i, ax in enumerate("xyz"):
+                env[f"grad_rho_{s}_{ax}"] = grad_[s][i]
+        env["chi_u"] = env["chi_v"] = chi_
+        for i, ax in enumerate("xyz"):
+            env[f"dchi_u_{ax}"] = env[f"dchi_v_{ax}"] = dchi_[i]
+        return env, chi_, dchi_, d2chi_
+
+    for spin in "ab":
+        fi = fock_spin("mgga_tau", spin)
+        sg = spatial_gradient_spin("mgga_tau", spin)
+        all_names = {s.name for s in (fi.expr.free_symbols
+                                      | sg.expr.free_symbols)}
+        xd = 1 if spin == "a" else 2
+        env, chi_c, dchi_c, d2chi_c = fock_env(pts)
+        for lbl in ("u", "v"):
+            env[f"dchi_g_{lbl}"] = dchi_c[xd]
+            for i, ax in enumerate("xyz"):
+                env[f"ddchi_g_{lbl}_{ax}"] = d2chi_c[xd, i]
+        env.update(_spatial_env(D, chi_c, dchi_c, d2chi_c, None, "g", xd))
+        an = evaluate(sg.expr, env, "uvg")
+
+        def dF(hh):
+            ex = np.zeros(3)
+            ex[xd] = hh
+            ep, _, _, _ = fock_env(pts + ex)
+            em, _, _, _ = fock_env(pts - ex)
+            return (evaluate(fi.expr, ep, "uvg")
+                    - evaluate(fi.expr, em, "uvg")) / (2 * hh)
+
+        ref = (4 * dF(h / 2) - dF(h)) / 3
+        rel = np.abs(an - ref).max() / max(np.abs(ref).max(), 1e-12)
+        ok = rel < 1e-8
+        tested += 1
+        failures += not ok
+        print(f"  [{'OK' if ok else 'FAIL'}] d_{'xyz'[xd]} f^{spin}_uv "
+              f"(spatial_gradient_spin): max rel {rel:.2e}")
 
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] geometric2_spin_validate: {tested} checks, "

@@ -385,6 +385,47 @@ def _geometric_seed_spin(family: str, label: str = "p1"):
     return seed
 
 
+def spatial_gradient_spin(family: str, spin: str, u: str = "u", v: str = "v"):
+    """d_d of the spin Fock integrand at fixed density (the grid-motion
+    class of the UKS Fock derivative): basis factors differentiate to the
+    unmasked spatial collocations dchi_g / ddchi_g (no sign fold), the
+    gradient fields and polarized Libxc symbols chain to the per-channel
+    direction-resolved spatial operands (drho_s_g, dgrad_rho_s_g_i,
+    dtau_s_g)."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    from .spin import GRAD, SPINS, family_scalars
+    from .spin_kernel import (SpinIntegrand, _SYM_SCALARS, _register,
+                              fock_spin)
+    fi = fock_spin(family, spin, u, v)
+    scalars = family_scalars(family)
+    grad_info = {GRAD[s][i]: (s, i) for s in SPINS for i in range(3)}
+
+    def seed(atom: sp.Symbol):
+        name = atom.name
+        m = _CHI_RE.match(name)
+        if m:
+            return from_expr(sp.Symbol(f"dchi_g_{m.group(1)}", real=True))
+        m = _DCHI_RE.match(name)
+        if m:
+            return from_expr(sp.Symbol(f"ddchi_g_{m.group(1)}_{m.group(2)}",
+                                       real=True))
+        if atom in grad_info:
+            s, i = grad_info[atom]
+            return from_expr(sp.Symbol(f"dgrad_rho_{s}_g_{AXES[i]}",
+                                       real=True))
+        if name in _SYM_SCALARS:
+            base = _SYM_SCALARS[name]
+            total = sp.Integer(0)
+            for Y in scalars:
+                total += _register(base + (Y,)) \
+                    * _spatial_field_gradient_spin(Y, "g")
+            return from_expr(total)
+        return None
+    out = seeded_derivative(from_expr(fi.expr), seed)
+    return SpinIntegrand(family=family, spins=[spin], index_pairs=[(u, v)],
+                         expr=to_expr(out))
+
+
 def geometric_fock_spin(family: str, spin: str, u: str = "u", v: str = "v"):
     """Basis-class integrand of dF^spin_uv/dX at fixed density and fixed
     grid: the spin-resolved analogue of geometric_fock. Operands are the

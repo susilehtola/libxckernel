@@ -1522,6 +1522,262 @@ def emit_uv_hessian_gridresponse(family: str = "mgga_tau") -> dict:
     regions["mb"] = "\n".join(L)
     return regions
 
+# --- compute_fock_derivatives quadrature-response classes -----------------------
+
+def _fxgrid_split(ck):
+    """Split a quadrature-response Fock kernel (the fock integrand for the
+    weight class; its spatial gradient for the grid-motion class) into the
+    accumulator groups of the scatter host (ACC + ACC^T applied once:
+    symmetric patterns at HALF weight, one transpose member at FULL).
+
+    Returns (T0, Ti): T0 is a list of (left factor, monos, weight) groups
+    contracted against phi; Ti[i] the groups contracted against dphi_i."""
+    pat = {(u, v): m for (u, v, m) in ck.patterns}
+
+    def side(f):
+        if f == "chi":
+            return ("chi", None)
+        if f.startswith("dchi["):
+            return ("dchi", int(f[5]))
+        if f == "dchi_g":
+            return ("dchi_g", None)
+        if f.startswith("ddchi_g["):
+            return ("ddchi_g", int(f[8]))
+        raise ValueError(f"psi4backend: unsupported factor {f!r}")
+
+    T0, Ti = [], {0: [], 1: [], 2: []}
+    seen = set()
+    for (u, v), monos in sorted(pat.items()):
+        if (u, v) in seen:
+            continue
+        if u == v:
+            ku, iu = side(u)
+            if ku == "chi":
+                T0.append((u, monos, 0.5))
+            elif ku == "dchi":
+                Ti[iu].append((u, monos, 0.5))
+            else:
+                raise ValueError(f"psi4backend: symmetric pattern {u!r}")
+        else:
+            if sorted(monos) != sorted(pat[(v, u)]):
+                raise ValueError("psi4backend: asymmetric transpose pair")
+            seen.add((v, u))
+            ku, _ = side(u)
+            kv, _ = side(v)
+            if kv == "chi":
+                left, right = u, v
+            elif ku == "chi":
+                left, right = v, u
+            elif kv == "dchi":
+                left, right = u, v
+            elif ku == "dchi":
+                left, right = v, u
+            else:
+                raise ValueError(f"psi4backend: pattern {(u, v)!r}")
+            kr, ir = side(right)
+            if kr == "chi":
+                T0.append((left, monos, 1.0))
+            else:
+                Ti[ir].append((left, monos, 1.0))
+    return T0, Ti
+
+
+def _emit_fx_grid_class(ck, ops, ind, cutoff, T0name, Tiname, ha):
+    """Emit one quadrature-response class block: a fused point loop that
+    assembles the T0 (right factor phi) and Ti (right factor dphi_i)
+    coefficient rows, then the completion GEMMs into Vx_localp (the host
+    scatter adds the transpose)."""
+    T0pats, Tipats = _fxgrid_split(ck)
+
+    def left_code(f, i_ctx=None):
+        if f == "chi":
+            return "phi"
+        if f.startswith("dchi["):
+            return f"phi_i[{int(f[5])}]"
+        if f == "dchi_g":
+            return "phi_i[d]"
+        if f.startswith("ddchi_g["):
+            return f"phi_hess[{ha}[d][{int(f[8])}]]"
+        raise ValueError(f)
+
+    def _needs1(f):
+        return f.startswith("ddchi_g[")
+
+    L: List[str] = []
+    A = L.append
+    A(ind + "for (int P = 0; P < npoints; P++) {")
+    A(ind + f"    std::fill({T0name}[P], {T0name}[P] + nlocal, 0.0);")
+    A(ind + "    if (ansatz >= 1) {")
+    for i in range(3):
+        A(ind + f"        std::fill({Tiname}[{i}][P], {Tiname}[{i}][P]"
+          " + nlocal, 0.0);")
+    A(ind + "    }")
+    A(ind + f"    if ({cutoff}) continue;")
+    # per-pattern dot compaction, shared definitions at loop top
+    dots_all = {}
+    T0c, Tic = [], {0: [], 1: [], 2: []}
+    for (left, monos, wf) in T0pats:
+        monos_c, dd = contract_dots([(float(c), tuple(f)) for c, f in monos])
+        dots_all.update(dd)
+        T0c.append((left, monos_c, wf))
+    for i in range(3):
+        for (left, monos, wf) in Tipats[i]:
+            monos_c, dd = contract_dots([(float(c), tuple(f))
+                                         for c, f in monos])
+            dots_all.update(dd)
+            Tic[i].append((left, monos_c, wf))
+    defs, ops2 = _emit_intermediates(dots_all, {}, ops, ind + "    ")
+    L.extend(defs)
+    A(ind + "    double c;")
+    order = {"chi": 0, "dchi[": 1, "dchi_g": 2, "ddchi_g[": 3}
+
+    def _clamp(monos_t, g):
+        # guards at or below the enclosing wrapper print unguarded
+        return [(0 if gg <= g else gg, c, e) for gg, c, e in monos_t]
+
+    for (left, monos, wf) in sorted(
+            T0c, key=lambda t: next(v for k, v in order.items()
+                                    if t[0].startswith(k) or t[0] == k)):
+        monos_t = _transform_monomials(monos, ops2)
+        g = max(1, min(gg for gg, c, e in monos_t)) if _needs1(left) \
+            else min(gg for gg, c, e in monos_t)
+        wtag = " at half weight" if wf == 0.5 else ""
+        A(ind + f"    // ({left}, chi){wtag}")
+        if g > 0:
+            A(ind + f"    if (ansatz >= {g}) {{")
+            A(ind + "        c = 0.0;")
+            L.extend(_cxx_sum(_clamp(monos_t, g), wf, ind + "        "))
+            A(ind + f"        C_DAXPY(nlocal, c, {left_code(left)}[P], 1, "
+              f"{T0name}[P], 1);")
+            A(ind + "    }")
+        else:
+            A(ind + "    c = 0.0;")
+            L.extend(_cxx_sum(monos_t, wf, ind + "    "))
+            A(ind + f"    C_DAXPY(nlocal, c, {left_code(left)}[P], 1, "
+              f"{T0name}[P], 1);")
+    if any(Tic[i] for i in range(3)):
+        A(ind + "    if (ansatz >= 1) {")
+        for i in range(3):
+            for (left, monos, wf) in sorted(
+                    Tic[i], key=lambda t: next(v for k, v in order.items()
+                                               if t[0].startswith(k)
+                                               or t[0] == k)):
+                monos_t = _transform_monomials(monos, ops2)
+                g = max(1, min(gg for gg, c, e in monos_t))
+                wtag = " at half weight" if wf == 0.5 else ""
+                A(ind + f"        // ({left}, dchi[{i}]){wtag}")
+                if g > 1:
+                    A(ind + f"        if (ansatz >= {g}) {{")
+                    A(ind + "            c = 0.0;")
+                    L.extend(_cxx_sum(_clamp(monos_t, g), wf,
+                                      ind + "            "))
+                    A(ind + f"            C_DAXPY(nlocal, c, "
+                      f"{left_code(left)}[P], 1, {Tiname}[{i}][P], 1);")
+                    A(ind + "        }")
+                else:
+                    A(ind + "        c = 0.0;")
+                    L.extend(_cxx_sum(_clamp(monos_t, 1), wf, ind + "        "))
+                    A(ind + f"        C_DAXPY(nlocal, c, {left_code(left)}[P],"
+                      f" 1, {Tiname}[{i}][P], 1);")
+        A(ind + "    }")
+    A(ind + "}")
+    A(ind + f"C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, {T0name}[0], "
+      "max_functions, phi[0], coll_funcs, 0.0,")
+    A(ind + "        Vx_localp[0], max_functions);")
+    if any(Tic[i] for i in range(3)):
+        A(ind + "if (ansatz >= 1) {")
+        A(ind + "    for (int i = 0; i < 3; i++) {")
+        A(ind + f"        C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, "
+          f"{Tiname}[i][0], max_functions, phi_i[i][0], coll_funcs, 1.0,")
+        A(ind + "                Vx_localp[0], max_functions);")
+        A(ind + "    }")
+        A(ind + "}")
+    return L
+
+
+def emit_rv_fx_gridresponse(family: str = "mgga_tau") -> dict:
+    """The two quadrature-response class blocks of
+    RV::compute_fock_derivatives: the weight class (the Fock integrand
+    with weight := dw_X) and the grid-motion class (the spatial gradient
+    of the Fock integrand, weight w, parent-atom directions)."""
+    from .geometric import spatial_gradient
+    from .kernel import fock
+    mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
+                         f"{what}, restricted] <==")
+    END = "// ==> END GENERATED CODE <=="
+    cutoff = "std::fabs(rho_a[P]) <= v2_rho_cutoff_"
+
+    base = dict(PSI4_RV_FX_OPERANDS)
+    base.update({
+        "drho_g": ("drho[3 * P + d]", 1.0),
+        "dtau_g": ("dtau[3 * P + d]", 1.0),
+    })
+    for i, ax in enumerate("xyz"):
+        base[f"grad_rho_{ax}"] = (f"rho_g[{i}][P]", 1.0)
+        base[f"dgrad_rho_g_{ax}"] = \
+            (f"ddrho6[6 * P + hess_addr[d][{i}]]", 1.0)
+
+    regions = {}
+    ind = " " * 16
+    ops = dict(base)
+    ops["w"] = ("dwp[X][P]", 1.0)
+    L = [ind + mark(f"fock({family}) weight class")]
+    L.extend(_emit_fx_grid_class(collapse(fock(family)), ops, ind, cutoff,
+                                 "T0p", "Tip", "hess_addr"))
+    L.append(ind + END)
+    regions["weight"] = "\n".join(L)
+
+    ops = dict(base)
+    ops["w"] = ("w[P]", 1.0)
+    L = [ind + mark(f"spatial_gradient(fock({family}))")]
+    L.extend(_emit_fx_grid_class(collapse(spatial_gradient(fock(family))),
+                                 ops, ind, cutoff, "T0p", "Tip", "hess_addr"))
+    L.append(ind + END)
+    regions["gridmotion"] = "\n".join(L)
+    return regions
+
+
+def emit_uv_fx_gridresponse(family: str = "mgga_tau") -> dict:
+    """The quadrature-response class blocks of
+    UV::compute_fock_derivatives, per spin channel: the weight class
+    (the spin Fock integrand with weight := dw_X) and the grid-motion
+    class (spatial_gradient_spin, weight w, parent-atom directions)."""
+    from .geometric import spatial_gradient_spin
+    from .spin_kernel import fock_spin
+    mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
+                         f"{what}] <==")
+    END = "// ==> END GENERATED CODE <=="
+    cutoff = "rho_a[P] + rho_b[P] < v2_rho_cutoff_"
+
+    base = _uv_fx_operands()
+    for sp_, s_ in ((0, "a"), (1, "b")):
+        base[f"drho_{s_}_g"] = (f"drho[6 * P + {3 * sp_} + d]", 1.0)
+        base[f"dtau_{s_}_g"] = (f"dtau[6 * P + {3 * sp_} + d]", 1.0)
+        for i, ax in enumerate("xyz"):
+            base[f"dgrad_rho_{s_}_g_{ax}"] = \
+                (f"ddrho[12 * P + {6 * sp_} + hess_addr_r[d][{i}]]", 1.0)
+
+    regions = {}
+    ind = " " * 16
+    for s_, T0, Ti in (("a", "T0ap", "Tiap"), ("b", "T0bp", "Tibp")):
+        ops = dict(base)
+        ops["w"] = ("dwp[X][P]", 1.0)
+        L = [ind + mark(f"fock_spin({family}, {s_}) weight class")]
+        L.extend(_emit_fx_grid_class(collapse(fock_spin(family, s_)), ops,
+                                     ind, cutoff, T0, Ti, "hess_addr_r"))
+        L.append(ind + END)
+        regions[f"weight_{s_}"] = "\n".join(L)
+
+        ops = dict(base)
+        ops["w"] = ("w[P]", 1.0)
+        L = [ind + mark(f"spatial_gradient_spin({family}, {s_})")]
+        L.extend(_emit_fx_grid_class(
+            collapse(spatial_gradient_spin(family, s_)), ops, ind, cutoff,
+            T0, Ti, "hess_addr_r"))
+        L.append(ind + END)
+        regions[f"gridmotion_{s_}"] = "\n".join(L)
+    return regions
+
 
 
 if __name__ == "__main__":
@@ -1540,6 +1796,14 @@ if __name__ == "__main__":
             print(_region)
     elif "--uvgridhess" in sys.argv:
         for _name, _region in emit_uv_hessian_gridresponse().items():
+            print(f"### {_name}")
+            print(_region)
+    elif "--fxgrid" in sys.argv:
+        for _name, _region in emit_rv_fx_gridresponse().items():
+            print(f"### {_name}")
+            print(_region)
+    elif "--uvfxgrid" in sys.argv:
+        for _name, _region in emit_uv_fx_gridresponse().items():
             print(f"### {_name}")
             print(_region)
     elif "--uvgridmotion" in sys.argv:
