@@ -60,8 +60,15 @@ _GS_SCALAR = re.compile(r"^(inv_rho|drho_g|dtau_g)$")
 # geometric operands: spatial-gradient basis factors (dchi_g, ddchi_g), their
 # atom-masked fixed-grid analogues (dchi_gA, ddchi_gA), and the direction-
 # resolved density-Hessian row dgrad_rho_g
-_DCHI_G = re.compile(r"^dchi_(g|gA)_(\w+)$")
-_DDCHI_G = re.compile(r"^ddchi_(g|gA)_(\w+)_([xyz])$")
+_DCHI_G = re.compile(r"^dchi_(g|gA|gB)_(\w+)$")
+_DDCHI_G = re.compile(r"^ddchi_(g|gA|gB)_(\w+)_([xyz])$")
+# second-displacement masked collocations (both nuclear derivatives on the
+# same function) and density-contracted collocation rows
+_D2CHI_G2 = re.compile(r"^d2chi_g2_(\w+)$")
+_D3CHI_G2 = re.compile(r"^d3chi_g2_(\w+)_([xyz])$")
+_UROW = re.compile(r"^U(0|[123])_(\w+)$")
+# the local density-matrix pair factor (two free labels)
+_DPAIR = re.compile(r"^D_(\w+)_(\w+)$")
 _DGRAD_G = re.compile(r"^dgrad_rho_g_([xyz])$")
 # operand *code* for a perturbed vector/tensor component, e.g. grad_rho_p1[0]
 _PERT_GRAD_CODE = re.compile(
@@ -98,6 +105,18 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _DCHI_G.match(name)
     if m:
         return Operand(f"dchi_{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _D2CHI_G2.match(name)
+    if m:
+        return Operand("d2chi_g2", f"{m.group(1)}g"), "basis"
+    m = _D3CHI_G2.match(name)
+    if m:
+        return Operand(f"d3chi_g2[{_AX[m.group(2)]}]", f"{m.group(1)}g"), "basis"
+    m = _UROW.match(name)
+    if m:
+        return Operand(f"U{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _DPAIR.match(name)
+    if m:
+        return Operand("Dloc", f"{m.group(1)}{m.group(2)}"), "dpair"
     m = _DGRAD_G.match(name)
     if m:
         return Operand(f"dgrad_rho_g[{_AX[m.group(1)]}]", "g"), "dgrad_g"

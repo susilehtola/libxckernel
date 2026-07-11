@@ -214,3 +214,91 @@ def geometric_dispatch(family: str) -> GeometricDispatch:
     return GeometricDispatch(basis=geometric_fock(family),
                              grid=spatial_gradient(fi),
                              weight=fi)
+
+# --- the second-order geometric operator (fixed-grid basis class) -------------
+
+@dataclass
+class GeometricHessian:
+    """The explicit fixed-grid XC Hessian as a function-pair kernel:
+
+        H^{(A,x),(B,y)} = sum_{u in A, v in B} pair_{uv} + delta_AB sum_{u in A} same_u
+
+    ``pair`` carries two free labels (u for the X side, v for the Y side);
+    ``same`` one. Operand vocabulary (all per function and grid point):
+    U0_u = (phi D)_u and Ui_u = (dphi_i D)_u density-contracted collocation
+    rows; dchi_gA_u / ddchi_gA_u_i (X side) and dchi_gB_v / ddchi_gB_v_i
+    (Y side) masked displacement collocations CARRYING the -d/dr sign;
+    d2chi_g2_u / d3chi_g2_u_i the double-displacement collocations (two
+    signs cancel: they carry +d^2/dxdy); D_u_v the local density-matrix
+    pair factor.
+    """
+    family: str
+    pair: sp.Expr
+    same: sp.Expr
+
+
+def _geo_rows(label: str, side: str, func: Functional):
+    """Per-function field-derivative rows F_k(u) for one displacement:
+    field^{(A,x)} = sum_{u in A} F_k(u), plus the gradient rows G_i."""
+    U0 = sp.Symbol(f"U0_{label}", real=True)
+    Ui = [sp.Symbol(f"U{i + 1}_{label}", real=True) for i in range(3)]
+    dg = sp.Symbol(f"dchi_g{side}_{label}", real=True)
+    ddg = [sp.Symbol(f"ddchi_g{side}_{label}_{ax}", real=True) for ax in AXES]
+    from .ingredients import GRAD_RHO
+    G = [2 * (U0 * ddg[i] + Ui[i] * dg) for i in range(3)]
+    rows = {"rho": 2 * U0 * dg,
+            "sigma": 2 * sum(GRAD_RHO[i].symbol * G[i] for i in range(3)),
+            "tau": sum(Ui[i] * ddg[i] for i in range(3))}
+    return {k: rows[k] for k in rows if k in {i.name for i in func.ingredients}}, G, (U0, Ui, dg, ddg)
+
+
+def geometric_hessian(family: str, u: str = "u", v: str = "v") -> GeometricHessian:
+    """Second geometric derivative of the XC energy integrand at fixed
+    density and fixed grid (the basis class): the explicit term of the
+    analytic nuclear Hessian."""
+    from collections import Counter
+
+    from .deriv import libxc_symbol
+    from .ingredients import GRAD_RHO
+    func = Functional.of_family(family)
+    names = [ing.name for ing in func.ingredients]
+    if any(n not in ("rho", "sigma", "tau") for n in names):
+        raise ValueError("geometric_hessian supports lda/gga/mgga_tau")
+    w = sp.Symbol("w", real=True, positive=True)
+    D = sp.Symbol(f"D_{u}_{v}", real=True)
+
+    FA, GA, (U0u, Uiu, dgu, ddgu) = _geo_rows(u, "A", func)
+    FB, GB, (U0v, Uiv, dgv, ddgv) = _geo_rows(v, "B", func)
+
+    # field x field through the second functional derivatives
+    pair = sp.Integer(0)
+    for k in names:
+        for l in names:
+            pair += libxc_symbol(Counter({k: 1}) + Counter({l: 1})) * FA[k] * FB[l]
+    # the vsigma gradient cross term of sigma^{XY}
+    if "sigma" in names:
+        pair += func.vsymbol([i for i in func.ingredients if i.name == "sigma"][0])             * 2 * sum(GA[i] * GB[i] for i in range(3))
+
+    # potential times the two-center seed second derivatives
+    vs = {ing.name: func.vsymbol(ing) for ing in func.ingredients}
+    pair += vs["rho"] * 2 * D * dgu * dgv
+    if "sigma" in names:
+        pair += vs["sigma"] * 2 * sum(
+            GRAD_RHO[i].symbol * 2 * D * (ddgu[i] * dgv + dgu * ddgv[i])
+            for i in range(3))
+    if "tau" in names:
+        pair += vs["tau"] * D * sum(ddgu[i] * ddgv[i] for i in range(3))
+
+    # potential times the one-center seed second derivatives
+    d2 = sp.Symbol(f"d2chi_g2_{u}", real=True)
+    d3 = [sp.Symbol(f"d3chi_g2_{u}_{ax}", real=True) for ax in AXES]
+    same = vs["rho"] * 2 * U0u * d2
+    if "sigma" in names:
+        same += vs["sigma"] * 2 * sum(
+            GRAD_RHO[i].symbol * 2 * (U0u * d3[i] + Uiu[i] * d2) for i in range(3))
+    if "tau" in names:
+        same += vs["tau"] * sum(Uiu[i] * d3[i] for i in range(3))
+
+    return GeometricHessian(family=family, pair=sp.expand(w * pair),
+                            same=sp.expand(w * same))
+
