@@ -235,6 +235,12 @@ class GeometricHessian:
     family: str
     pair: sp.Expr
     same: sp.Expr
+    #: backend-facing structure: the i=0 instances of the per-function
+    #: rows and seed members (i-generic across Cartesian components),
+    #: WITHOUT the quadrature weight. Emitters bind the component index
+    #: and fold class symmetry factors (symmetric classes enter
+    #: accumulate-plus-transpose hosts at half weight).
+    hints: dict
 
 
 def _geo_rows(label: str, side: str, func: Functional):
@@ -299,6 +305,22 @@ def geometric_hessian(family: str, u: str = "u", v: str = "v") -> GeometricHessi
     if "tau" in names:
         same += vs["tau"] * sum(Uiu[i] * d3[i] for i in range(3))
 
+    hints = {"F_rho": FA["rho"], "G_i": GA[0],
+             "seed_pair_rho": vs["rho"] * 2 * D * dgu * dgv,
+             "seed_same_rho": vs["rho"] * 2 * U0u * d2}
+    if "sigma" in names:
+        hints["F_sigma_i"] = 2 * GRAD_RHO[0].symbol * sp.Symbol("G_i", real=True)
+        # the left member of the transpose pair; the mirror comes from
+        # the host's accumulate-plus-transpose
+        hints["seed_pair_sigma_i"] = vs["sigma"] * 2 * GRAD_RHO[0].symbol \
+            * 2 * D * ddgu[0] * dgv
+        hints["seed_same_sigma_i"] = vs["sigma"] * 2 * GRAD_RHO[0].symbol \
+            * 2 * (U0u * d3[0] + Uiu[0] * d2)
+    if "tau" in names:
+        hints["F_tau_i"] = Uiu[0] * ddgu[0]
+        hints["seed_pair_tau_i"] = vs["tau"] * D * ddgu[0] * ddgv[0]
+        hints["seed_same_tau_i"] = vs["tau"] * Uiu[0] * d3[0]
+
     return GeometricHessian(family=family, pair=sp.expand(w * pair),
-                            same=sp.expand(w * same))
+                            same=sp.expand(w * same), hints=hints)
 

@@ -205,10 +205,15 @@ def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
     L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.5, ind))
     A("                C_DAXPY(nlocal, c, phi[P], 1, Tp[P], 1);")
     for i, nm in enumerate(("phi_x", "phi_y", "phi_z")):
+        # the gradient collocation itself needs ansatz >= 1: guard the
+        # whole statement group (an alpha of zero does not excuse
+        # dereferencing an uninitialized pointer in the DAXPY arguments)
         A(f"                // (phi, dphi_{'xyz'[i]}) + transpose at full weight")
-        A("                c = 0.0;")
-        L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind))
-        A(f"                C_DAXPY(nlocal, c, {nm}[P], 1, Tp[P], 1);")
+        A("                if (ansatz >= 1) {")
+        A("                    c = 0.0;")
+        L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind + "    "))
+        A(f"                    C_DAXPY(nlocal, c, {nm}[P], 1, Tp[P], 1);")
+        A("                }")
     A("            }")
     A("")
     A("            // ===> Contract T against phi, and complete with the adjoint <===")
@@ -368,10 +373,13 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
         L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.5, ind))
         A(f"                C_DAXPY(nlocal, c, phi[P], 1, {T}[P], 1);")
         for i, nm in enumerate(("phi_x", "phi_y", "phi_z")):
+            # guard the whole group: phi_x is uninitialized below ansatz 1
             A(f"                // spin {s_}: (phi, dphi_{'xyz'[i]}) + transpose at full weight")
-            A("                c = 0.0;")
-            L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind))
-            A(f"                C_DAXPY(nlocal, c, {nm}[P], 1, {T}[P], 1);")
+            A("                if (ansatz >= 1) {")
+            A("                    c = 0.0;")
+            L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 1.0, ind + "    "))
+            A(f"                    C_DAXPY(nlocal, c, {nm}[P], 1, {T}[P], 1);")
+            A("                }")
     A("            }")
     A("")
     A("            // ===> Contract Ta and Tb against phi, and complete with the adjoint <===")
@@ -612,6 +620,159 @@ def emit_rv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     return "\n".join(L)
 
 
+# --- RV::compute_hessian: the explicit fixed-grid term ------------------------
+
+#: operand map for the Hessian pair kernel, per-function context
+#: (P = point, ml/nl = function, xd/yd = displacement direction, i =
+#: Cartesian component). Factors fold the Psi4 conventions: U rows are
+#: built from D_alpha (x2 for the total density), masked displacement
+#: collocations carry -d/dr against raw PHI_X arrays (x-1), the pair
+#: factor is D_alpha (x2), and tau-index libxc derivatives are stored
+#: halved per tau index. Text None = right-side/pair factor folded into
+#: the coefficient only (the host GEMM supplies the raw array).
+PSI4_RV_HESS_OPERANDS = {
+    "U0_u": ("U0[P][ml]", 2.0),
+    "U1_u": ("Uip[i][P][ml]", 2.0),
+    "dchi_gA_u": ("phi_i[xd][P][ml]", -1.0),
+    "ddchi_gA_u_x": ("phi_hess[hess_addr[xd][i]][P][ml]", -1.0),
+    "dchi_gB_v": (None, -1.0),
+    "ddchi_gB_v_x": (None, -1.0),
+    "D_u_v": (None, 2.0),
+    "d2chi_g2_u": ("phi_hess[hess_addr[xd][yd]][P][ml]", 1.0),
+    "d3chi_g2_u_x": ("phi_3[t3_addr[xd][yd][i]][P][ml]", 1.0),
+    "grad_rho_x": ("rho_g[i][P]", 1.0),
+    "vrho": ("v_rho_a[P]", 1.0),
+    "vsigma": ("v_gamma[P]", 1.0),
+    "vtau": ("v_tau[P]", 2.0),
+    "G_i": ("g", 1.0),
+}
+
+#: second-derivative arrays in the class-I field x field contraction
+PSI4_RV_HESS_FXX = {
+    "v2rho2": ("v_rho_aa[P]", 1.0),
+    "v2rhosigma": ("v2_rho_gamma[P]", 1.0),
+    "v2sigma2": ("v2_gamma_gamma[P]", 1.0),
+    "v2rhotau": ("v2_rho_tau[P]", 2.0),
+    "v2sigmatau": ("v2_gamma_tau[P]", 2.0),
+    "v2tau2": ("v2_tau_tau[P]", 4.0),
+}
+
+
+def _hx(expr, scale: float = 1.0, weight: str = "") -> str:
+    """Transform a hint expression to a C sum with the Hessian operand
+    map: per-monomial coefficient x mapped factors, optionally times the
+    quadrature weight."""
+    from .fastpoly import from_expr
+    terms = []
+    for key, coeff in sorted(from_expr(expr).items(),
+                             key=lambda kv: str(kv[0])):
+        c = float(coeff) * scale
+        facs = []
+        for sym, e in key:
+            text, fac = PSI4_RV_HESS_OPERANDS[sym.name]
+            c *= fac ** e
+            if text is not None:
+                facs.extend([text] * e)
+        if weight:
+            facs.insert(0, weight)
+        body = " * ".join(facs)
+        terms.append(f"{c:+.1f} * {body}" if body else f"{c:+.1f}")
+    out = " ".join(terms)
+    return out[1:] if out.startswith("+") else out
+
+
+def emit_rv_hessian(family: str = "mgga_tau") -> dict:
+    """Emit the four IR-dense regions of RV::compute_hessian's explicit
+    fixed-grid term (the GEMM/scatter orchestration is host plumbing):
+    the per-function field-derivative row fill, the class-I coefficient
+    assembly, the class-II seed coefficients, and the class-III
+    one-center body."""
+    from collections import Counter
+
+    from .deriv import libxc_symbol
+    from .geometric import geometric_hessian
+    gh = geometric_hessian(family)
+    h = gh.hints
+    mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
+                         f"geometric_hessian({family}) {what}, restricted] <==")
+    END = "// ==> END GENERATED CODE <=="
+    regions = {}
+
+    # R1: field-derivative row fill (bound in the host's xd/P/ml loops)
+    ind = " " * 24
+    r1 = [mark("rows")]
+    r1.append(f"double frho = {_hx(h['F_rho'])};")
+    r1.append("double fsig = 0.0, ftau = 0.0;")
+    r1.append("for (int i = 0; i < 3; i++) {")
+    r1.append(f"    double g = {_hx(h['G_i'])};")
+    r1.append("    Gp[3 * xd + i][P][ml] = live ? g : 0.0;")
+    r1.append(f"    fsig += {_hx(h['F_sigma_i'])};")
+    r1.append(f"    if (is_meta) ftau += {_hx(h['F_tau_i'])};")
+    r1.append("}")
+    r1.append("F_rho[xd][P][ml] = live ? frho : 0.0;")
+    r1.append("F_sig[xd][P][ml] = live ? fsig : 0.0;")
+    r1.append("F_tau[xd][P][ml] = live ? ftau : 0.0;")
+    r1.append(END)
+    regions["rows"] = "\n".join(ind + line for line in r1)
+
+    # R2: class I -- field x field through the second functional
+    # derivatives, at half weight (rho-rho lives in the host LSDA block)
+    names = ["rho", "sigma", "tau"]
+    var = {"rho": "lr", "sigma": "ls", "tau": "lt"}
+    row = {"rho": "F_rho[xd][P][ml]", "sigma": "F_sig[xd][P][ml]",
+           "tau": "F_tau[xd][P][ml]"}
+    r2 = [mark("class I")]
+    r2.append("double wP = 0.5 * w[P];")
+    for k in names:
+        base, meta = [], []
+        for l in names:
+            if {k, l} == {"rho"}:
+                continue
+            text, fac = PSI4_RV_HESS_FXX[libxc_symbol(
+                Counter({k: 1}) + Counter({l: 1})).name]
+            term = (f"{fac:.1f} * {text} * {row[l]}" if fac != 1.0
+                    else f"{text} * {row[l]}")
+            (meta if "tau" in (k, l) else base).append(term)
+        lhs = f"double {var[k]}"
+        if base:
+            r2.append(f"{lhs} = {' + '.join(base)};")
+            for t in meta:
+                r2.append(f"if (is_meta) {var[k]} += {t};")
+        else:
+            r2.append(f"{lhs} = is_meta ? {' + '.join(meta)} : 0.0;")
+    r2.append("WL[P][ml] = wP * lr;")
+    r2.append("WR[P][ml] = wP * ls;")
+    r2.append("Tp[P][ml] = wP * lt;")
+    r2.append(END)
+    regions["classI"] = "\n".join(ind + line for line in r2)
+
+    # R3: class II -- seed two-center coefficients. sigma is the left
+    # member of a transpose pair (mirror from accumulate-plus-transpose,
+    # full weight); tau is symmetric (half weight). All scalar factors
+    # and both masked-collocation signs fold into the coefficient; the
+    # host GEMMs against raw collocations and the raw D pair factor.
+    r3s = [mark("class II sigma"),
+           f"acc += {_hx(h['seed_pair_sigma_i'], weight='w[P]')};",
+           END]
+    regions["classII_sigma"] = "\n".join(" " * 32 + line for line in r3s)
+    r3t = [mark("class II tau"),
+           "WL[P][ml] = live ? "
+           f"{_hx(h['seed_pair_tau_i'], scale=0.5, weight='w[P]')} : 0.0;",
+           END]
+    regions["classII_tau"] = "\n".join(" " * 32 + line for line in r3t)
+
+    # R4: class III -- seed one-center body (both displacements on one
+    # function; third-derivative collocation), at half weight
+    r4 = [mark("class III")]
+    r4.append("for (int i = 0; i < 3; i++) {")
+    r4.append(f"    t += {_hx(h['seed_same_sigma_i'], scale=0.5, weight='w[P]')};")
+    r4.append(f"    if (is_meta) t += {_hx(h['seed_same_tau_i'], scale=0.5, weight='w[P]')};")
+    r4.append("}")
+    r4.append(END)
+    regions["classIII"] = "\n".join(" " * 28 + line for line in r4)
+    return regions
+
+
 if __name__ == "__main__":
     import sys
     if "--uv" in sys.argv:
@@ -620,5 +781,9 @@ if __name__ == "__main__":
         print(emit_rv_fx_contraction())
     elif "--gridmotion" in sys.argv:
         print(emit_rv_gradient_gridmotion())
+    elif "--hessian" in sys.argv:
+        for _name, _region in emit_rv_hessian().items():
+            print(f"### {_name}")
+            print(_region)
     else:
         print(emit_rv_vx_contraction())
