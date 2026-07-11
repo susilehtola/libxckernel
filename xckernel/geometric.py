@@ -154,19 +154,19 @@ def spatial_energy_gradient(family: str) -> sp.Expr:
 
 # --- spin-polarized spatial gradient (grid-motion class) ----------------------
 
-def _spatial_field_gradient_spin(K) -> sp.Expr:
-    """d_d of a polarized Libxc scalar variable, in per-channel
+def _spatial_field_gradient_spin(K, slot: str = "g") -> sp.Expr:
+    """d_slot of a polarized Libxc scalar variable, in per-channel
     direction-resolved operands (drho_a_g, dgrad_rho_a_g_i, dtau_a_g and
-    the beta twins)."""
+    the beta twins), slot in {'g', 'h'} (independent motion directions)."""
     from .spin import COMP_SPINS, GRAD
     if K.group == "rho":
-        return sp.Symbol(f"drho_{K.comp}_g", real=True)
+        return sp.Symbol(f"drho_{K.comp}_{slot}", real=True)
     if K.group == "tau":
-        return sp.Symbol(f"dtau_{K.comp}_g", real=True)
+        return sp.Symbol(f"dtau_{K.comp}_{slot}", real=True)
     if K.group == "sigma":
         s1, s2 = COMP_SPINS["sigma"][K.comp]
-        dg = {s: [sp.Symbol(f"dgrad_rho_{s}_g_{ax}", real=True) for ax in AXES]
-              for s in (s1, s2)}
+        dg = {s: [sp.Symbol(f"dgrad_rho_{s}_{slot}_{ax}", real=True)
+                  for ax in AXES] for s in (s1, s2)}
         return sum(GRAD[s1][i] * dg[s2][i] + GRAD[s2][i] * dg[s1][i]
                    for i in range(3))
     raise ValueError(f"spatial gradient of {K.group!r} not supported yet "
@@ -635,6 +635,101 @@ def spatial_row_gradient(family: str, u: str = "u") -> sp.Expr:
                 if Y in names:
                     total += libxc_symbol(ms + Counter({Y: 1})) \
                         * _spatial_field_gradient_slot(Y, "h")
+            return from_expr(total)
+        return None
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    return to_expr(seeded_derivative(from_expr(sp.expand(base)), seed))
+
+# --- spin-polarized second-order spatial operators -----------------------------
+
+def spatial_energy_hessian_spin(family: str) -> sp.Expr:
+    """d_g d_h of the polarized XC energy density (the grid x grid class
+    of the UKS nuclear Hessian): sum_KL f_KL d_g field_K d_h field_L
+    + sum_K v_K d_g d_h field_K over the polarized scalar variables, with
+    per-channel pair operands d2rho_s_gh, d2grad_rho_s_gh_i, d2tau_s_gh."""
+    from .spin import COMP_SPINS, GRAD, family_scalars
+    from .spin_kernel import _register
+    scalars = family_scalars(family)
+    if any(K.group not in ("rho", "sigma", "tau") for K in scalars):
+        raise ValueError("spatial_energy_hessian_spin supports "
+                         "lda/gga/mgga_tau")
+    total = sp.Integer(0)
+    for K in scalars:
+        for L in scalars:
+            total += _register((K, L)) \
+                * _spatial_field_gradient_spin(K, "g") \
+                * _spatial_field_gradient_spin(L, "h")
+    for K in scalars:
+        if K.group == "rho":
+            d2 = sp.Symbol(f"d2rho_{K.comp}_gh", real=True)
+        elif K.group == "tau":
+            d2 = sp.Symbol(f"d2tau_{K.comp}_gh", real=True)
+        else:
+            s1, s2 = COMP_SPINS["sigma"][K.comp]
+            dg = {s: {slot: [sp.Symbol(f"dgrad_rho_{s}_{slot}_{ax}", real=True)
+                             for ax in AXES] for slot in ("g", "h")}
+                  for s in (s1, s2)}
+            d2g = {s: [sp.Symbol(f"d2grad_rho_{s}_gh_{ax}", real=True)
+                       for ax in AXES] for s in (s1, s2)}
+            d2 = sum(dg[s1]["g"][i] * dg[s2]["h"][i]
+                     + dg[s2]["g"][i] * dg[s1]["h"][i]
+                     + GRAD[s1][i] * d2g[s2][i] + GRAD[s2][i] * d2g[s1][i]
+                     for i in range(3))
+        total += _register((K,)) * d2
+    return sp.expand(total)
+
+
+def spatial_row_gradient_spin(family: str, u: str = "u") -> sp.Expr:
+    """d_h of the polarized basis-class energy-derivative row
+    sum_K v_K F_K(u) (the grid x basis cross class of the UKS nuclear
+    Hessian, per function).
+
+    New operands relative to _geo_rows_spin: the h-direction
+    density-contracted collocations Uh0<s>_u = (dphi_h D^s)_u and
+    Uhess<s>_u_i = (dphi_h dphi_i D^s)_u per channel, and the SHARED
+    h-differentiated masked collocations ddchi_ghA_u (= -d_h d_x chi,
+    sign fold as dchi_gA) and dddchi_ghA_u_i."""
+    from .spin import GRAD, SPINS, family_scalars
+    from .spin_kernel import _SYM_SCALARS, _register
+    scalars = family_scalars(family)
+    if any(K.group not in ("rho", "sigma", "tau") for K in scalars):
+        raise ValueError("spatial_row_gradient_spin supports "
+                         "lda/gga/mgga_tau")
+    rows, G, (U0, Ui, dg, ddg) = _geo_rows_spin(u, "A", family)
+    vs = {K: _register((K,)) for K in scalars}
+    base = sum(vs[K] * rows[K] for K in scalars)
+
+    Uh0 = {s: sp.Symbol(f"Uh0{s}_{u}", real=True) for s in SPINS}
+    Uhess = {s: [sp.Symbol(f"Uhess{s}_{u}_{ax}", real=True) for ax in AXES]
+             for s in SPINS}
+    ddgh = sp.Symbol(f"ddchi_ghA_{u}", real=True)
+    dddgh = [sp.Symbol(f"dddchi_ghA_{u}_{ax}", real=True) for ax in AXES]
+    grad_info = {GRAD[s][i]: (s, i) for s in SPINS for i in range(3)}
+
+    def seed(atom: sp.Symbol):
+        from .fastpoly import from_expr
+        name = atom.name
+        for s in SPINS:
+            if name == U0[s].name:
+                return from_expr(Uh0[s])
+            for i in range(3):
+                if name == Ui[s][i].name:
+                    return from_expr(Uhess[s][i])
+        if name == dg.name:
+            return from_expr(ddgh)
+        for i, dd in enumerate(ddg):
+            if name == dd.name:
+                return from_expr(dddgh[i])
+        if atom in grad_info:
+            s, i = grad_info[atom]
+            return from_expr(sp.Symbol(f"dgrad_rho_{s}_h_{AXES[i]}",
+                                       real=True))
+        if name in _SYM_SCALARS:
+            base_ms = _SYM_SCALARS[name]
+            total = sp.Integer(0)
+            for Y in scalars:
+                total += _register(base_ms + (Y,)) \
+                    * _spatial_field_gradient_spin(Y, "h")
             return from_expr(total)
         return None
     from .fastpoly import from_expr, seeded_derivative, to_expr
