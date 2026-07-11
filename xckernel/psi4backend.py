@@ -772,6 +772,148 @@ def emit_rv_hessian(family: str = "mgga_tau") -> dict:
     regions["classIII"] = "\n".join(" " * 28 + line for line in r4)
     return regions
 
+# --- UV::compute_fock_derivatives ---------------------------------------------
+
+def _uv_fx_operands() -> Dict[str, Tuple[str, float]]:
+    """Operand map for the UV Fx coefficient region: the polarized Vx map
+    with the perturbed fields rebound to the per-point plumbing locals
+    (rho_ak, grad_ak[i], tau_ak, ...) and the gradient fields to the
+    rho_ag/rho_bg pointer arrays of compute_fock_derivatives."""
+    ops = dict(_uv_operands())
+    for s_ in ("a", "b"):
+        ops[f"rho_{s_}_p1"] = (f"rho_{s_}k", 1.0)
+        ops[f"tau_{s_}_p1"] = (f"tau_{s_}k", 1.0)
+        for i, ax in enumerate("xyz"):
+            ops[f"grad_rho_{s_}_p1_{ax}"] = (f"grad_{s_}k[{i}]", 1.0)
+            ops[f"grad_rho_{s_}_{ax}"] = (f"rho_{s_}g[{i}][P]", 1.0)
+    return ops
+
+
+def _fx_split(ck):
+    """Split a collapsed geometric-Fock kernel into field patterns
+    (phiphi, mixed{i}, diag{i}) and masked seed patterns, verifying the
+    transpose-pair assumptions (shared by the RV and UV emitters)."""
+    field_phiphi = []
+    field_mixed: Dict[int, list] = {}
+    field_diag: Dict[int, list] = {}
+    seeds: List[Tuple[str, str, list]] = []
+    pat = {(u, v): m for (u, v, m) in ck.patterns}
+    for (u, v), monos in pat.items():
+        u_masked = u in _FX_MASKED
+        v_masked = v in _FX_MASKED
+        if u_masked and not v_masked:
+            seeds.append((u, v, monos))
+        elif v_masked and not u_masked:
+            if sorted(monos) != sorted(pat[(v, u)]):
+                raise ValueError("psi4backend: asymmetric seed pattern")
+        elif u_masked and v_masked:
+            raise ValueError("psi4backend: doubly-masked pattern")
+        elif u == "chi" and v == "chi":
+            field_phiphi = monos
+        elif u == "chi" and v.startswith("dchi["):
+            field_mixed[int(v[5])] = monos
+        elif v == "chi" and u.startswith("dchi["):
+            if sorted(monos) != sorted(pat[("chi", u)]):
+                raise ValueError("psi4backend: asymmetric mixed pattern")
+        elif u == v and u.startswith("dchi["):
+            field_diag[int(u[5])] = monos
+        else:
+            raise ValueError(f"psi4backend: unsupported pattern {(u, v)}")
+    return field_phiphi, field_mixed, field_diag, seeds
+
+
+def emit_uv_fx_contraction(family: str = "mgga_tau") -> str:
+    """The generated coefficient region of UV::compute_fock_derivatives:
+    both spin channels fused in one per-point block, with the RV weight
+    rules (the accumulation visits every function pair from both sides:
+    symmetric patterns at QUARTER weight, transpose pairs at HALF, seeds
+    at -1/2 with the -d/dr sign folded into the emission factor)."""
+    from .geometric import geometric_fock_spin
+    base_ops = _uv_fx_operands()
+    ind = "                    "
+
+    chan = {}
+    dots_all, hoists_all = {}, {}
+    for s_ in ("a", "b"):
+        ck = collapse(geometric_fock_spin(family, s_))
+        phiphi, mixed, diag, seeds = _fx_split(ck)
+        phiphi, mixed, diag, dots, hoists = _compact_patterns(phiphi, mixed, diag)
+        ren = {name: f"{name}_{s_}" for name in hoists}
+        hoists = {ren[k]: v for k, v in hoists.items()}
+        for i in range(3):
+            mixed[i] = [(c, tuple(sorted((ren.get(n, n), e) for n, e in f)))
+                        for c, f in mixed[i]]
+        chan[s_] = (phiphi, mixed, diag, seeds)
+        dots_all.update(dots)
+        hoists_all.update(hoists)
+
+    defs, ops = _emit_intermediates(dots_all, hoists_all, base_ops, ind)
+
+    L: List[str] = []
+    A = L.append
+    A(ind + "// ==> BEGIN GENERATED CODE"
+      " [xckernel psi4backend: geometric_fock_spin(%s)] <==" % family)
+    A(ind + "// Reproduce with: python -m xckernel.psi4backend --uvfx")
+    A(ind + "// Physics source: the spin geometric derivative of the")
+    A(ind + "// symbolic tower (basis class, fixed grid); the")
+    A(ind + "// intermediates are IR compaction output.")
+    L.extend(defs)
+    A(ind + "double c;")
+    for s_, T0, Ti in (("a", "T0ap", "Tiap"), ("b", "T0bp", "Tibp")):
+        phiphi, mixed, diag, seeds = chan[s_]
+        A(ind + f"// spin {s_}: field (phi, phi) pattern at quarter weight")
+        A(ind + "c = 0.0;")
+        L.extend(_cxx_sum(_transform_monomials(phiphi, ops), 0.25, ind))
+        A(ind + f"C_DAXPY(nlocal, c, phi[P], 1, {T0}[P], 1);")
+        for i in range(3):
+            A(ind + f"// spin {s_}: field (dphi_{'xyz'[i]}, phi) + transpose at half weight")
+            A(ind + "if (ansatz >= 1) {")
+            A(ind + "    c = 0.0;")
+            L.extend(_cxx_sum(_transform_monomials(mixed[i], ops), 0.5, ind + "    "))
+            A(ind + f"    C_DAXPY(nlocal, c, phi_i[{i}][P], 1, {T0}[P], 1);")
+            A(ind + "}")
+        for i in range(3):
+            monos_t = _transform_monomials(diag[i], ops)
+            g = max(1, min(gg for gg, c, e in monos_t))
+            A(ind + f"// spin {s_}: field (dphi_{'xyz'[i]}, dphi_{'xyz'[i]}) at quarter weight")
+            A(ind + f"if (ansatz >= {g}) {{")
+            A(ind + "    c = 0.0;")
+            L.extend(_cxx_sum(monos_t, 0.25, ind + "    "))
+            A(ind + f"    C_DAXPY(nlocal, c, phi_i[{i}][P], 1, {Ti}[{i}][P], 1);")
+            A(ind + "}")
+        A(ind + f"// spin {s_}: atom-restricted seed patterns at half weight;")
+        A(ind + "// each masked factor carries the -d/dr sign")
+        for (mask, right, monos) in sorted(seeds):
+            monos_c, dd = contract_dots([(float(c), tuple(f)) for c, f in monos])
+            sdefs, ops2 = _emit_intermediates(dd, {}, ops, ind)
+            L.extend(sdefs)
+            monos_t = _transform_monomials(monos_c, ops2)
+            req = 1 if mask.startswith("ddchi_gA") else 0
+            if right.startswith("dchi["):
+                req = max(req, 1)
+            g = max(req, min(gg for gg, c, e in monos_t))
+            A(ind + f"// spin {s_}: seed ({mask}, {right})")
+            left = _FX_MASKED[mask]
+            if right == "chi":
+                daxpy = f"C_DAXPY(nfuncs, c, {left}, 1, &{T0}[P][off], 1);"
+            elif right.startswith("dchi["):
+                i = int(right[5])
+                daxpy = f"C_DAXPY(nfuncs, c, {left}, 1, &{Ti}[{i}][P][off], 1);"
+            else:
+                raise ValueError(f"psi4backend: seed right factor {right!r}")
+            if g > 0:
+                A(ind + f"if (ansatz >= {g}) {{")
+                A(ind + "    c = 0.0;")
+                L.extend(_cxx_sum(monos_t, -0.5, ind + "    "))
+                A(ind + f"    {daxpy}")
+                A(ind + "}")
+            else:
+                A(ind + "c = 0.0;")
+                L.extend(_cxx_sum(monos_t, -0.5, ind))
+                A(ind + f"    {daxpy}".replace("    C_", "C_"))
+    A(ind + "// ==> END GENERATED CODE <==")
+    return "\n".join(L)
+
 
 if __name__ == "__main__":
     import sys
@@ -781,6 +923,8 @@ if __name__ == "__main__":
         print(emit_rv_fx_contraction())
     elif "--gridmotion" in sys.argv:
         print(emit_rv_gradient_gridmotion())
+    elif "--uvfx" in sys.argv:
+        print(emit_uv_fx_contraction())
     elif "--hessian" in sys.argv:
         for _name, _region in emit_rv_hessian().items():
             print(f"### {_name}")
