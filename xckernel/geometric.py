@@ -324,3 +324,147 @@ def geometric_hessian(family: str, u: str = "u", v: str = "v") -> GeometricHessi
     return GeometricHessian(family=family, pair=sp.expand(w * pair),
                             same=sp.expand(w * same), hints=hints)
 
+# --- spin-polarized geometric layer -------------------------------------------
+
+def _geometric_seed_spin(family: str, label: str = "p1"):
+    """Spin analogue of _geometric_seed: basis factors go to the
+    atom-masked displacement collocations (collocations carry no spin);
+    gradient fields and polarized Libxc symbols chain to the fixed-grid
+    perturbed fields of BOTH spin channels (a displacement perturbs both,
+    like any one-electron perturbation)."""
+    from .fastpoly import from_expr
+    from .spin_kernel import _seed_fn_spin
+    resp = _seed_fn_spin(family, label)
+
+    def seed(atom: sp.Symbol):
+        name = atom.name
+        m = _CHI_RE.match(name)
+        if m:
+            return from_expr(sp.Symbol(f"dchi_gA_{m.group(1)}", real=True))
+        m = _DCHI_RE.match(name)
+        if m:
+            return from_expr(sp.Symbol(f"ddchi_gA_{m.group(1)}_{m.group(2)}",
+                                       real=True))
+        if name.startswith("lapl_chi"):
+            raise ValueError("geometric seed of lapl_chi needs "
+                             "third-derivative collocation (not wired yet)")
+        return resp(atom)
+    return seed
+
+
+def geometric_fock_spin(family: str, spin: str, u: str = "u", v: str = "v"):
+    """Basis-class integrand of dF^spin_uv/dX at fixed density and fixed
+    grid: the spin-resolved analogue of geometric_fock. Operands are the
+    per-channel fixed-grid perturbed fields (rho_a_p1, rho_b_p1,
+    grad_rho_{a,b}_p1_i, tau_{a,b}_p1) and the SHARED atom-masked
+    collocation derivatives dchi_gA / ddchi_gA (sign folded)."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    from .spin_kernel import SpinIntegrand, fock_spin
+    fi = fock_spin(family, spin, u, v)
+    out = seeded_derivative(from_expr(fi.expr),
+                            _geometric_seed_spin(family, "p1"))
+    return SpinIntegrand(family=family, spins=[spin], index_pairs=[(u, v)],
+                         expr=to_expr(out))
+
+
+def _geo_rows_spin(label: str, side: str, family: str):
+    """Per-function field-derivative rows F_K(u) for one displacement,
+    per polarized scalar K. U rows are per spin channel (U0a_u = (phi
+    D^a)_u, ...); the displacement collocations carry no spin."""
+    from .spin import GRAD, SPINS, family_scalars
+    U0 = {s: sp.Symbol(f"U0{s}_{label}", real=True) for s in SPINS}
+    Ui = {s: [sp.Symbol(f"U{i + 1}{s}_{label}", real=True) for i in range(3)]
+          for s in SPINS}
+    dg = sp.Symbol(f"dchi_g{side}_{label}", real=True)
+    ddg = [sp.Symbol(f"ddchi_g{side}_{label}_{ax}", real=True) for ax in AXES]
+    G = {s: [2 * (U0[s] * ddg[i] + Ui[s][i] * dg) for i in range(3)]
+         for s in SPINS}
+    rows = {}
+    for K in family_scalars(family):
+        if K.group == "rho":
+            rows[K] = 2 * U0[K.comp] * dg
+        elif K.group == "tau":
+            rows[K] = sum(Ui[K.comp][i] * ddg[i] for i in range(3))
+        elif K.group == "sigma":
+            s1, s2 = K.comp
+            rows[K] = sum(GRAD[s1][i] * G[s2][i] + GRAD[s2][i] * G[s1][i]
+                          for i in range(3)) if s1 != s2 else                 2 * sum(GRAD[s1][i] * G[s1][i] for i in range(3))
+        else:
+            raise ValueError(f"spin geometric rows: unsupported group {K.group}")
+    return rows, G, (U0, Ui, dg, ddg)
+
+
+def geometric_hessian_spin(family: str, u: str = "u",
+                           v: str = "v") -> GeometricHessian:
+    """Spin-polarized second geometric derivative of the XC energy
+    integrand at fixed density and fixed grid. Same pair/same structure
+    as geometric_hessian; the D_u_v pair factor and the U rows split per
+    channel (D_a_u_v, D_b_u_v; U0a_u, ...), and the functional
+    derivatives are the polarized component symbols of spin_kernel."""
+    from .spin import GRAD, SPINS, family_scalars
+    from .spin_kernel import _register
+    scalars = family_scalars(family)
+    if any(K.group not in ("rho", "sigma", "tau") for K in scalars):
+        raise ValueError("geometric_hessian_spin supports lda/gga/mgga_tau")
+    w = sp.Symbol("w", real=True, positive=True)
+    D = {s: sp.Symbol(f"D_{s}_{u}_{v}", real=True) for s in SPINS}
+
+    FA, GA, (U0u, Uiu, dgu, ddgu) = _geo_rows_spin(u, "A", family)
+    FB, GB, (U0v, Uiv, dgv, ddgv) = _geo_rows_spin(v, "B", family)
+
+    # field x field through the second functional derivatives
+    pair = sp.Integer(0)
+    for K in scalars:
+        for L in scalars:
+            pair += _register((K, L)) * FA[K] * FB[L]
+
+    # the vsigma gradient cross terms of sigma_st^{XY}
+    vs = {K: _register((K,)) for K in scalars}
+    for K in scalars:
+        if K.group != "sigma":
+            continue
+        s1, s2 = K.comp
+        if s1 == s2:
+            pair += vs[K] * 2 * sum(GA[s1][i] * GB[s1][i] for i in range(3))
+        else:
+            pair += vs[K] * sum(GA[s1][i] * GB[s2][i] + GA[s2][i] * GB[s1][i]
+                                for i in range(3))
+
+    # potential times the two-center seed second derivatives
+    for K in scalars:
+        if K.group == "rho":
+            pair += vs[K] * 2 * D[K.comp] * dgu * dgv
+        elif K.group == "tau":
+            pair += vs[K] * D[K.comp] * sum(ddgu[i] * ddgv[i]
+                                            for i in range(3))
+        else:
+            s1, s2 = K.comp
+            # for s1 == s2 the two sums coincide and their total IS the
+            # required 2 grad_s . (grad rho_s)^{XY} seed
+            cross = sum(GRAD[s2][i] * 2 * D[s1] * (ddgu[i] * dgv + dgu * ddgv[i])
+                        for i in range(3)) \
+                + sum(GRAD[s1][i] * 2 * D[s2] * (ddgu[i] * dgv + dgu * ddgv[i])
+                      for i in range(3))
+            pair += vs[K] * cross
+
+    # potential times the one-center seed second derivatives
+    d2 = sp.Symbol(f"d2chi_g2_{u}", real=True)
+    d3 = [sp.Symbol(f"d3chi_g2_{u}_{ax}", real=True) for ax in AXES]
+    same = sp.Integer(0)
+    for K in scalars:
+        if K.group == "rho":
+            same += vs[K] * 2 * U0u[K.comp] * d2
+        elif K.group == "tau":
+            same += vs[K] * sum(Uiu[K.comp][i] * d3[i] for i in range(3))
+        else:
+            s1, s2 = K.comp
+            same += vs[K] * sum(
+                GRAD[s2][i] * 2 * (U0u[s1] * d3[i] + Uiu[s1][i] * d2)
+                + GRAD[s1][i] * 2 * (U0u[s2] * d3[i] + Uiu[s2][i] * d2)
+                for i in range(3))
+
+    hints = {"rows_A": FA, "G_A": GA, "scalars": scalars, "vs": vs, "D": D,
+             "colloc": (U0u, Uiu, dgu, ddgu, d2, d3)}
+    return GeometricHessian(family=family, pair=sp.expand(w * pair),
+                            same=sp.expand(w * same), hints=hints)
+
