@@ -548,3 +548,95 @@ def geometric_hessian_spin(family: str, u: str = "u",
     return GeometricHessian(family=family, pair=sp.expand(w * pair),
                             same=sp.expand(w * same), hints=hints)
 
+# --- second-order spatial operators (grid-motion at Hessian level) -------------
+
+def _spatial_field_gradient_slot(var: str, slot: str) -> sp.Expr:
+    """d_slot of a Libxc variable, slot in {'g', 'h'} (two independent
+    motion directions)."""
+    from .ingredients import GRAD_RHO
+    if var == "rho":
+        return sp.Symbol(f"drho_{slot}", real=True)
+    if var == "tau":
+        return sp.Symbol(f"dtau_{slot}", real=True)
+    if var == "sigma":
+        return 2 * sum(p.symbol * sp.Symbol(f"dgrad_rho_{slot}_{ax}", real=True)
+                       for ax, p in zip(AXES, GRAD_RHO))
+    raise ValueError(f"spatial gradient of {var!r} not supported")
+
+
+def spatial_energy_hessian(family: str) -> sp.Expr:
+    """d_g d_h of the XC energy density (the grid x grid class of the
+    nuclear Hessian): sum_kl f_kl d_g field_k d_h field_l
+    + sum_k v_k d_g d_h field_k, with pair operands d2rho_gh,
+    d2grad_rho_gh_i (= d_g d_h grad_i rho), d2tau_gh."""
+    from .ingredients import GRAD_RHO
+    func = Functional.of_family(family)
+    names = [ing.name for ing in func.ingredients]
+    total = sp.Integer(0)
+    for k in names:
+        for l in names:
+            total += libxc_symbol(Counter({k: 1}) + Counter({l: 1})) \
+                * _spatial_field_gradient_slot(k, "g") \
+                * _spatial_field_gradient_slot(l, "h")
+    d2 = {"rho": sp.Symbol("d2rho_gh", real=True),
+          "tau": sp.Symbol("d2tau_gh", real=True)}
+    if "sigma" in names:
+        d2["sigma"] = 2 * sum(
+            sp.Symbol(f"dgrad_rho_g_{ax}", real=True)
+            * sp.Symbol(f"dgrad_rho_h_{ax}", real=True)
+            + GRAD_RHO[i].symbol * sp.Symbol(f"d2grad_rho_gh_{ax}", real=True)
+            for i, ax in enumerate(AXES))
+    for ing in func.ingredients:
+        total += func.vsymbol(ing) * d2[ing.name]
+    return sp.expand(total)
+
+
+def spatial_row_gradient(family: str, u: str = "u") -> sp.Expr:
+    """d_h of the basis-class energy-derivative row sum_k v_k F_k(u)
+    (the grid x basis cross class of the nuclear Hessian, per function).
+
+    New operands relative to _geo_rows: the h-direction density-contracted
+    collocations Uh0_u = (dphi_h D)_u and Uhess_u_i = (dphi_h dphi_i D)_u,
+    and the h-differentiated masked collocations ddchi_ghA_u
+    (= -d_h d_x chi, sign fold as dchi_gA) and dddchi_ghA_u_i."""
+    from .ingredients import GRAD_RHO
+    func = Functional.of_family(family)
+    names = {ing.name for ing in func.ingredients}
+    rows, G, (U0, Ui, dg, ddg) = _geo_rows(u, "A", func)
+    vs = {ing.name: func.vsymbol(ing) for ing in func.ingredients}
+    base = sum(vs[k] * rows[k] for k in rows)
+
+    Uh0 = sp.Symbol(f"Uh0_{u}", real=True)
+    Uhess = [sp.Symbol(f"Uhess_{u}_{ax}", real=True) for ax in AXES]
+    ddgh = sp.Symbol(f"ddchi_ghA_{u}", real=True)
+    dddgh = [sp.Symbol(f"dddchi_ghA_{u}_{ax}", real=True) for ax in AXES]
+
+    def seed(atom: sp.Symbol):
+        from .fastpoly import from_expr
+        name = atom.name
+        if name == U0.name:
+            return from_expr(Uh0)
+        for i in range(3):
+            if name == Ui[i].name:
+                return from_expr(Uhess[i])
+        if name == dg.name:
+            return from_expr(ddgh)
+        for i, dd in enumerate(ddg):
+            if name == dd.name:
+                return from_expr(dddgh[i])
+        prim = PRIM_BY_SYMBOL.get(atom)
+        if prim is not None and prim.name.startswith("grad_rho_"):
+            ax = prim.name[-1]
+            return from_expr(sp.Symbol(f"dgrad_rho_h_{ax}", real=True))
+        if name in LIBXC_MULTISET:
+            ms = LIBXC_MULTISET[name]
+            total = sp.Integer(0)
+            for Y in VARS:
+                if Y in names:
+                    total += libxc_symbol(ms + Counter({Y: 1})) \
+                        * _spatial_field_gradient_slot(Y, "h")
+            return from_expr(total)
+        return None
+    from .fastpoly import from_expr, seeded_derivative, to_expr
+    return to_expr(seeded_derivative(from_expr(sp.expand(base)), seed))
+

@@ -1200,6 +1200,143 @@ def emit_uv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     A("                    // ==> END GENERATED CODE <==")
     return "\n".join(L)
 
+# --- RV::compute_hessian grid-response regions ---------------------------------
+
+def _grid_hess_ops() -> Dict[str, Tuple[str, float]]:
+    """Operand map for the grid-response regions of RV::compute_hessian
+    (slots: g -> direction xd, h -> direction yd; per-point plumbing
+    locals drho/ddrho/dtau/d3r/ddtau; per-function context ml)."""
+    ops = dict(PSI4_RV_HESS_OPERANDS)
+    ops.update({
+        "w": (None, 1.0),
+        "vrho": ("v_rho[P]", 1.0),
+        "v2rho2": ("v2_rho2[P]", 1.0),
+        "drho_g": ("drho[xd]", 1.0), "drho_h": ("drho[yd]", 1.0),
+        "dtau_g": ("dtau[xd]", 2.0), "dtau_h": ("dtau[yd]", 2.0),
+        "d2rho_gh": ("ddrho[hess_addr[xd][yd]]", 1.0),
+        "d2tau_gh": ("ddtau", 2.0),
+        "v2rhosigma": ("v2_rho_gamma[P]", 1.0),
+        "v2sigma2": ("v2_gamma_gamma[P]", 1.0),
+        "v2rhotau": ("v2_rho_tau[P]", 2.0),
+        "v2sigmatau": ("v2_gamma_tau[P]", 2.0),
+        "v2tau2": ("v2_tau_tau[P]", 4.0),
+        "Uh0_u": ("Uip[yd][P][ml]", 2.0),
+        "ddchi_ghA_u": ("phi_hess[hess_addr[xd][yd]][P][ml]", -1.0),
+    })
+    for i, ax in enumerate("xyz"):
+        ops[f"dgrad_rho_g_{ax}"] = (f"ddrho[hess_addr[xd][{i}]]", 1.0)
+        ops[f"dgrad_rho_h_{ax}"] = (f"ddrho[hess_addr[yd][{i}]]", 1.0)
+        ops[f"d2grad_rho_gh_{ax}"] = (f"d3r[{i}]", 1.0)
+        ops[f"Uhess_u_{ax}"] = (f"Uhess[hess_addr[yd][{i}]][P][ml]", 2.0)
+        ops[f"dddchi_ghA_u_{ax}"] = (f"phi_3[t3_addr[xd][yd][{i}]][P][ml]", -1.0)
+        # explicit Cartesian components (the grid regions are not
+        # i-generic, unlike the fixed-grid row emitter)
+        ops[f"grad_rho_{ax}"] = (f"rho_g[{i}][P]", 1.0)
+        ops[f"U{i + 1}_u"] = (f"Uip[{i}][P][ml]", 2.0)
+        ops[f"ddchi_gA_u_{ax}"] = (f"phi_hess[hess_addr[xd][{i}]][P][ml]", -1.0)
+    return ops
+
+
+def _monos_of(expr):
+    from .fastpoly import from_expr
+    return [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
+            for key, c in from_expr(expr).items()]
+
+
+def emit_rv_hessian_gridresponse(family: str = "mgga_tau") -> dict:
+    """The four IR-dense regions of RV::compute_hessian's quadrature
+    response block: the spatial energy gradient es[d] (grid-motion of e),
+    the per-function basis rows of de (deval), the second spatial
+    derivative d2e (grid x grid), and the spatial row gradient mb
+    (grid x basis cross). Plumbing supplies only raw collocation dots."""
+    import sympy
+    from .geometric import (geometric_hessian, spatial_energy_gradient,
+                            spatial_energy_hessian, spatial_row_gradient)
+    ops = _grid_hess_ops()
+    mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
+                         f"{what}({family}), restricted] <==")
+    END = "// ==> END GENERATED CODE <=="
+    regions = {}
+
+    # es: reuse the gradient grid-motion IR with slot-g operands bound to
+    # the plumbing arrays, direction index d
+    monos = _monos_of(spatial_energy_gradient(family))
+    ind = " " * 16
+    es_ops = {k: (v[0].replace("[xd]", "[d]") if v[0] else None, v[1])
+              for k, v in ops.items()}
+    for i in range(3):
+        es_ops[f"dgrad_rho_g_{'xyz'[i]}"] = (f"ddrho[hess_addr[d][{i}]]", 1.0)
+    L = [ind + mark("spatial_energy_gradient")]
+    L.append(ind + "double es[3];")
+    L.append(ind + "for (int d = 0; d < 3; d++) {")
+    L.append(ind + "    double de = 0.0;")
+    L.extend(_cxx_sum(_transform_monomials(monos, es_ops), 1.0, ind + "    ", var="de"))
+    L.append(ind + "    es[d] = de;")
+    L.append(ind + "}")
+    L.append(ind + END)
+    regions["es"] = "\n".join(L)
+
+    # deval: sum_k v_k F_k(u) rows (per ml, per xd) -- i-generic map
+    gh = geometric_hessian(family)
+    h = gh.hints
+    iops = dict(PSI4_RV_HESS_OPERANDS)
+    iops.update({"w": (None, 1.0), "vrho": ("v_rho[P]", 1.0)})
+
+    def _sum_expr(monos_t):
+        parts = []
+        for gg, c, e in monos_t:
+            body = " * ".join(e)
+            parts.append(f"{c:+.1f} * {body}" if body else f"{c:+.1f}")
+        out = " ".join(parts)
+        return out[1:].strip() if out.startswith("+") else out
+
+    ind = " " * 24
+    L = [ind + mark("basis rows of de: sum_k v_k F_k")]
+    frho = _transform_monomials(_monos_of(sympy.expand(
+        sympy.Symbol("vrho", real=True) * h["F_rho"])), iops)
+    L.append(ind + "double val = 0.0;")
+    L.extend(_cxx_sum(frho, 1.0, ind, var="val"))
+    L.append(ind + "if (ansatz >= 1) {")
+    L.append(ind + "    double fsig = 0.0, ftau = 0.0;")
+    L.append(ind + "    for (int i = 0; i < 3; i++) {")
+    L.append(ind + "        double g = "
+             + _sum_expr(_transform_monomials(_monos_of(h["G_i"]), iops)) + ";")
+    L.append(ind + "        fsig += "
+             + _sum_expr(_transform_monomials(_monos_of(h["F_sigma_i"]), iops)) + ";")
+    L.append(ind + "        if (ansatz >= 2) ftau += "
+             + _sum_expr(_transform_monomials(_monos_of(h["F_tau_i"]), iops)) + ";")
+    L.append(ind + "    }")
+    L.append(ind + "    val += v_gamma[P] * fsig;")
+    L.append(ind + "    if (ansatz >= 2) val += 2.0 * v_tau[P] * ftau;")
+    L.append(ind + "}")
+    L.append(ind + END)
+    regions["deval"] = "\n".join(L)
+
+    # d2e: grid x grid
+    monos = _monos_of(spatial_energy_hessian(family))
+    monos, dots = contract_dots(monos)
+    ind = " " * 20
+    defs, ops2 = _emit_intermediates(dots, {}, ops, ind)
+    L = [ind + mark("spatial_energy_hessian")]
+    L.extend(defs)
+    L.append(ind + "double d2e = 0.0;")
+    L.extend(_cxx_sum(_transform_monomials(monos, ops2), 1.0, ind, var="d2e"))
+    L.append(ind + END)
+    regions["d2e"] = "\n".join(L)
+
+    # mb: grid x basis cross, per function
+    monos = _monos_of(spatial_row_gradient(family))
+    monos, dots = contract_dots(monos)
+    ind = " " * 24
+    defs, ops2 = _emit_intermediates(dots, {}, ops, ind)
+    L = [ind + mark("spatial_row_gradient")]
+    L.extend(defs)
+    L.append(ind + "double mb = 0.0;")
+    L.extend(_cxx_sum(_transform_monomials(monos, ops2), 1.0, ind, var="mb"))
+    L.append(ind + END)
+    regions["mb"] = "\n".join(L)
+    return regions
+
 
 
 if __name__ == "__main__":
@@ -1212,6 +1349,10 @@ if __name__ == "__main__":
         print(emit_rv_gradient_gridmotion())
     elif "--uvfx" in sys.argv:
         print(emit_uv_fx_contraction())
+    elif "--gridhess" in sys.argv:
+        for _name, _region in emit_rv_hessian_gridresponse().items():
+            print(f"### {_name}")
+            print(_region)
     elif "--uvgridmotion" in sys.argv:
         print(emit_uv_gradient_gridmotion())
     elif "--uvhessian" in sys.argv:

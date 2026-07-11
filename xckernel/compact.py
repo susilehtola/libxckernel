@@ -36,6 +36,10 @@ VECTOR_GROUPS["dgrad_rho_g"] = tuple(f"dgrad_rho_g_{ax}" for ax in "xyz")
 for _s in ("a", "b"):
     VECTOR_GROUPS[f"dgrad_rho_{_s}_g"] = \
         tuple(f"dgrad_rho_{_s}_g_{ax}" for ax in "xyz")
+for _slot in ("h", "gh"):
+    VECTOR_GROUPS[f"dgrad_rho_{_slot}" if _slot == "h" else "d2grad_rho_gh"] = \
+        tuple((f"dgrad_rho_h_{ax}" if _slot == "h" else f"d2grad_rho_gh_{ax}")
+              for ax in "xyz")
 
 _COMPONENT_OF = {comp: (g, i) for g, comps in VECTOR_GROUPS.items()
                  for i, comp in enumerate(comps)}
