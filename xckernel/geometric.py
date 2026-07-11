@@ -463,8 +463,55 @@ def geometric_hessian_spin(family: str, u: str = "u",
                 + GRAD[s1][i] * 2 * (U0u[s2] * d3[i] + Uiu[s2][i] * d2)
                 for i in range(3))
 
-    hints = {"rows_A": FA, "G_A": GA, "scalars": scalars, "vs": vs, "D": D,
-             "colloc": (U0u, Uiu, dgu, ddgu, d2, d3)}
+    # emit-ready structure: i = 0 instances of rows and seed members,
+    # weight-free, grouped the way a two-channel emitter consumes them
+    # (per D/U channel for the seeds, per right G channel for the vsigma
+    # gradient cross). G_<s>_i are placeholders for the materialized
+    # per-point G rows.
+    Gph = {s: sp.Symbol(f"G_{s}_i", real=True) for s in SPINS}
+    F_i0 = {}
+    for K in scalars:
+        if K.group == "rho":
+            F_i0[K] = FA[K]
+        elif K.group == "tau":
+            F_i0[K] = Uiu[K.comp][0] * ddgu[0]
+        else:
+            s1, s2 = K.comp
+            F_i0[K] = (2 * GRAD[s1][0] * Gph[s1] if s1 == s2 else
+                       GRAD[s1][0] * Gph[s2] + GRAD[s2][0] * Gph[s1])
+    cIp_left = {s: sp.Integer(0) for s in SPINS}     # right G channel -> left
+    sp_sig = {s: sp.Integer(0) for s in SPINS}       # D channel -> pair seed
+    ss_sig = {s: sp.Integer(0) for s in SPINS}       # U channel -> same seed
+    for K in scalars:
+        if K.group != "sigma":
+            continue
+        s1, s2 = K.comp
+        if s1 == s2:
+            cIp_left[s1] += vs[K] * 2 * Gph[s1]
+            sp_sig[s1] += vs[K] * 4 * GRAD[s1][0] * D[s1] * ddgu[0] * dgv
+            ss_sig[s1] += vs[K] * 4 * GRAD[s1][0] * (U0u[s1] * d3[0]
+                                                     + Uiu[s1][0] * d2)
+        else:
+            cIp_left[s1] += vs[K] * Gph[s2]
+            cIp_left[s2] += vs[K] * Gph[s1]
+            sp_sig[s1] += vs[K] * 2 * GRAD[s2][0] * D[s1] * ddgu[0] * dgv
+            sp_sig[s2] += vs[K] * 2 * GRAD[s1][0] * D[s2] * ddgu[0] * dgv
+            ss_sig[s1] += vs[K] * 2 * GRAD[s2][0] * (U0u[s1] * d3[0]
+                                                     + Uiu[s1][0] * d2)
+            ss_sig[s2] += vs[K] * 2 * GRAD[s1][0] * (U0u[s2] * d3[0]
+                                                     + Uiu[s2][0] * d2)
+    sp_tau, ss_tau = {}, {}
+    for K in scalars:
+        if K.group == "tau":
+            sp_tau[K.comp] = vs[K] * D[K.comp] * ddgu[0] * ddgv[0]
+            ss_tau[K.comp] = vs[K] * Uiu[K.comp][0] * d3[0]
+
+    hints = {"scalars": scalars, "vs": vs,
+             "G_i": {s: GA[s][0] for s in SPINS},
+             "F_i0": F_i0,
+             "classIp_left": cIp_left,
+             "seed_pair_sigma_i": sp_sig, "seed_pair_tau_i": sp_tau,
+             "seed_same_sigma_i": ss_sig, "seed_same_tau_i": ss_tau}
     return GeometricHessian(family=family, pair=sp.expand(w * pair),
                             same=sp.expand(w * same), hints=hints)
 

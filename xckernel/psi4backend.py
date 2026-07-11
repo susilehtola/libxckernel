@@ -914,6 +914,250 @@ def emit_uv_fx_contraction(family: str = "mgga_tau") -> str:
     A(ind + "// ==> END GENERATED CODE <==")
     return "\n".join(L)
 
+# --- UV::compute_hessian: the explicit fixed-grid term ------------------------
+
+#: operand map for the polarized Hessian pair kernel (per-function
+#: context: P, ml/nl, xd/yd, component i). UKS is pure math throughout:
+#: the U rows and D pair factors are the actual spin matrices (factor 1);
+#: masked displacement collocations carry -d/dr; double-displacement
+#: collocations carry +d2/dxdy; tau-index libxc arrays are stored halved.
+def _uv_hess_operands() -> Dict[str, Tuple[str, float]]:
+    ops = dict(_uv_operands())
+    ops["w"] = (None, 1.0)      # the emitter places w[P] itself
+    for s_ in ("a", "b"):
+        ops[f"U0{s_}_u"] = (f"U0{s_}[P][ml]", 1.0)
+        ops[f"U1{s_}_u"] = (f"Ui{s_}[i][P][ml]", 1.0)
+        ops[f"G_{s_}_i"] = (f"g_{s_}", 1.0)
+        # hints carry i = 0 instances: the x components bind to the
+        # host's Cartesian loop index i
+        ops[f"grad_rho_{s_}_x"] = (f"rho_{s_}g[i][P]", 1.0)
+        del ops[f"grad_rho_{s_}_y"], ops[f"grad_rho_{s_}_z"]
+        ops[f"D_{s_}_u_v"] = (None, 1.0)
+    ops["dchi_gA_u"] = ("phi_i[xd][P][ml]", -1.0)
+    ops["ddchi_gA_u_x"] = ("phi_hess[hess_addr[xd][i]][P][ml]", -1.0)
+    ops["dchi_gB_v"] = (None, -1.0)
+    ops["ddchi_gB_v_x"] = (None, -1.0)
+    ops["d2chi_g2_u"] = ("phi_hess[hess_addr[xd][yd]][P][ml]", 1.0)
+    ops["d3chi_g2_u_x"] = ("phi_3[t3_addr[xd][yd][i]][P][ml]", 1.0)
+    return ops
+
+
+def _hx_uv(expr, ops, scale: float = 1.0, weight: str = "w[P]") -> str:
+    """Transform an expression to a C sum with a Hessian operand map."""
+    from .fastpoly import from_expr
+    terms = []
+    for key, coeff in sorted(from_expr(sp_expand(expr)).items(),
+                             key=lambda kv: str(kv[0])):
+        c = float(coeff) * scale
+        facs = []
+        for sym, e in key:
+            text, fac = ops[sym.name]
+            c *= fac ** e
+            if text is not None:
+                facs.extend([text] * e)
+        if weight:
+            facs.insert(0, weight)
+        body = " * ".join(facs)
+        terms.append(f"{c:+.1f} * {body}" if body else f"{c:+.1f}")
+    out = " ".join(terms)
+    return out[1:] if out.startswith("+") else out
+
+
+def sp_expand(e):
+    import sympy
+    return sympy.expand(e)
+
+
+#: per-scalar row array names and ansatz guards for the UV Hessian
+_UV_ROW = {("rho", "a"): ("F_ra", 0), ("rho", "b"): ("F_rb", 0),
+           ("sigma", "aa"): ("F_saa", 1), ("sigma", "ab"): ("F_sab", 1),
+           ("sigma", "bb"): ("F_sbb", 1),
+           ("tau", "a"): ("F_ta", 2), ("tau", "b"): ("F_tb", 2)}
+
+
+def emit_uv_hessian(family: str = "mgga_tau") -> dict:
+    """Emit the generated regions of UV::compute_hessian's explicit
+    fixed-grid GGA/meta term. UV convention: the host ends with
+    hermitivitize() alone (no scale(2)), so symmetric classes enter at
+    FULL weight and transpose-pair members TWICE."""
+    from .geometric import geometric_hessian_spin
+    from .spin_kernel import _register
+    gh = geometric_hessian_spin(family)
+    h = gh.hints
+    scalars = h["scalars"]
+    ops = _uv_hess_operands()
+    mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
+                         f"geometric_hessian_spin({family}) {what}] <==")
+    END = "// ==> END GENERATED CODE <=="
+    regions = {}
+
+    # R1: field-derivative row fill (bound in the host's xd/P/ml loops)
+    ind = " " * 24
+    r1 = [mark("rows")]
+    r1.append(f"double f_ra = {_hx_uv(h['F_i0'][scalars[0]], ops, weight='')};")
+    r1.append(f"double f_rb = {_hx_uv(h['F_i0'][scalars[1]], ops, weight='')};")
+    r1.append("double f_saa = 0.0, f_sab = 0.0, f_sbb = 0.0;")
+    r1.append("double f_ta = 0.0, f_tb = 0.0;")
+    r1.append("for (int i = 0; i < 3; i++) {")
+    r1.append(f"    double g_a = {_hx_uv(h['G_i']['a'], ops, weight='')};")
+    r1.append(f"    double g_b = {_hx_uv(h['G_i']['b'], ops, weight='')};")
+    r1.append("    Ga[3 * xd + i][P][ml] = live ? g_a : 0.0;")
+    r1.append("    Gb[3 * xd + i][P][ml] = live ? g_b : 0.0;")
+    by_kc = {(K.group, K.comp): K for K in scalars}
+    for comp in ("aa", "ab", "bb"):
+        K = by_kc.get(("sigma", comp))
+        if K is not None:
+            r1.append(f"    f_s{comp} += {_hx_uv(h['F_i0'][K], ops, weight='')};")
+    for comp in ("a", "b"):
+        K = by_kc.get(("tau", comp))
+        if K is not None:
+            r1.append(f"    if (is_meta) f_t{comp} += "
+                      f"{_hx_uv(h['F_i0'][K], ops, weight='')};")
+    r1.append("}")
+    for K in scalars:
+        name, _g = _UV_ROW[(K.group, K.comp)]
+        local = {"rho": {"a": "f_ra", "b": "f_rb"},
+                 "sigma": {"aa": "f_saa", "ab": "f_sab", "bb": "f_sbb"},
+                 "tau": {"a": "f_ta", "b": "f_tb"}}[K.group][K.comp]
+        r1.append(f"{name}[xd][P][ml] = live ? {local} : 0.0;")
+    regions["rows"] = "\n".join(ind + line for line in r1)
+
+    # R2: class I (field x field, full weight, rho-rho pairs excluded --
+    # the LSDA block owns them) + the vsigma gradient cross
+    ind = " " * 16
+    r2 = [mark("class I")]
+    for L in scalars:
+        Lname, Lg = _UV_ROW[(L.group, L.comp)]
+        base, guarded = [], {}
+        for K in scalars:
+            if K.group == "rho" and L.group == "rho":
+                continue
+            fname = _register((K, L)).name
+            text, fac = ops[fname]
+            Kname, Kg = _UV_ROW[(K.group, K.comp)]
+            term = (f"{fac:.1f} * {text} * {Kname}[xd][P][ml]" if fac != 1.0
+                    else f"{text} * {Kname}[xd][P][ml]")
+            g = Kg
+            if g <= Lg:
+                base.append(term)
+            else:
+                guarded.setdefault(g, []).append(term)
+        if not base and not guarded:
+            continue
+        body = ["for (int P = 0; P < npoints; P++) {",
+                "    for (int ml = 0; ml < nlocal; ml++) {",
+                f"        double l = {' + '.join(base) if base else '0.0'};"]
+        for g in sorted(guarded):
+            body.append(f"        if (ansatz >= {g}) l += "
+                        f"{' + '.join(guarded[g])};")
+        body += ["        WL[P][ml] = w[P] * l;",
+                 "    }",
+                 "}",
+                 "for (int yd = 0; yd < 3; yd++) {",
+                 f"    C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WL[0], max_functions, {Lname}[yd][0],",
+                 "            max_functions, 1.0, pH[xd][yd][0], max_functions);",
+                 "}"]
+        r2.append(f"// class I, right row {Lname}")
+        if Lg > 0:
+            r2.append(f"if (ansatz >= {Lg}) {{")
+            r2.extend("    " + b for b in body)
+            r2.append("}")
+        else:
+            r2.extend(body)
+    # vsigma gradient cross: left factors per right G channel
+    r2.append("// vsigma gradient cross, per right G channel")
+    r2.append("if (ansatz >= 1) {")
+    r2.append("    for (int i = 0; i < 3; i++) {")
+    r2.append("        for (int P = 0; P < npoints; P++) {")
+    r2.append("            for (int ml = 0; ml < nlocal; ml++) {")
+    gops = dict(ops)
+    gops["G_a_i"] = ("Ga[3 * xd + i][P][ml]", 1.0)
+    gops["G_b_i"] = ("Gb[3 * xd + i][P][ml]", 1.0)
+    r2.append(f"                WL[P][ml] = {_hx_uv(h['classIp_left']['a'], gops)};")
+    r2.append(f"                WR[P][ml] = {_hx_uv(h['classIp_left']['b'], gops)};")
+    r2.append("            }")
+    r2.append("        }")
+    r2.append("        for (int yd = 0; yd < 3; yd++) {")
+    r2.append("            C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WL[0], max_functions, Ga[3 * yd + i][0],")
+    r2.append("                    max_functions, 1.0, pH[xd][yd][0], max_functions);")
+    r2.append("            C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WR[0], max_functions, Gb[3 * yd + i][0],")
+    r2.append("                    max_functions, 1.0, pH[xd][yd][0], max_functions);")
+    r2.append("        }")
+    r2.append("    }")
+    r2.append("}")
+    r2.append(END)
+    regions["classI"] = "\n".join(ind + line for line in r2)
+
+    # R3: class II -- two-center seeds. sigma members enter TWICE
+    # (transpose pair under hermitivitize-only); tau symmetric at full.
+    r3 = [mark("class II")]
+    r3.append("if (ansatz >= 1) {")
+    r3.append("    for (int P = 0; P < npoints; P++) {")
+    r3.append("        bool live = std::fabs(rho_a[P]) + std::fabs(rho_b[P]) > v2_rho_cutoff_;")
+    r3.append("        for (int ml = 0; ml < nlocal; ml++) {")
+    r3.append("            double acc_a = 0.0, acc_b = 0.0;")
+    r3.append("            if (live) {")
+    r3.append("                for (int i = 0; i < 3; i++) {")
+    r3.append(f"                    acc_a += {_hx_uv(h['seed_pair_sigma_i']['a'], ops, scale=2.0)};")
+    r3.append(f"                    acc_b += {_hx_uv(h['seed_pair_sigma_i']['b'], ops, scale=2.0)};")
+    r3.append("                }")
+    r3.append("            }")
+    r3.append("            WL[P][ml] = acc_a;")
+    r3.append("            WR[P][ml] = acc_b;")
+    r3.append("        }")
+    r3.append("    }")
+    r3.append("    for (int yd = 0; yd < 3; yd++) {")
+    r3.append("        C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WL[0], max_functions, phi_i[yd][0], coll_funcs,")
+    r3.append("                0.0, WT[0], max_functions);")
+    r3.append("        for (int ml = 0; ml < nlocal; ml++)")
+    r3.append("            for (int nl = 0; nl < nlocal; nl++) pH[xd][yd][ml][nl] += WT[ml][nl] * Dap[ml][nl];")
+    r3.append("        C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WR[0], max_functions, phi_i[yd][0], coll_funcs,")
+    r3.append("                0.0, WT[0], max_functions);")
+    r3.append("        for (int ml = 0; ml < nlocal; ml++)")
+    r3.append("            for (int nl = 0; nl < nlocal; nl++) pH[xd][yd][ml][nl] += WT[ml][nl] * Dbp[ml][nl];")
+    r3.append("    }")
+    r3.append("}")
+    r3.append("// tau two-center seed (symmetric, full weight)")
+    r3.append("if (is_meta) {")
+    r3.append("    for (int i = 0; i < 3; i++) {")
+    r3.append("        for (int P = 0; P < npoints; P++) {")
+    r3.append("            bool live = std::fabs(rho_a[P]) + std::fabs(rho_b[P]) > v2_rho_cutoff_;")
+    r3.append("            for (int ml = 0; ml < nlocal; ml++) {")
+    r3.append(f"                WL[P][ml] = live ? {_hx_uv(h['seed_pair_tau_i']['a'], ops)} : 0.0;")
+    r3.append(f"                WR[P][ml] = live ? {_hx_uv(h['seed_pair_tau_i']['b'], ops)} : 0.0;")
+    r3.append("            }")
+    r3.append("        }")
+    r3.append("        for (int yd = 0; yd < 3; yd++) {")
+    r3.append("            C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WL[0], max_functions,")
+    r3.append("                    phi_hess[hess_addr[yd][i]][0], coll_funcs, 0.0, WT[0], max_functions);")
+    r3.append("            for (int ml = 0; ml < nlocal; ml++)")
+    r3.append("                for (int nl = 0; nl < nlocal; nl++) pH[xd][yd][ml][nl] += WT[ml][nl] * Dap[ml][nl];")
+    r3.append("            C_DGEMM('T', 'N', nlocal, nlocal, npoints, 1.0, WR[0], max_functions,")
+    r3.append("                    phi_hess[hess_addr[yd][i]][0], coll_funcs, 0.0, WT[0], max_functions);")
+    r3.append("            for (int ml = 0; ml < nlocal; ml++)")
+    r3.append("                for (int nl = 0; nl < nlocal; nl++) pH[xd][yd][ml][nl] += WT[ml][nl] * Dbp[ml][nl];")
+    r3.append("        }")
+    r3.append("    }")
+    r3.append("}")
+    r3.append(END)
+    regions["classII"] = "\n".join(ind + line for line in r3)
+
+    # R4: class III -- one-center seeds at full weight, scattered to both
+    # (xd, yd) and (yd, xd) of the (A, A) block (hermitivitize averages)
+    ind4 = " " * 28
+    r4 = [mark("class III")]
+    r4.append("for (int i = 0; i < 3; i++) {")
+    r4.append(f"    t += {_hx_uv(h['seed_same_sigma_i']['a'], ops)};")
+    r4.append(f"    t += {_hx_uv(h['seed_same_sigma_i']['b'], ops)};")
+    if h["seed_same_tau_i"]:
+        r4.append(f"    if (is_meta) t += {_hx_uv(h['seed_same_tau_i']['a'], ops)}"
+                  f" + {_hx_uv(h['seed_same_tau_i']['b'], ops)};")
+    r4.append("}")
+    r4.append(END)
+    regions["classIII"] = "\n".join(ind4 + line for line in r4)
+    return regions
+
+
 
 if __name__ == "__main__":
     import sys
@@ -925,6 +1169,10 @@ if __name__ == "__main__":
         print(emit_rv_gradient_gridmotion())
     elif "--uvfx" in sys.argv:
         print(emit_uv_fx_contraction())
+    elif "--uvhessian" in sys.argv:
+        for _name, _region in emit_uv_hessian().items():
+            print(f"### {_name}")
+            print(_region)
     elif "--hessian" in sys.argv:
         for _name, _region in emit_rv_hessian().items():
             print(f"### {_name}")
