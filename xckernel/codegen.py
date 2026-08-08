@@ -478,20 +478,51 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                            uses=uses, n_terms=n_terms)
 
 
+#: basis arrays that gain a conjugated companion in sesquilinear emission.
+_SESQUI_BASES = ("chi", "dchi", "lapl_chi", "hess_chi")
+
+
+def _conj_factor(fac: str) -> str:
+    """The conjugated-array counterpart of a u-side basis factor code."""
+    base = fac.split("[", 1)[0]
+    if base not in _SESQUI_BASES:
+        raise ValueError(
+            f"sesquilinear emission does not support basis factor {fac!r} "
+            "(geometric-derivative kernels are bilinear-only for now)")
+    return fac.replace(base, base + "_c", 1)
+
+
 def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
-                       batch: bool = False) -> GeneratedFunction:
+                       batch: bool = False,
+                       sesquilinear: bool = False) -> GeneratedFunction:
     """Pattern-collapsed NumPy emission (the production lowering).
 
     Every monomial of a one-free-pair integrand factorizes as
     (basis factor at u) x (basis factor at v) x (per-point scalar), and only a
     handful of basis-pair patterns exist at ANY derivative order.  See
     collapse() for the structured intermediate shared with other backends.
+
+    With ``sesquilinear=True`` (complex basis functions), the free pair
+    contracts the CONJUGATED basis values on the u side: the emitted function
+    takes companion arrays ``chi_c`` (= conj(chi)), ``dchi_c``, ... after
+    each plain basis array, accumulates in complex arithmetic, and returns
+    ``F_uv = dE/dP_uv`` for the convention ``rho = sum_uv P_uv chi_u^* chi_v``.
+    The per-point scalar coefficients are untouched: all ingredient fields of
+    a Hermitian density matrix remain real for a complex basis as well.
     """
     ck = collapse(ki)
     u_lbl, v_lbl = ck.u_lbl, ck.v_lbl
     libxc_args = ck.libxc_args
     pert_grads, pert_scalars = ck.pert_grads, ck.pert_scalars
     uses, params, n_terms = ck.uses, ck.params, ck.n_terms
+
+    if sesquilinear:
+        for ufac, _vfac, _monos in ck.patterns:
+            _conj_factor(ufac)          # reject unsupported factors early
+        params = list(params)
+        for base in reversed(_SESQUI_BASES):
+            if base in params:
+                params.insert(params.index(base) + 1, base + "_c")
 
     # map scalar symbol names to python expressions for coefficient printing
     def scalar_code(name: str) -> str:
@@ -513,11 +544,12 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     for ufac, vfac, monos in ck.patterns:
         code = " + ".join(mono_code(coeff, fac) for coeff, fac in monos)
         lines.append(f"    c = {code}")
+        ucode = _conj_factor(ufac) if sesquilinear else ufac
         if batch:
-            lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ufac}, "
+            lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ucode}, "
                          f"c, {vfac}, optimize=True)")
         else:
-            lines.append(f"    out += ({ufac} * c) @ {vfac}.T")
+            lines.append(f"    out += ({ucode} * c) @ {vfac}.T")
 
     header = [
         f"def {func_name}({', '.join(params)}):",
@@ -525,15 +557,16 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         f"from {n_terms} terms",
         f"    nao = chi.shape[0]",
     ]
+    dtype = ", dtype=complex" if sesquilinear else ""
     if batch:
         if not (pert_scalars or pert_grads):
             raise ValueError("batch=True requires perturbed-field operands")
         nx_src = pert_scalars[0] if pert_scalars \
             else f"grad_rho_{pert_grads[0]}"
         header += [f"    nx = {nx_src}.shape[0]",
-                   f"    out = np.zeros((nx, nao, nao))"]
+                   f"    out = np.zeros((nx, nao, nao){dtype})"]
     else:
-        header += ["    out = np.zeros((nao, nao))"]
+        header += [f"    out = np.zeros((nao, nao){dtype})"]
     source = "\n".join(header + lines + ["    return out", ""])
 
     return GeneratedFunction(

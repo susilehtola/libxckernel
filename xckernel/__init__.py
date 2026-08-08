@@ -20,6 +20,7 @@ from .codegen import (CollapsedKernel, GeneratedFunction, collapse,
                       compile_function, generate, generate_collapsed)
 from .cbackend import emit_c, scal_order
 from .runtime import Library, get_kernel
+from .fields import collocate, hermitian_fields, hermitian_fock
 from .mo import mo_transform, orbital_gradient, orbital_hessian
 from .response import (ResponseIntegrand, contracted_derivative, pert_field,
                        perturbed_variable, response_fock)
@@ -57,6 +58,9 @@ __all__ = [
     "scal_order",
     "Library",
     "get_kernel",
+    "collocate",
+    "hermitian_fields",
+    "hermitian_fock",
     "generate",
     "generate_collapsed",
     "compile_function",
