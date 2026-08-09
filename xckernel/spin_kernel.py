@@ -20,7 +20,8 @@ import sympy as sp
 
 from .basis import Orbital
 from .deriv import libxc_deriv_name
-from .spin import (COMPS, GROUPS, SCALARS, Scalar, _GROUP_RANK,
+from .spin import (COMPS, FIELD_PERTS, FIELD_SEEDS, GROUPS, HESS_S,
+                   INV_RHO_S, JP_S, SCALARS, Scalar, _GROUP_RANK,
                    family_scalars, GRAD)
 
 
@@ -68,18 +69,8 @@ def _register(scalars: Tuple[Scalar, ...]) -> sp.Symbol:
     return sym
 
 
-# --- grad-field seed lookup (P-dependent atoms that appear in expressions) --
-
-_GRAD_INFO = {}   # symbol -> (spin, axis)
-for _s in ("a", "b"):
-    for _ax in range(3):
-        _GRAD_INFO[GRAD[_s][_ax]] = (_s, _ax)
-
-
-def _grad_seed(spin: str, ax: int, dspin: str, u: Orbital, v: Orbital) -> sp.Expr:
-    if dspin != spin:
-        return sp.Integer(0)
-    return u.grad[ax] * v.val + u.val * v.grad[ax]
+# P-dependent field atoms (gradient, current, inverse-density, Hessian
+# fields) are seeded through the spin.FIELD_SEEDS registry.
 
 
 # --- the spin-resolved directional derivative D^dspin ----------------------
@@ -96,10 +87,9 @@ def directional_derivative(expr: sp.Expr, family: str, dspin: str,
     scalars = family_scalars(family)
 
     def seed(atom: sp.Symbol):
-        # spin-resolved gradient field
-        if atom in _GRAD_INFO:
-            spin, ax = _GRAD_INFO[atom]
-            d = _grad_seed(spin, ax, dspin, u, v)
+        # spin-resolved P-dependent field
+        if atom in FIELD_SEEDS:
+            d = FIELD_SEEDS[atom](dspin, u, v)
         # Libxc derivative symbol: bump by each family scalar Y
         elif atom.name in _SYM_SCALARS:
             base = _SYM_SCALARS[atom.name]
@@ -127,8 +117,11 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     A perturbation carries BOTH spin channels (D^{X,a}, D^{X,b}); the perturbed
     sigma components mix them: sigma_st^X = grad_s^X . grad_t + grad_s . grad_t^X
     (which reduces to 2 grad_s . grad_s^X for the same-spin components).
+    Composite scalars (gauge-corrected tau, eta) carry their own pert closure.
     """
     from .basis import AXES
+    if sc.pert is not None:
+        return sc.pert(label)
     if sc.group == "rho":
         return sp.Symbol(f"rho_{sc.comp}_{label}", real=True)
     if sc.group == "lapl":
@@ -147,14 +140,12 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
 
 def _seed_fn_spin(family: str, label: str):
     """Monomial-level seed map for the spin engine (fastpoly)."""
-    from .basis import AXES
     from .fastpoly import from_expr
     scalars = family_scalars(family)
 
     def seed(atom: sp.Symbol):
-        if atom in _GRAD_INFO:
-            spin, ax = _GRAD_INFO[atom]
-            return {((_pert_grad(spin, label, AXES[ax]), 1),): sp.Integer(1)}
+        if atom in FIELD_PERTS:
+            return from_expr(FIELD_PERTS[atom](label))
         if atom.name in _SYM_SCALARS:
             base = _SYM_SCALARS[atom.name]
             d = sp.Integer(0)
@@ -266,14 +257,19 @@ def response_fock_st(family: str, order: int = 2,
     if any(p not in (-1, +1) for p in parities):
         raise ValueError("parities must be +1 (singlet) or -1 (triplet)")
 
-    from .basis import AXES
+    from .basis import AXES, HESS_COMPS
     from .fastpoly import subs_signed
     ri = response_fock_spin(family, "a", order, u, v)
     mapping = {}
-    # closed-shell ground state: beta gradient fields -> alpha fields
+    # closed-shell ground state: beta fields -> alpha fields
     for i in range(3):
         mapping[GRAD["b"][i]] = (GRAD["a"][i], +1)
+        mapping[JP_S["b"][i]] = (JP_S["a"][i], +1)
+    mapping[INV_RHO_S["b"]] = (INV_RHO_S["a"], +1)
+    for k in range(6):
+        mapping[HESS_S["b"][k]] = (HESS_S["a"][k], +1)
     # perturbation parity: beta perturbed fields -> parity * alpha fields
+    _h6 = [f"{AXES[i]}{AXES[j]}" for (i, j) in HESS_COMPS]
     for label, par in zip(ri.labels, parities):
         for base in ("rho", "lapl_rho", "tau"):
             mapping[sp.Symbol(f"{base}_b_{label}", real=True)] = \
@@ -281,6 +277,11 @@ def response_fock_st(family: str, order: int = 2,
         for ax in AXES:
             mapping[_pert_grad("b", label, ax)] = \
                 (_pert_grad("a", label, ax), par)
+            mapping[sp.Symbol(f"jp_b_{label}_{ax}", real=True)] = \
+                (sp.Symbol(f"jp_a_{label}_{ax}", real=True), par)
+        for comp in _h6:
+            mapping[sp.Symbol(f"hess_rho_b_{label}_{comp}", real=True)] = \
+                (sp.Symbol(f"hess_rho_a_{label}_{comp}", real=True), par)
     poly = subs_signed(ri.poly, mapping)
     return SpinResponseIntegrand(family=family, spin="a", labels=ri.labels,
                                  index_pairs=[(u, v)], poly=poly)

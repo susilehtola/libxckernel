@@ -252,6 +252,8 @@ FAMILIES: Dict[str, List[Ingredient]] = {
     "mgga": [RHO_ING, SIGMA_ING, LAPL_ING, TAU_ING],
     # meta-GGA without the density Laplacian (the common case in Libxc):
     "mgga_tau": [RHO_ING, SIGMA_ING, TAU_ING],
+    # meta-GGA without tau: deorbitalized functionals (e.g. r2SCAN-L):
+    "mgga_lapl": [RHO_ING, SIGMA_ING, LAPL_ING],
     # current-density DFT: a tau-meta-GGA evaluated at the gauge-corrected
     # tau~ = tau - j_p^2/(2 rho); operands gain jp (3,ng) and inv_rho (ng,).
     "cmgga_tau": [RHO_ING, SIGMA_ING, CTAU_ING],
