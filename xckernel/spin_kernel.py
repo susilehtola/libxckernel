@@ -86,12 +86,16 @@ def _grad_seed(spin: str, ax: int, dspin: str, u: Orbital, v: Orbital) -> sp.Exp
 
 def directional_derivative(expr: sp.Expr, family: str, dspin: str,
                            u_label: str, v_label: str) -> sp.Expr:
-    """Apply D^dspin_{u,v} = d/dP^dspin_uv to an integrand expression."""
+    """Apply D^dspin_{u,v} = d/dP^dspin_uv to an integrand expression.
+
+    Applied monomial-wise via the fastpoly representation, like every
+    other derivative operator of the library."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
     u = Orbital.make(u_label)
     v = Orbital.make(v_label)
     scalars = family_scalars(family)
-    result = sp.Integer(0)
-    for atom in expr.free_symbols:
+
+    def seed(atom: sp.Symbol):
         # spin-resolved gradient field
         if atom in _GRAD_INFO:
             spin, ax = _GRAD_INFO[atom]
@@ -103,10 +107,10 @@ def directional_derivative(expr: sp.Expr, family: str, dspin: str,
             for Y in scalars:
                 d += _register(base + (Y,)) * Y.seed(dspin, u, v)
         else:
-            d = sp.Integer(0)  # basis data / weight
-        if d != 0:
-            result += sp.diff(expr, atom) * d
-    return sp.expand(result)
+            return None  # basis data / weight
+        return from_expr(d) if d != 0 else None
+
+    return to_expr(seeded_derivative(from_expr(expr), seed))
 
 
 # --- assembly ---------------------------------------------------------------

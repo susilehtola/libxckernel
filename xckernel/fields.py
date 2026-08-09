@@ -42,7 +42,8 @@ import numpy as np
 
 from .basis import HESS_COMPS
 
-__all__ = ["collocate", "hermitian_fields", "hermitian_fock"]
+__all__ = ["collocate", "collocate_pair", "hermitian_fields",
+           "hermitian_fock"]
 
 
 def collocate(P, chi, dchi, lapl_chi=None, hess_chi=None) -> Dict[str, np.ndarray]:
@@ -86,6 +87,35 @@ def collocate(P, chi, dchi, lapl_chi=None, hess_chi=None) -> Dict[str, np.ndarra
                          + np.einsum("uv,ug,vg->g", P, dchi_c[j], dchi[i])
                          + np.einsum("uv,ug,vg->g", P, chi_c, hess_chi[k]))
         out["hess_rho"] = np.stack(comps)
+    return out
+
+
+def collocate_pair(X, psi_l, dpsi_l, psi_r, dpsi_r) -> Dict[str, np.ndarray]:
+    """Perturbed fields of an orbital-pair trial matrix, without AO matrices.
+
+    Computes the fields of the density-matrix direction
+    ``D_uv = sum_ij X_ij psi^l_i(u)^* psi^r_j(v)`` directly from
+    molecular-orbital values on the grid:
+    ``rho^X = sum_ij X_ij psi^l_i{}^* psi^r_j`` and its gradient-,
+    tau-, and jp-type companions.  The cost is a handful of rank-k
+    matrix products at O(n_orb n_grid); no (nbf, nbf) matrix is formed,
+    which is the natural mode for plane-wave and other matrix-free hosts
+    (the AO route via :func:`collocate` gives identical fields).
+
+    X: (nl, nr); psi_l: (nl, ng); dpsi_l: (3, nl, ng); psi_r, dpsi_r
+    likewise. Returns rho, grad_rho (3,ng), sigma, tau, jp (3,ng).
+    """
+    X = np.asarray(X)
+    Mv = X.T @ np.conj(psi_l)
+    Md = np.stack([X.T @ np.conj(dpsi_l[c]) for c in range(3)])
+    out: Dict[str, np.ndarray] = {}
+    out["rho"] = np.einsum("jg,jg->g", Mv, psi_r)
+    out["grad_rho"] = (np.einsum("cjg,jg->cg", Md, psi_r)
+                       + np.einsum("jg,cjg->cg", Mv, dpsi_r))
+    out["sigma"] = np.einsum("cg,cg->g", out["grad_rho"], out["grad_rho"])
+    out["tau"] = 0.5 * np.einsum("cjg,cjg->g", Md, dpsi_r)
+    out["jp"] = 0.5 * (np.einsum("jg,cjg->cg", Mv, dpsi_r)
+                       - np.einsum("cjg,jg->cg", Md, psi_r))
     return out
 
 

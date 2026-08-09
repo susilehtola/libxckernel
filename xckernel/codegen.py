@@ -482,19 +482,20 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
 _SESQUI_BASES = ("chi", "dchi", "lapl_chi", "hess_chi")
 
 
-def _conj_factor(fac: str) -> str:
-    """The conjugated-array counterpart of a u-side basis factor code."""
+def _side_factor(fac: str, suffix: str, why: str) -> str:
+    """A basis factor code with a side suffix, e.g. chi -> chi_l."""
     base = fac.split("[", 1)[0]
     if base not in _SESQUI_BASES:
         raise ValueError(
-            f"sesquilinear emission does not support basis factor {fac!r} "
+            f"{why} emission does not support basis factor {fac!r} "
             "(geometric-derivative kernels are bilinear-only for now)")
-    return fac.replace(base, base + "_c", 1)
+    return fac.replace(base, base + suffix, 1)
 
 
 def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                        batch: bool = False,
-                       sesquilinear: bool = False) -> GeneratedFunction:
+                       sesquilinear: bool = False,
+                       two_sided: bool = False) -> GeneratedFunction:
     """Pattern-collapsed NumPy emission (the production lowering).
 
     Every monomial of a one-free-pair integrand factorizes as
@@ -509,7 +510,19 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     ``F_uv = dE/dP_uv`` for the convention ``rho = sum_uv P_uv chi_u^* chi_v``.
     The per-point scalar coefficients are untouched: all ingredient fields of
     a Hermitian density matrix remain real for a complex basis as well.
+
+    With ``two_sided=True``, the u and v sides take INDEPENDENT collocation
+    arrays (``chi_l``/``chi_r``, ``dchi_l``/``dchi_r``, ...), and the output
+    is (nl, nr) with nl and nr free.  Seeding the sides with occupied and
+    virtual MOLECULAR-orbital values on the grid emits the sigma-vector
+    contraction sigma_ia directly, with no atomic-orbital matrix ever
+    materialized -- the matrix-free mode of plane-wave and Davidson-solver
+    hosts.  The caller supplies conjugated left-side values (bra side) when
+    the orbitals are complex.
     """
+    if sesquilinear and two_sided:
+        raise ValueError("sesquilinear and two_sided are mutually exclusive; "
+                         "two_sided callers pass conjugated left arrays")
     ck = collapse(ki)
     u_lbl, v_lbl = ck.u_lbl, ck.v_lbl
     libxc_args = ck.libxc_args
@@ -518,11 +531,22 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
 
     if sesquilinear:
         for ufac, _vfac, _monos in ck.patterns:
-            _conj_factor(ufac)          # reject unsupported factors early
+            _side_factor(ufac, "_c", "sesquilinear")   # reject early
         params = list(params)
         for base in reversed(_SESQUI_BASES):
             if base in params:
                 params.insert(params.index(base) + 1, base + "_c")
+    if two_sided:
+        for ufac, vfac, _monos in ck.patterns:
+            _side_factor(ufac, "_l", "two-sided")      # reject early
+            _side_factor(vfac, "_r", "two-sided")
+        # replace each basis array by its _l/_r pair, keeping the order
+        params = []
+        for p in ck.params:
+            if p in _SESQUI_BASES:
+                params += [p + "_l", p + "_r"]
+            else:
+                params.append(p)
 
     # map scalar symbol names to python expressions for coefficient printing
     def scalar_code(name: str) -> str:
@@ -540,33 +564,89 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
             factors.append(f"{c}**{e}" if e > 1 else c)
         return "*".join(factors)
 
+    # Transpose-partner deduplication: patterns (u, v) and (v, u) whose
+    # coefficient polynomials are identical (or exactly negated, as in the
+    # antisymmetric current channel) are evaluated with a single matrix
+    # multiplication and a (subtracted) transposed accumulation. The plain
+    # transpose is only the partner when both sides draw from the same
+    # collocation arrays, so the sesquilinear and two-sided modes emit
+    # every pattern separately.
+    def _mono_dict(monos):
+        return {fac: coeff for coeff, fac in monos}
+
+    plan: List[tuple] = []          # (pattern index, +1 / -1 / None)
+    if sesquilinear or two_sided:
+        plan = [(k, None) for k in range(len(ck.patterns))]
+    else:
+        index = {(u, v): k for k, (u, v, _) in enumerate(ck.patterns)}
+        done = set()
+        for k, (u, v, m) in enumerate(ck.patterns):
+            if k in done:
+                continue
+            done.add(k)
+            j = index.get((v, u))
+            sign = None
+            if u != v and j is not None and j not in done:
+                mk = _mono_dict(m)
+                mj = _mono_dict(ck.patterns[j][2])
+                if mj == mk:
+                    sign = 1
+                elif mj == {fac: -c for fac, c in mk.items()}:
+                    sign = -1
+                if sign is not None:
+                    done.add(j)
+            plan.append((k, sign))
+
     lines: List[str] = []
-    for ufac, vfac, monos in ck.patterns:
+    for k, sign in plan:
+        ufac, vfac, monos = ck.patterns[k]
         code = " + ".join(mono_code(coeff, fac) for coeff, fac in monos)
         lines.append(f"    c = {code}")
-        ucode = _conj_factor(ufac) if sesquilinear else ufac
-        if batch:
-            lines.append(f"    out += np.einsum('ug,xg,vg->xuv', {ucode}, "
-                         f"c, {vfac}, optimize=True)")
+        if sesquilinear:
+            ucode, vcode = _side_factor(ufac, "_c", "sesquilinear"), vfac
+        elif two_sided:
+            ucode = _side_factor(ufac, "_l", "two-sided")
+            vcode = _side_factor(vfac, "_r", "two-sided")
         else:
-            lines.append(f"    out += ({ucode} * c) @ {vfac}.T")
+            ucode, vcode = ufac, vfac
+        if batch:
+            gemm = (f"np.einsum('ug,xg,vg->xuv', {ucode}, "
+                    f"c, {vcode}, optimize=True)")
+            tr = "np.transpose(t, (0, 2, 1))"
+        else:
+            gemm = f"({ucode} * c) @ {vcode}.T"
+            tr = "t.T"
+        if sign is None:
+            lines.append(f"    out += {gemm}")
+        else:
+            lines.append(f"    t = {gemm}")
+            lines.append(f"    out += t")
+            lines.append(f"    out {'+' if sign > 0 else '-'}= {tr}")
 
     header = [
         f"def {func_name}({', '.join(params)}):",
         f"    # pattern-collapsed: {len(ck.patterns)} patterns "
         f"from {n_terms} terms",
-        f"    nao = chi.shape[0]",
     ]
-    dtype = ", dtype=complex" if sesquilinear else ""
+    if two_sided:
+        header += ["    nl = chi_l.shape[0]",
+                   "    nr = chi_r.shape[0]"]
+        shape, dtype = "(nl, nr)", ", dtype=np.result_type(chi_l, chi_r)"
+    else:
+        header += ["    nao = chi.shape[0]"]
+        shape = "(nao, nao)"
+        dtype = ", dtype=complex" if sesquilinear else ""
     if batch:
         if not (pert_scalars or pert_grads):
             raise ValueError("batch=True requires perturbed-field operands")
         nx_src = pert_scalars[0] if pert_scalars \
             else f"grad_rho_{pert_grads[0]}"
         header += [f"    nx = {nx_src}.shape[0]",
+                   f"    out = np.zeros((nx,) + {shape}{dtype})"
+                   if two_sided else
                    f"    out = np.zeros((nx, nao, nao){dtype})"]
     else:
-        header += [f"    out = np.zeros((nao, nao){dtype})"]
+        header += [f"    out = np.zeros({shape}{dtype})"]
     source = "\n".join(header + lines + ["    return out", ""])
 
     return GeneratedFunction(

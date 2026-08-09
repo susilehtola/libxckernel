@@ -123,12 +123,16 @@ def _atom_derivative(atom: sp.Symbol, func: Functional,
 
 def directional_derivative(expr: sp.Expr, func: Functional,
                            u_label: str, v_label: str) -> sp.Expr:
-    """Apply D_uv = d/dP_uv to an integrand expression."""
+    """Apply D_uv = d/dP_uv to an integrand expression.
+
+    Applied monomial-wise via the fastpoly representation, like every
+    other derivative operator of the library."""
+    from .fastpoly import from_expr, seeded_derivative, to_expr
     u = Orbital.make(u_label)
     v = Orbital.make(v_label)
-    result = sp.Integer(0)
-    for atom in expr.free_symbols:
+
+    def seed(atom: sp.Symbol):
         d = _atom_derivative(atom, func, u, v)
-        if d != 0:
-            result += sp.diff(expr, atom) * d
-    return sp.expand(result)
+        return from_expr(d) if d != 0 else None
+
+    return to_expr(seeded_derivative(from_expr(expr), seed))
