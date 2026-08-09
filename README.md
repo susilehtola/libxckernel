@@ -22,8 +22,15 @@ derivation with symbolic differentiation and code generation:
 
 Composing the two by the chain rule — mechanically, at any order — yields any
 XC kernel element as an Einstein-sum expression over basis-function values,
-grid weights, and Libxc derivative arrays, which is emitted as ready-to-run
-NumPy code (other codegen targets are planned).
+grid weights, and Libxc derivative arrays. Derivatives are applied
+monomial-wise in a fast polynomial representation, and the result is
+**pattern-collapsed**: every term factorizes as (basis-pair pattern) ×
+(per-point scalar), and only a handful of patterns exist at any order, so
+even a 130,566-term kernel lowers to a few GEMMs. Three emitter families
+consume the collapsed form: ready-to-run NumPy (`einsum`), a low-level C
+library with static coefficient tables, and host-idiom plugins that write a
+program's own contraction style (demonstrated on Psi4:
+[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458)).
 
 ## The derivative tower
 
@@ -62,6 +69,24 @@ of κ at any order), gradient projections, TDA/RPA σ-vector templates, and an
 for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 2, 3 instances of one loop — no per-order hand derivation.
 
+## The kernel catalog
+
+`catalog.py` enumerates, generates, and manifests **141 kernels** named
+`xck_<family>_<case>_o<order>[_<parities>]`, spanning seven functional
+families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
+`mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
+gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
+local-hybrid calibration functions) — in the restricted, unrestricted, and
+closed-shell spin-adapted cases (singlet/triplet parity per perturbation)
+through fourth derivative order (third for the spin-resolved `cmgga_tau` and
+for `hmgga`, whose higher orders remain generatable on demand). Every kernel
+ships with a machine-readable manifest declaring its operands and shapes,
+the Libxc arrays it consumes by name, and its term ownership. Beyond the
+catalog: complex orbitals and complex basis functions (sesquilinear
+emission), a matrix-free two-sided mode that emits σ-vector contractions
+from MO-pair collocation, and nuclear derivatives of the XC contribution
+including the full quadrature-grid response (`geometric.py`).
+
 ## What is validated
 
 All checks live in `xckernel/tests/` and compare against PySCF (machine
@@ -80,6 +105,13 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | RPA supervector σ | LDA/GGA | R | PySCF `gen_tdhf_operation` | ~1e-17 |
 | quadratic-response σ (E[3]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-6 |
 | cubic-response σ (E[4]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-5 |
+| geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
+| geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
+| complex orbitals/basis (sesquilinear) | LDA–mGGA | R | FD in complex P | machine ε |
+| two-sided (matrix-free) σ | LDA–mGGA | R | AO-route kernels | machine ε |
+| current-density (τ̃, jp seeds) | cmgga_tau | R + U + s/t | FD in general M | ~1e-12 |
+| density-Hessian (η) | hmgga | R + U + s/t | FD in general M | ~1e-11 |
+| C backend | all | R | NumPy backend | ~1e-16 |
 
 Conventions (the κ exponential sign, occupation/factor placement,
 singlet/triplet parities, Libxc component packing) are explicit parameters or
@@ -111,16 +143,24 @@ ground-state and perturbed fields, and the named Libxc derivative arrays that
 
 ```
 xckernel/
-  basis.py         symbolic basis-function fields (chi, grad chi, lapl chi)
-  ingredients.py   rho, grad rho, lapl rho, tau as bilinear forms in P + seeds
-  functional.py    Libxc first-derivative symbols
+  basis.py         symbolic basis-function fields (chi, grad, lapl, hess chi)
+  ingredients.py   rho, grad rho, lapl rho, tau, jp, hess rho, eta + seeds
+  functional.py    families as ingredient sets
   deriv.py         the D operator and the Libxc derivative-name registry
+  fastpoly.py      monomial representation; all derivatives applied here
   fock.py          F_uv integrand
   kernel.py        repeated-D kernels (g_uv,ts and higher)
   response.py      contraction engine (perturbed-field seeds), any order
-  spin.py          spin-resolved ingredients and seeds
-  spin_kernel.py   open-shell tower, Libxc component packing, singlet/triplet
-  codegen.py       einsum code generation (batched; spin; perturbed fields)
+  spin.py          spin-resolved ingredients, seeds, component packing
+  spin_kernel.py   open-shell tower, singlet/triplet parities
+  geometric.py     nuclear derivatives incl. quadrature-grid response
+  codegen.py       pattern collapse + NumPy emission (batched; spin;
+                   sesquilinear; two-sided)
+  cbackend.py      C library emitter (static tables + fixed evaluator)
+  psi4backend.py   Psi4 host-idiom emitter (marked source regions)
+  catalog.py       the 141-kernel catalog + machine-readable manifests
+  fields.py        numerical collocation helpers (incl. complex P)
+  runtime.py       compiled-library loader
   mo.py            AO->MO helpers: orbital gradient (kappa sign!) and Hessian
   algebra.py       response algebra: DM builders, projections, sigma templates
   tests/           validation suites (see table above)
@@ -139,10 +179,18 @@ BSD 3-Clause (see `LICENSE`).
 
 ## Status and roadmap
 
-Working and validated: everything in the table. Not yet done: matrix-form
-(commutator-algebra) lowering of the response σ assembly for production
-efficiency; active-space (MCSCF-type) gradient projector; spin-basis
-(`ud2ts`) transformation maps; rank-1 (occupation × orbital) density-matrix
-form; C/Fortran codegen targets; hybrid/range-separated bookkeeping (the
-exchange part is the host's, but the survey's term-ownership lesson says the
-boundary must be spelled out).
+Working and validated: everything in the tables above, including the C and
+Psi4 emitter backends, complex orbitals, the matrix-free two-sided mode, and
+the geometric derivatives with quadrature-grid response. The Psi4
+integration (meta-GGA TDDFT/CPKS/stability, GGA and meta-GGA nuclear
+Hessians, grid response) is available as
+[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458). A manuscript
+describing the library is in preparation.
+
+Not yet done: the exact-exchange energy density e_x(r) as a primitive
+ingredient (local hybrids; the density-Hessian calibration variable η is
+already in); noncollinear spin; matrix-form (commutator-algebra) lowering of
+the response σ assembly; active-space (MCSCF-type) gradient projector;
+spin-basis (`ud2ts`) transformation maps; rank-1 (occupation × orbital)
+density-matrix form. Hybrid/range-separated exchange remains host-owned, and
+the manifests spell out that term-ownership boundary explicitly.
