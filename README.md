@@ -71,7 +71,7 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **141 kernels** named
+`catalog.py` enumerates, generates, and manifests **145 kernels** named
 `xck_<family>_<case>_o<order>[_<parities>]`, spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
@@ -79,7 +79,9 @@ gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
 local-hybrid calibration functions) — in the restricted, unrestricted, and
 closed-shell spin-adapted cases (singlet/triplet parity per perturbation)
 through fourth derivative order (third for the spin-resolved `cmgga_tau` and
-for `hmgga`, whose higher orders remain generatable on demand). Every kernel
+for `hmgga`, whose higher orders remain generatable on demand). Four `xck_<family>_r_giao` kernels provide the explicit magnetic-field
+derivatives of the Fock matrix with London (GIAO) orbitals, as the real
+factor of dF/dB_s = (i/2c) K_s at a real reference. Every kernel
 ships with a machine-readable manifest declaring its operands and shapes,
 the Libxc arrays it consumes by name, and its term ownership. Beyond the
 catalog: complex orbitals and complex basis functions (sesquilinear

@@ -67,6 +67,9 @@ OWNERSHIP = ("xc-only: Coulomb, HF and range-separated exchange are "
 #: (~30 MB of source); orders above the cap remain generatable on demand.
 FAMILY_MAX_ORDER = {"hmgga": 3}
 
+#: families with GIAO magnetic-field derivative kernels (London orbitals).
+GIAO_FAMILIES = ("lda", "gga", "mgga_tau", "mgga")
+
 #: additional cap for the SPIN-RESOLVED cases: the 1/rho tower of the gauge
 #: correction makes the spin-resolved fourth-order cmgga_tau contractions
 #: ~7e7 chars of source; the unpolarized set still ships through order 4.
@@ -80,9 +83,14 @@ class CatalogEntry:
     order: int                     # 0=exc, 1=Fock, >=2 response contraction
     parities: Tuple[int, ...] = ()   # 'st' only, one per perturbation
     batch: bool = False
+    #: explicit GIAO magnetic-field derivative of the Fock matrix
+    #: (London orbitals; F^{B_s} = (i/2c) K_s at a real reference)
+    giao: bool = False
 
     @property
     def name(self) -> str:
+        if self.giao:
+            return f"xck_{self.family}_r_giao"
         parts = ["xck", self.family, self.spin, f"o{self.order}"]
         if self.parities:
             parts.append("".join("p" if p > 0 else "m" for p in self.parities))
@@ -90,6 +98,10 @@ class CatalogEntry:
 
     @property
     def description(self) -> str:
+        if self.giao:
+            return (f"explicit GIAO magnetic-field derivative of the XC "
+                    f"Fock matrix, {self.family}, unpolarized; "
+                    f"F^(B_s) = (i/2c) K_s at a real reference")
         q = {0: "XC energy", 1: "XC Fock matrix"}.get(
             self.order, f"order-{self.order} XC response contraction")
         s = {"r": "unpolarized", "ua": "unrestricted (alpha channel)",
@@ -118,6 +130,8 @@ def entries(families=FAMILIES, max_order: int = 4) -> Iterator[CatalogEntry]:
         for o in range(2, smax + 1):                         # spin-adapted
             for pars in combinations_with_replacement((+1, -1), o - 1):
                 yield CatalogEntry(fam, "st", o, parities=pars, batch=True)
+        if fam in GIAO_FAMILIES:                             # GIAO B-derivative
+            yield CatalogEntry(fam, "r", 1, giao=True)
 
 
 # --- source generation -------------------------------------------------------
@@ -133,8 +147,22 @@ def {name}(w, rho, zk):
 def build_entry(e: CatalogEntry):
     """Generate the entry's source. Returns (source, GeneratedFunction|None)."""
     from .codegen import generate_collapsed
-    if e.order == 0:
-        return _EXC_SOURCE.format(name=e.name), None
+    if e.giao:
+        from .london import london_fock
+        parts, gen0 = [], None
+        for si, ax in enumerate("xyz"):
+            gen = generate_collapsed(london_fock(e.family, si),
+                                     f"{e.name}_{ax}")
+            parts.append(gen.source)
+            gen0 = gen0 or gen
+        sig = gen0.source.split("(", 1)[1].split(")", 1)[0]
+        parts.append(
+            f"def {e.name}({sig}):\n"
+            f"    # stacked (3, nao, nao); F^(B_s) = (i/2c) * result[s]\n"
+            f"    import numpy as np\n"
+            f"    return np.stack([{e.name}_x({sig}), {e.name}_y({sig}), "
+            f"{e.name}_z({sig})])\n")
+        return "\n\n".join(parts), gen0
 
     if e.spin == "r":
         if e.order == 1:
@@ -176,6 +204,16 @@ def _param_meta(name: str, batch: bool) -> Dict[str, str]:
         return {"shape": "(6, nbf, ng)", "kind": "collocation_hessian"}
     if re.match(r"^(grad_rho|jp)(_[ab])?$", name):
         return {"shape": "(3, ng)", "kind": "gs_field"}
+    if name == "rg":
+        return {"shape": "(3, ng)", "kind": "grid_coordinates"}
+    if name == "Rchi":
+        return {"shape": "(3, nbf, ng)", "kind": "center_scaled_collocation"}
+    if name == "Rdchi":
+        return {"shape": "(3, 3, nbf, ng)",
+                "kind": "center_scaled_collocation_gradient"}
+    if name == "Rlapl_chi":
+        return {"shape": "(3, nbf, ng)",
+                "kind": "center_scaled_collocation_laplacian"}
     if re.match(r"^hess_rho(_[ab])?$", name):
         return {"shape": "(6, ng)", "kind": "gs_field"}
     if re.match(r"^inv_rho(_[ab])?$", name):

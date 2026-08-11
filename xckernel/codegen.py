@@ -62,6 +62,11 @@ _PERT_HRHO = re.compile(r"^hess_rho_(p\d+)_(xx|xy|xz|yy|yz|zz)$")
 _PERT_HRHO_SPIN = re.compile(r"^hess_rho_([ab])_(p\d+)_(xx|xy|xz|yy|yz|zz)$")
 _GS_SCALAR = re.compile(
     r"^(inv_rho(_[ab])?|drho_g|dtau_g|drho_[ab]_g|dtau_[ab]_g)$")
+# London/GIAO operands: center-scaled collocations and grid coordinates
+_RCHI = re.compile(r"^Rchi_(\w+)_([xyz])$")
+_RDCHI = re.compile(r"^Rdchi_(\w+)_([xyz])_([xyz])$")
+_RLAPL = re.compile(r"^Rlapl_chi_(\w+)_([xyz])$")
+_RG = re.compile(r"^rg_([xyz])$")
 # geometric operands: spatial-gradient basis factors (dchi_g, ddchi_g), their
 # atom-masked fixed-grid analogues (dchi_gA, ddchi_gA), and the direction-
 # resolved density-Hessian row dgrad_rho_g
@@ -104,6 +109,20 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"hess_chi[{_H6[m.group(2)]}]",
                        f"{m.group(1)}g"), "basis"
+    m = _RCHI.match(name)
+    if m:
+        return Operand(f"Rchi[{_AX[m.group(2)]}]", f"{m.group(1)}g"), "basis"
+    m = _RDCHI.match(name)
+    if m:
+        return Operand(f"Rdchi[{_AX[m.group(2)]}][{_AX[m.group(3)]}]",
+                       f"{m.group(1)}g"), "basis"
+    m = _RLAPL.match(name)
+    if m:
+        return Operand(f"Rlapl_chi[{_AX[m.group(2)]}]",
+                       f"{m.group(1)}g"), "basis"
+    m = _RG.match(name)
+    if m:
+        return Operand(f"rg[{_AX[m.group(1)]}]", "g"), "gscalar:rg"
     m = _DDCHI_G.match(name)
     if m:
         return Operand(f"ddchi_{m.group(1)}[{_AX[m.group(3)]}]",
@@ -246,6 +265,9 @@ def _term_einsum(coeff, powers, out_indices: str) -> Tuple[str, float,
             uses.add("lapl")
         elif kind == "basis" and op.code.startswith("hess_chi"):
             uses.add("hess")
+        elif kind == "basis" and op.code.startswith(
+                ("Rchi", "Rdchi", "Rlapl_chi")):
+            uses.add(op.code.split("[", 1)[0])
         elif kind == "basis" and op.code.startswith(("dchi_g", "ddchi_g")):
             uses.add(op.code.split("[", 1)[0])
         for _ in range(e):
@@ -315,6 +337,9 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
         params.append("lapl_chi")
     if "hess" in uses:
         params.append("hess_chi")
+    for b in ("Rchi", "Rdchi", "Rlapl_chi"):
+        if b in uses:
+            params.append(b)
     for b in ("dchi_g", "ddchi_g", "dchi_gA", "ddchi_gA"):
         if b in uses:
             params.append(b)
@@ -426,6 +451,8 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                     uses.add("lapl")
                 elif op.code.startswith("hess_chi"):
                     uses.add("hess")
+                elif op.code.startswith(("Rchi", "Rdchi", "Rlapl_chi")):
+                    uses.add(op.code.split("[", 1)[0])
                 elif op.code.startswith(("dchi_g", "ddchi_g")):
                     uses.add(op.code.split("[", 1)[0])
             else:
@@ -473,6 +500,9 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
         params.append("lapl_chi")
     if "hess" in uses:
         params.append("hess_chi")
+    for b in ("Rchi", "Rdchi", "Rlapl_chi"):
+        if b in uses:
+            params.append(b)
     for b in ("dchi_g", "ddchi_g", "dchi_gA", "ddchi_gA"):
         if b in uses:
             params.append(b)
