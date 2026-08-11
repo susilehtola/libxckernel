@@ -68,7 +68,7 @@ OWNERSHIP = ("xc-only: Coulomb, HF and range-separated exchange are "
 FAMILY_MAX_ORDER = {"hmgga": 3}
 
 #: families with GIAO magnetic-field derivative kernels (London orbitals).
-GIAO_FAMILIES = ("lda", "gga", "mgga_tau", "mgga")
+GIAO_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga")
 
 #: additional cap for the SPIN-RESOLVED cases: the 1/rho tower of the gauge
 #: correction makes the spin-resolved fourth-order cmgga_tau contractions
@@ -90,7 +90,7 @@ class CatalogEntry:
     @property
     def name(self) -> str:
         if self.giao:
-            return f"xck_{self.family}_r_giao"
+            return f"xck_{self.family}_{self.spin}_giao"
         parts = ["xck", self.family, self.spin, f"o{self.order}"]
         if self.parities:
             parts.append("".join("p" if p > 0 else "m" for p in self.parities))
@@ -99,8 +99,11 @@ class CatalogEntry:
     @property
     def description(self) -> str:
         if self.giao:
+            sd = {"r": "unpolarized",
+                  "ua": "unrestricted (alpha channel)",
+                  "ub": "unrestricted (beta channel)"}[self.spin]
             return (f"explicit GIAO magnetic-field derivative of the XC "
-                    f"Fock matrix, {self.family}, unpolarized; "
+                    f"Fock matrix, {self.family}, {sd}; "
                     f"F^(B_s) = (i/2c) K_s at a real reference")
         q = {0: "XC energy", 1: "XC Fock matrix"}.get(
             self.order, f"order-{self.order} XC response contraction")
@@ -132,6 +135,8 @@ def entries(families=FAMILIES, max_order: int = 4) -> Iterator[CatalogEntry]:
                 yield CatalogEntry(fam, "st", o, parities=pars, batch=True)
         if fam in GIAO_FAMILIES:                             # GIAO B-derivative
             yield CatalogEntry(fam, "r", 1, giao=True)
+            for spin in ("ua", "ub"):
+                yield CatalogEntry(fam, spin, 1, giao=True)
 
 
 # --- source generation -------------------------------------------------------
@@ -147,12 +152,18 @@ def {name}(w, rho, zk):
 def build_entry(e: CatalogEntry):
     """Generate the entry's source. Returns (source, GeneratedFunction|None)."""
     from .codegen import generate_collapsed
+    if e.order == 0 and not e.giao:
+        return _EXC_SOURCE.format(name=e.name), None
+
     if e.giao:
-        from .london import london_fock
+        from .london import london_fock, london_fock_spin
         parts, gen0 = [], None
         for si, ax in enumerate("xyz"):
-            gen = generate_collapsed(london_fock(e.family, si),
-                                     f"{e.name}_{ax}")
+            if e.spin == "r":
+                ki = london_fock(e.family, si)
+            else:
+                ki = london_fock_spin(e.family, e.spin[1], si)
+            gen = generate_collapsed(ki, f"{e.name}_{ax}")
             parts.append(gen.source)
             gen0 = gen0 or gen
         sig = gen0.source.split("(", 1)[1].split(")", 1)[0]

@@ -153,3 +153,62 @@ def london_fock(family: str, s: int) -> KernelIntegrand:
     expr = sp.expand(w * expr)
     return KernelIntegrand(functional=func, index_pairs=[("u", "v")],
                            expr=expr)
+
+
+def london_fock_spin(family: str, spin: str, s: int):
+    """Spin-channel analogue of london_fock: the real factor K of the
+    explicit GIAO B_s-derivative of the spin-sigma xc Fock matrix,
+    F^{B_s, sigma}_uv = (i/2c) K_uv at a real reference. Needed, e.g.,
+    for the NMR shieldings and g-tensors of open-shell systems."""
+    from .spin import COMPS, FAMILY_GROUPS, GRAD, SCALARS
+    from .spin_kernel import SpinIntegrand, _register
+
+    u, v = Orbital.make("u"), Orbital.make("v")
+    w = sp.Symbol("w", real=True, positive=True)
+
+    def d_rho() -> sp.Expr:
+        return _m("u", s) * v.val - u.val * _m("v", s)
+
+    def d_grad(cc: int) -> sp.Expr:
+        return _m_grad("u", s, cc) * v.val + _m("u", s) * v.grad[cc] \
+            - u.grad[cc] * _m("v", s) - u.val * _m_grad("v", s, cc)
+
+    def d_tau() -> sp.Expr:
+        t = sp.Integer(0)
+        for cc in range(3):
+            t += _m_grad("u", s, cc) * v.grad[cc] \
+                - u.grad[cc] * _m_grad("v", s, cc)
+        return sp.Rational(1, 2) * t
+
+    def d_lapl() -> sp.Expr:
+        t = _m_lapl("u", s) * v.val - u.lapl * _m("v", s) \
+            + _m("u", s) * v.lapl - u.val * _m_lapl("v", s)
+        for cc in range(3):
+            t += 2 * (_m_grad("u", s, cc) * v.grad[cc]
+                      - u.grad[cc] * _m_grad("v", s, cc))
+        return t
+
+    expr = sp.Integer(0)
+    for group in FAMILY_GROUPS[family]:
+        for comp in COMPS[group]:
+            X = SCALARS[(group, comp)]
+            vsym = _register((X,))
+            if group == "rho" and comp == spin:
+                expr += vsym * d_rho()
+            elif group == "lapl" and comp == spin:
+                expr += vsym * d_lapl()
+            elif group == "tau" and comp == spin:
+                expr += vsym * d_tau()
+            elif group == "sigma":
+                s1, s2 = comp[0], comp[1]
+                coeffs = []
+                if s1 == spin:
+                    coeffs.append(GRAD[s2])
+                if s2 == spin:
+                    coeffs.append(GRAD[s1])
+                for g in coeffs:
+                    for cc in range(3):
+                        expr += vsym * g[cc] * d_grad(cc)
+    expr = sp.expand(w * expr)
+    return SpinIntegrand(family=family, spins=[spin],
+                         index_pairs=[("u", "v")], expr=expr)
