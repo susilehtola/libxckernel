@@ -89,6 +89,27 @@ emission), a matrix-free two-sided mode that emits σ-vector contractions
 from MO-pair collocation, and nuclear derivatives of the XC contribution
 including the full quadrature-grid response (`geometric.py`).
 
+## The compiled library
+
+The repository ships only the generator and its tests; the compiled
+C/C++ library (C ABI + Fortran module, static coefficient tables walked
+by a fixed evaluator) is a **generated artifact**. `clib/CMakeLists.txt`
+generates and builds it in one go, with the kernel selection as
+configure flags:
+
+```sh
+cmake -S clib -B build -DXCKERNEL_FAMILIES=lda,gga,mgga_tau -DXCKERNEL_MAX_ORDER=3
+cmake --build build
+```
+
+Generation takes a small fraction of the time needed to compile the
+emitted code. To produce a self-contained source tree for distribution
+(no Python required downstream), run the generator directly:
+
+```sh
+python3 -m xckernel.catalog libxckernel "lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga" 4 c
+```
+
 ## What is validated
 
 All checks live in `xckernel/tests/` and compare against PySCF (machine
@@ -160,7 +181,7 @@ xckernel/
                    sesquilinear; two-sided)
   cbackend.py      C library emitter (static tables + fixed evaluator)
   psi4backend.py   Psi4 host-idiom emitter (marked source regions)
-  catalog.py       the 141-kernel catalog + machine-readable manifests
+  catalog.py       the 156-kernel catalog + machine-readable manifests
   fields.py        numerical collocation helpers (incl. complex P)
   runtime.py       compiled-library loader
   mo.py            AO->MO helpers: orbital gradient (kappa sign!) and Hessian
