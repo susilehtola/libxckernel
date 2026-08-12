@@ -633,15 +633,17 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     # Transpose-partner deduplication: patterns (u, v) and (v, u) whose
     # coefficient polynomials are identical (or exactly negated, as in the
     # antisymmetric current channel) are evaluated with a single matrix
-    # multiplication and a (subtracted) transposed accumulation. The plain
-    # transpose is only the partner when both sides draw from the same
-    # collocation arrays, so the sesquilinear and two-sided modes emit
-    # every pattern separately.
+    # multiplication and a (subtracted) transposed accumulation. In the
+    # sesquilinear mode the partner accumulates through the conjugate
+    # transpose instead, which is exact because the per-point coefficients
+    # are real (all ingredients of a Hermitian density matrix are real
+    # also for a complex basis). The two-sided mode emits every pattern
+    # separately, as its bra and ket collocations are different arrays.
     def _mono_dict(monos):
         return {fac: coeff for coeff, fac in monos}
 
     plan: List[tuple] = []          # (pattern index, +1 / -1 / None)
-    if sesquilinear or two_sided:
+    if two_sided:
         plan = [(k, None) for k in range(len(ck.patterns))]
     else:
         index = {(u, v): k for k, (u, v, _) in enumerate(ck.patterns)}
@@ -678,10 +680,11 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         if batch:
             gemm = (f"np.einsum('ug,xg,vg->xuv', {ucode}, "
                     f"c, {vcode}, optimize=True)")
-            tr = "np.transpose(t, (0, 2, 1))"
+            tr = ("np.conjugate(np.transpose(t, (0, 2, 1)))"
+                  if sesquilinear else "np.transpose(t, (0, 2, 1))")
         else:
             gemm = f"({ucode} * c) @ {vcode}.T"
-            tr = "t.T"
+            tr = "t.conj().T" if sesquilinear else "t.T"
         if sign is None:
             lines.append(f"    out += {gemm}")
         else:
