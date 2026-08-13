@@ -138,6 +138,44 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     return total
 
 
+def pert2_scalar_value(sc: Scalar, l1: str, l2: str) -> sp.Expr:
+    """Second-order perturbed value of a polarized Libxc scalar under
+    two independent perturbations: nonzero only through the scalar's
+    own nonlinearity (the sigma components; composite scalars carry
+    their own closure if they define one)."""
+    from ..inputs.basis import AXES
+    if sc.group != "sigma":
+        return sp.Integer(0)
+    from .spin import COMP_SPINS
+    s1, s2 = COMP_SPINS["sigma"][sc.comp]
+    total = sp.Integer(0)
+    for ax in AXES:
+        total += _pert_grad(s1, l1, ax) * _pert_grad(s2, l2, ax) \
+            + _pert_grad(s2, l1, ax) * _pert_grad(s1, l2, ax)
+    return total
+
+
+def fxc_bilinear_spin(family: str, l1: str = "p1",
+                      l2: str = "p2") -> sp.Expr:
+    """Per-point integrand of the spin-polarized XC kernel bilinear
+    form between two perturbations (each carrying both spin channels),
+
+        d2 Exc / dl1 dl2 = sum_KL v2_KL K^l1 L^l2 + sum_K v_K K^{l1 l2},
+
+    over the polarized Libxc scalar variables K, L of the family; the
+    host multiplies by the quadrature weight and sums.  The polarized
+    counterpart of response.fxc_bilinear."""
+    from .spin import family_scalars
+    scalars = family_scalars(family)
+    total = sp.Integer(0)
+    for K in scalars:
+        for L in scalars:
+            total += _register((K, L)) \
+                * pert_scalar_value(K, l1) * pert_scalar_value(L, l2)
+        total += _register((K,)) * pert2_scalar_value(K, l1, l2)
+    return sp.expand(total)
+
+
 def _seed_fn_spin(family: str, label: str):
     """Monomial-level seed map for the spin engine (fastpoly)."""
     from .fastpoly import from_expr
