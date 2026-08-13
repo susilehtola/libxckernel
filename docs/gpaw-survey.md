@@ -125,7 +125,15 @@ the friendliest place for a semilocal kernel.
 
 ## Plan
 
-**Phase 0 — stress regeneration (cross-validation, small).** Emit
+**Phase 0 — stress regeneration (cross-validation, small). DONE
+2026-08-13** (`xckernel/tests/gpaw_stress_validate.py`): GPAW's
+semilocal XC stress contribution reproduced from
+`strain_energy_derivative` on GPAW's own `_args` arrays at machine
+precision — worst relative deviation 6.7e-16 over all nine components
+for LDA, PBE, and TPSS on a sheared Si cell (GPAW 26.7.0, PW mode,
+2x2x2 k-points). Convention notes encoded in the suite: GPAW's e_g is
+the energy density per volume (zk = e/rho), and its KED tensor
+carries no 1/2 (tau_tensor = taut_swR / 2).** Original plan text: Emit
 GPAW's XC stress contribution (`stress_lda_term` + `stress_gga_term` +
 `stress_mgga_term`) from `strain_energy_derivative` and verify
 numerical identity against `Functional.stress_contribution` on real
