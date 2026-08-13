@@ -43,7 +43,9 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
         rng = np.random.default_rng(seed)
         tested = failures = 0
         for k in man["kernels"]:
-            if not k.get("emitted", True) or k["order"] == 0:
+            # skip cross-backend pointer entries (e.g. the GIAO notes,
+            # which carry no "abi"/"order") and the order-0 energy kernels
+            if "abi" not in k or k.get("order", 0) == 0:
                 continue
             e = CatalogEntry(k["family"], k["spin"], k["order"],
                              tuple(k.get("parities", ())))
