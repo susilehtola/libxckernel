@@ -113,11 +113,36 @@ def _emit_spin_function(family: str) -> str:
     return "\n".join(L)
 
 
+def _emit_triplet_function(family: str) -> str:
+    from ..engine.spin_kernel import fxc_channels_st
+    printer = NumPyPrinter()
+    ch = fxc_channels_st(family, parity=-1)
+    names = sorted({s.name for e in ch.values() for s in e.free_symbols})
+    L = [f"def fxc_pair_coefficients_{family}_triplet(ops):",
+         '    """Closed-shell TRIPLET (spin-flip) per-point coefficient',
+         "    channels: the polarized Libxc arrays are evaluated at the",
+         "    spin-compensated point (rho/2 per channel, flat packing",
+         "    v2rho2_0..) and all fields/pair fields are ALPHA-channel",
+         '    quantities (half the total pair density etc.)."""']
+    for n in names:
+        L.append(f"    {n} = ops['{n}']")
+    L.append(f"    u = {printer.doprint(ch['rho'])}")
+    for ax in AXES:
+        L.append(f"    v_{ax} = {printer.doprint(ch[f'grad_{ax}'])}")
+    out = "{'rho': u, 'grad': [v_x, v_y, v_z]"
+    if "tau" in ch:
+        L.append(f"    w_tau = {printer.doprint(ch['tau'])}")
+        out += ", 'tau': w_tau"
+    L.append(f"    return {out}}}")
+    return "\n".join(L)
+
+
 def emit_module() -> str:
     parts = [HEADER]
     parts.extend(_emit_function(f) for f in FAMILIES)
     parts.extend(_emit_coefficient_function(f) for f in FAMILIES)
     parts.extend(_emit_spin_function(f) for f in FAMILIES)
+    parts.extend(_emit_triplet_function(f) for f in FAMILIES)
     return "\n\n".join(parts) + "\n"
 
 

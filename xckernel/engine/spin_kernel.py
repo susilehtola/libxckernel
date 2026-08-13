@@ -226,6 +226,26 @@ def fxc_bilinear_st(family: str, parities: "Tuple[int, int]" = (+1, +1),
     return sp.expand(expr.subs(canon, simultaneous=True))
 
 
+def fxc_channels_st(family: str, parity: int = -1,
+                    label: str = "p1") -> "dict[str, sp.Expr]":
+    """Per-point coefficient channels of the closed-shell spin-adapted
+    fxc contraction with one perturbation of the given parity
+    (-1: triplet, the spin-flip Casida kernel): derivatives of the st
+    bilinear with respect to the second perturbation's alpha-channel
+    operands, keyed 'rho'/'grad_x'/../'tau'."""
+    from ..inputs.basis import AXES
+    b = fxc_bilinear_st(family, (parity, parity), l1=label, l2="_q")
+    out = {"rho": sp.expand(
+        sp.diff(b, sp.Symbol("rho_a__q", real=True)))}
+    for ax in AXES:
+        out[f"grad_{ax}"] = sp.expand(
+            sp.diff(b, sp.Symbol(f"grad_rho_a__q_{ax}", real=True)))
+    tau_q = sp.Symbol("tau_a__q", real=True)
+    if b.has(tau_q):
+        out["tau"] = sp.expand(sp.diff(b, tau_q))
+    return out
+
+
 def fxc_channels_spin(family: str,
                       label: str = "p1") -> "dict[str, sp.Expr]":
     """Per-point coefficient channels of the polarized fxc contraction
