@@ -118,6 +118,57 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
     raise ValueError(f"unknown libxc variable {var!r}")
 
 
+def perturbed_ingredient2(ing, l1: str, l2: str) -> sp.Expr:
+    """Second-order perturbed value Y^{X1 X2} of a Libxc input variable:
+    the part bilinear in two independent perturbations through the
+    ingredient's own nonlinearity, sum_pq (d2 Y/dp dq) p^X1 q^X2.
+    Zero for primitive variables; reproduces sigma^{X1 X2} =
+    2 grad rho^X1 . grad rho^X2 and extends to the mapped ingredients
+    (gauge-corrected tau, eta) through their primitive expressions."""
+    E = ing.value
+    prims = [a for a in E.free_symbols if PRIM_BY_SYMBOL.get(a) is not None]
+    total = sp.Integer(0)
+    for p in prims:
+        for q in prims:
+            d2 = sp.diff(E, p, q)
+            if d2 != 0:
+                total += d2 * _pert_atom(PRIM_BY_SYMBOL[p], l1) \
+                    * _pert_atom(PRIM_BY_SYMBOL[q], l2)
+    return sp.expand(total)
+
+
+def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2") -> sp.Expr:
+    """Per-point integrand of the XC kernel bilinear form between two
+    perturbations (the E[2] coupling / Casida fxc matrix element),
+
+        d2 Exc / dl1 dl2 = sum_g w_g [ sum_YZ v2_YZ Y^l1 Z^l2
+                                       + sum_Y vY Y^{l1 l2} ]_g :
+
+    the host multiplies by the quadrature weight and sums.  The second
+    term carries the ingredient nonlinearities (2 vsigma grad rho^l1 .
+    grad rho^l2 for GGAs, and the tau~/eta analogs).  Operands: the
+    ground-state fields, the vY/v2YZ arrays, and the perturbed fields
+    of both labels."""
+    from .deriv import libxc_symbol as _ls
+
+    func = Functional.of_family(family)
+    by_name = {ing.name: ing for ing in func.ingredients}
+    from collections import Counter as _C
+    total = sp.Integer(0)
+    for Y in VARS:
+        iY = by_name.get(Y)
+        if iY is None:
+            continue
+        for Z in VARS:
+            iZ = by_name.get(Z)
+            if iZ is None:
+                continue
+            total += _ls(_C({Y: 1}) + _C({Z: 1})) \
+                * perturbed_ingredient(iY, l1) * perturbed_ingredient(iZ, l2)
+        total += func.vsymbol(iY) * perturbed_ingredient2(iY, l1, l2)
+    return sp.expand(total)
+
+
 def _seed_fn(func: Functional, label: str):
     """Monomial-level seed map for fastpoly.seeded_derivative."""
     from collections import Counter
