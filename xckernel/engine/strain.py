@@ -31,13 +31,24 @@ respect to the UNSYMMETRIZED deformation gradient; hosts contracting with
 a symmetric strain take the symmetric part, and the antisymmetric part
 vanishing (rotational invariance) is a free validation sum rule.
 
-Composition with the rest of the tower is monomial-wise like every other
-operator here, so strain derivatives of response integrands (elastic
-constants, internal strain) come from the same seeds.
+The seed operator is the exact tangent AT eps = 0.  Grid positions are
+linear in the deformation (A r0: higher position-derivatives vanish),
+but the fields' cell dependence is NOT -- the metric (A^{-T} on every
+gradient) and the normalization (det A) are nonlinear -- e.g. under
+r -> a r one has rho -> rho/a^3, so d^2 rho/da^2 = +12 rho/a^5 != 0.
+Consequently composing this operator twice does NOT yield the second
+cell derivative: that needs the derivative-of-seed-coefficient terms
+(second-order seeds), still closed-form but not yet implemented here.
+First-order composition with the RESPONSE tower (strain of fxc-level
+integrands, for internal-strain couplings) IS supported: perturbed
+fields transform exactly like their ground-state counterparts, and the
+seeds below carry the perturbation label through (tau_p<k> gains a
+tau_tensor_p<k> operand like the ground state).
 """
 
 from __future__ import annotations
 
+import re as _re
 from collections import Counter
 
 import sympy as sp
@@ -106,6 +117,63 @@ def strain_ingredient(ing, a: int, b: int) -> sp.Expr:
     return sp.expand(total)
 
 
+#: perturbed-field name patterns (labels p1, p2, ... from the response layer)
+_PERT_RES = {
+    "rho": _re.compile(r"^rho_(p\d+)$"),
+    "grad": _re.compile(r"^grad_rho_(p\d+)_([xyz])$"),
+    "lapl": _re.compile(r"^lapl_rho_(p\d+)$"),
+    "tau": _re.compile(r"^tau_(p\d+)$"),
+    "hess": _re.compile(r"^hess_rho_(p\d+)_([xyz]{2})$"),
+    "jp": _re.compile(r"^jp_(p\d+)_([xyz])$"),
+}
+
+
+def _sym(name: str) -> sp.Symbol:
+    return sp.Symbol(name, real=True)
+
+
+def strain_pert_field(name: str, a: int, b: int) -> "sp.Expr | None":
+    """Explicit d/d eps_ab of a perturbed-field operand: identical
+    closed forms to the ground-state seeds, label carried through
+    (perturbed fields are 1/sqrt(Omega)-normalized bilinears too)."""
+    ax_ab = f"{AXES[a]}{AXES[b]}" if a <= b else f"{AXES[b]}{AXES[a]}"
+    m = _PERT_RES["rho"].match(name)
+    if m:
+        return -_d(a, b) * _sym(name)
+    m = _PERT_RES["grad"].match(name)
+    if m:
+        lab, ax = m.groups()
+        i = AXES.index(ax)
+        return (-_d(a, b) * _sym(name)
+                - _d(i, b) * _sym(f"grad_rho_{lab}_{AXES[a]}"))
+    m = _PERT_RES["lapl"].match(name)
+    if m:
+        lab = m.group(1)
+        return (-_d(a, b) * _sym(name)
+                - 2 * _sym(f"hess_rho_{lab}_{ax_ab}"))
+    m = _PERT_RES["tau"].match(name)
+    if m:
+        lab = m.group(1)
+        return (-_d(a, b) * _sym(name)
+                - 2 * _sym(f"tau_tensor_{lab}_{ax_ab}"))
+    m = _PERT_RES["hess"].match(name)
+    if m:
+        lab, comp = m.groups()
+        i, j = AXES.index(comp[0]), AXES.index(comp[1])
+        c_aj = f"{AXES[min(a, j)]}{AXES[max(a, j)]}"
+        c_ia = f"{AXES[min(i, a)]}{AXES[max(i, a)]}"
+        return (-_d(a, b) * _sym(name)
+                - _d(i, b) * _sym(f"hess_rho_{lab}_{c_aj}")
+                - _d(j, b) * _sym(f"hess_rho_{lab}_{c_ia}"))
+    m = _PERT_RES["jp"].match(name)
+    if m:
+        lab, ax = m.groups()
+        i = AXES.index(ax)
+        return (-_d(a, b) * _sym(name)
+                - _d(i, b) * _sym(f"jp_{lab}_{AXES[a]}"))
+    return None
+
+
 def strain_seed_fn(func: Functional, a: int, b: int):
     """Monomial-level seed for the explicit strain operator d/d eps_ab:
     fields by their closed-form seeds, Libxc derivative symbols by the
@@ -134,7 +202,10 @@ def strain_seed_fn(func: Functional, a: int, b: int):
             # appears in the energy path, which uses the ingredient chain
             # directly; keep zk inert under the monomial operator.
             return None
-        return None  # basis data, perturbed fields, tau_tensor itself
+        p = strain_pert_field(atom.name, a, b)
+        if p is not None:
+            return from_expr(p)
+        return None  # basis data, tau_tensor itself
     return seed
 
 

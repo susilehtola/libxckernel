@@ -53,6 +53,10 @@ class PWModel:
         self.sin_c = rng.normal(size=(NORB, nm)) * 0.15
         self.cos_c[:, 0] = rng.uniform(0.8, 1.2, NORB)  # positive baseline
         self.occ = rng.uniform(0.7, 1.0, NORB)
+        # a second coefficient set: pair bilinears psi*chi provide synthetic
+        # perturbed fields with the exact transformation law of densities
+        self.cos_p = rng.normal(size=(NORB, nm)) * 0.2
+        self.sin_p = rng.normal(size=(NORB, nm)) * 0.2
 
     def fields(self, A: np.ndarray):
         """All grid fields in the cell deformed by A (coefficients and
@@ -94,6 +98,41 @@ class PWModel:
         w = omega / ng
         return {"w": w, "rho": rho, "grad": grad, "sigma": sigma,
                 "lapl": lapl, "tau": tau, "hess": hess, "tau_tensor": tau_t}
+
+
+    def pert_fields(self, A: np.ndarray):
+        """Perturbed-density-like pair fields rho_p = sum f psi chi with
+        their gradient, tau_p, and tau_p tensor."""
+        cell = self.cell0 @ A.T
+        omega = abs(np.linalg.det(cell))
+        B = 2 * np.pi * np.linalg.inv(cell).T
+        G = self.miller @ B
+        phase = 2 * np.pi * (self.frac @ self.miller.T)
+        cph, sph = np.cos(phase), np.sin(phase)
+        norm = 1.0 / np.sqrt(omega)
+
+        ng = len(self.frac)
+        rho_p = np.zeros(ng)
+        grad_p = np.zeros((3, ng))
+        tau_t_p = np.zeros((6, ng))
+        for i in range(NORB):
+            psi = (cph @ self.cos_c[i] + sph @ self.sin_c[i]) * norm
+            chi = (cph @ self.cos_p[i] + sph @ self.sin_p[i]) * norm
+            dpsi = np.stack([(-sph * G[:, c]) @ self.cos_c[i]
+                             + (cph * G[:, c]) @ self.sin_c[i]
+                             for c in range(3)]) * norm
+            dchi = np.stack([(-sph * G[:, c]) @ self.cos_p[i]
+                             + (cph * G[:, c]) @ self.sin_p[i]
+                             for c in range(3)]) * norm
+            f = self.occ[i]
+            rho_p += f * psi * chi
+            grad_p += f * (dpsi * chi + psi * dchi)
+            for k, (a, b) in enumerate(HESS_COMPS):
+                tau_t_p[k] += 0.25 * f * (dpsi[a] * dchi[b]
+                                          + dpsi[b] * dchi[a])
+        tau_p = tau_t_p[0] + tau_t_p[3] + tau_t_p[5]
+        return {"rho_p": rho_p, "grad_p": grad_p, "tau_p": tau_p,
+                "tau_t_p": tau_t_p}
 
 
 def libxc_eval(func_ids, family, F, orders=(0, 1)):
@@ -224,6 +263,55 @@ def validate_rotation(model, family, func_ids):
     return 0 if ok else 1
 
 
+def validate_pert(model):
+    """Strain of a response-level integrand: the perturbed-field seeds
+    (label carried through, tau_p1 gaining tau_tensor_p1), via the
+    monomial strain operator on w (rho_p1 sigma + tau_p1 rho)."""
+    from ..engine.fastpoly import from_expr, seeded_derivative, to_expr
+    from ..engine.strain import strain_seed_fn
+    from ..inputs.functional import Functional
+
+    func = Functional.of_family("mgga_tau")
+    sigma_prim = sum(p.symbol ** 2 for p in GRAD_RHO)
+    q = sp.Symbol("w", real=True) * (
+        sp.Symbol("rho_p1", real=True) * sigma_prim
+        + sp.Symbol("tau_p1", real=True) * sp.Symbol("rho", real=True))
+
+    F0 = model.fields(np.eye(3))
+    P0 = model.pert_fields(np.eye(3))
+    vals = operand_values(F0, {})
+    vals["w"] = F0["w"]
+    vals["rho_p1"] = P0["rho_p"]
+    vals["tau_p1"] = P0["tau_p"]
+    for i, ax in enumerate(AXES):
+        vals[f"grad_rho_p1_{ax}"] = P0["grad_p"][i]
+    for k, (i, j) in enumerate(HESS_COMPS):
+        vals[f"tau_tensor_p1_{AXES[i]}{AXES[j]}"] = P0["tau_t_p"][k]
+
+    fails = 0
+    for a in range(3):
+        for b in range(3):
+            dq = to_expr(seeded_derivative(from_expr(q),
+                                           strain_seed_fn(func, a, b)))
+            syms = sorted(dq.free_symbols, key=lambda s: s.name)
+            fn = sp.lambdify(syms, dq, "numpy")
+            ana = float(np.sum(fn(*[vals[s.name] for s in syms])))
+
+            def Q(t):
+                A = np.eye(3)
+                A[a, b] += t
+                F = model.fields(A)
+                P = model.pert_fields(A)
+                return F["w"] * float(np.sum(P["rho_p"] * F["sigma"]
+                                             + P["tau_p"] * F["rho"]))
+            fd = (8 * (Q(H) - Q(-H)) - (Q(2 * H) - Q(-2 * H))) / (12 * H)
+            if abs(ana - fd) / max(1.0, abs(fd)) > 1e-8:
+                fails += 1
+    print(f"  [{'OK ' if fails == 0 else 'FAIL'}] perturbed-field seeds "
+          f"(w (rho_p1 sigma + tau_p1 rho)): 9 components")
+    return fails
+
+
 def main():
     model = PWModel()
     failures = 0
@@ -231,8 +319,9 @@ def main():
         failures += validate_family(model, family, func_ids)
         failures += validate_rotation(model, family, func_ids)
     failures += validate_eta(model)
+    failures += validate_pert(model)
     status = "OK " if failures == 0 else "FAIL"
-    print(f"[{status}] strain_validate: {len(FAMILIES) * 2 + 1} checks, "
+    print(f"[{status}] strain_validate: {len(FAMILIES) * 2 + 2} checks, "
           f"{failures} failures")
     return failures
 
