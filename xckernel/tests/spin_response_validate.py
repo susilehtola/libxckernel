@@ -13,8 +13,8 @@ from typing import Dict
 
 import numpy as np
 
-from ..codegen import compile_function, generate
-from ..spin_kernel import fock_spin, response_fock_spin
+from ..emitters.codegen import compile_function, generate
+from ..engine.spin_kernel import fock_spin, response_fock_spin
 
 SPINS = ("a", "b")
 
@@ -201,7 +201,7 @@ def check_third_order(family: str):
 def check_st(family: str, singlet: bool):
     from pyscf import gto, dft
     from pyscf.dft import numint
-    from ..spin_kernel import response_fock_st
+    from ..engine.spin_kernel import response_fock_st
 
     xc = {"lda": "LDA_X,", "gga": "PBE"}[family]
     xctype = {"lda": "LDA", "gga": "GGA"}[family]

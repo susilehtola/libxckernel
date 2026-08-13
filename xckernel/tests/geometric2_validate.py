@@ -11,9 +11,9 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..deriv import LIBXC_MULTISET
-from ..fastpoly import from_expr
-from ..geometric import geometric_hessian
+from ..engine.deriv import LIBXC_MULTISET
+from ..engine.fastpoly import from_expr
+from ..engine.geometric import geometric_hessian
 
 # --- explicit functional (mgga_tau) -------------------------------------------
 

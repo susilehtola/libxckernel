@@ -19,9 +19,9 @@ from typing import Dict
 import numpy as np
 from scipy.linalg import expm
 
-from ..codegen import compile_function, generate
-from ..kernel import fock, xc_kernel
-from ..mo import orbital_gradient, orbital_hessian
+from ..emitters.codegen import compile_function, generate
+from ..engine.kernel import fock, xc_kernel
+from ..engine.mo import orbital_gradient, orbital_hessian
 from .validate import (FAMILY_FUNCTIONAL, Grid, ingredients_from_P,
                        libxc_eval, exc_of_P, make_grid)
 

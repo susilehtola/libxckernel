@@ -50,11 +50,11 @@ from dataclasses import dataclass
 
 import sympy as sp
 
-from .basis import AXES
+from ..inputs.basis import AXES
 from .deriv import LIBXC_MULTISET, VARS, libxc_symbol
 from .fock import fock_integrand
-from .functional import Functional
-from .ingredients import PRIM_BY_SYMBOL
+from ..inputs.functional import Functional
+from ..inputs.ingredients import PRIM_BY_SYMBOL
 from .kernel import KernelIntegrand
 from .response import _seed_fn
 
@@ -73,7 +73,7 @@ DTAU_G = sp.Symbol("dtau_g", real=True)
 
 def _spatial_field_gradient(var: str) -> sp.Expr:
     """d_d of a Libxc input variable, in direction-resolved operands."""
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     if var == "rho":
         return DRHO_G
     if var == "tau":
@@ -283,7 +283,7 @@ def _geo_rows(label: str, side: str, func: Functional):
     Ui = [sp.Symbol(f"U{i + 1}_{label}", real=True) for i in range(3)]
     dg = sp.Symbol(f"dchi_g{side}_{label}", real=True)
     ddg = [sp.Symbol(f"ddchi_g{side}_{label}_{ax}", real=True) for ax in AXES]
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     G = [2 * (U0 * ddg[i] + Ui[i] * dg) for i in range(3)]
     rows = {"rho": 2 * U0 * dg,
             "sigma": 2 * sum(GRAD_RHO[i].symbol * G[i] for i in range(3)),
@@ -298,7 +298,7 @@ def geometric_hessian(family: str, u: str = "u", v: str = "v") -> GeometricHessi
     from collections import Counter
 
     from .deriv import libxc_symbol
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     func = Functional.of_family(family)
     names = [ing.name for ing in func.ingredients]
     if any(n not in ("rho", "sigma", "tau") for n in names):
@@ -594,7 +594,7 @@ def geometric_hessian_spin(family: str, u: str = "u",
 def _spatial_field_gradient_slot(var: str, slot: str) -> sp.Expr:
     """d_slot of a Libxc variable, slot in {'g', 'h'} (two independent
     motion directions)."""
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     if var == "rho":
         return sp.Symbol(f"drho_{slot}", real=True)
     if var == "tau":
@@ -610,7 +610,7 @@ def spatial_energy_hessian(family: str) -> sp.Expr:
     nuclear Hessian): sum_kl f_kl d_g field_k d_h field_l
     + sum_k v_k d_g d_h field_k, with pair operands d2rho_gh,
     d2grad_rho_gh_i (= d_g d_h grad_i rho), d2tau_gh."""
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     func = Functional.of_family(family)
     names = [ing.name for ing in func.ingredients]
     total = sp.Integer(0)
@@ -640,7 +640,7 @@ def spatial_row_gradient(family: str, u: str = "u") -> sp.Expr:
     collocations Uh0_u = (dphi_h D)_u and Uhess_u_i = (dphi_h dphi_i D)_u,
     and the h-differentiated masked collocations ddchi_ghA_u
     (= -d_h d_x chi, sign fold as dchi_gA) and dddchi_ghA_u_i."""
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     func = Functional.of_family(family)
     names = {ing.name for ing in func.ingredients}
     rows, G, (U0, Ui, dg, ddg) = _geo_rows(u, "A", func)

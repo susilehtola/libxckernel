@@ -30,9 +30,9 @@ from typing import Dict, List, Tuple
 
 import sympy as sp
 
-from .basis import AXES
-from .deriv import LIBXC_MULTISET
-from .kernel import KernelIntegrand
+from ..inputs.basis import AXES
+from ..engine.deriv import LIBXC_MULTISET
+from ..engine.kernel import KernelIntegrand
 
 _AX = {ax: i for i, ax in enumerate(AXES)}
 #: packed symmetric-tensor component -> index (xx,xy,xz,yy,yz,zz)

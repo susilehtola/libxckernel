@@ -151,12 +151,12 @@ def {name}(w, rho, zk):
 
 def build_entry(e: CatalogEntry):
     """Generate the entry's source. Returns (source, GeneratedFunction|None)."""
-    from .codegen import generate_collapsed
+    from .emitters.codegen import generate_collapsed
     if e.order == 0 and not e.giao:
         return _EXC_SOURCE.format(name=e.name), None
 
     if e.giao:
-        from .london import london_fock, london_fock_spin
+        from .engine.london import london_fock, london_fock_spin
         parts, gen0 = [], None
         for si, ax in enumerate("xyz"):
             if e.spin == "r":
@@ -177,21 +177,21 @@ def build_entry(e: CatalogEntry):
 
     if e.spin == "r":
         if e.order == 1:
-            from .kernel import fock
+            from .engine.kernel import fock
             ki = fock(e.family)
         else:
-            from .response import response_fock
+            from .engine.response import response_fock
             ki = response_fock(e.family, e.order)
     elif e.spin in ("ua", "ub"):
         s = e.spin[1]
         if e.order == 1:
-            from .spin_kernel import fock_spin
+            from .engine.spin_kernel import fock_spin
             ki = fock_spin(e.family, s)
         else:
-            from .spin_kernel import response_fock_spin
+            from .engine.spin_kernel import response_fock_spin
             ki = response_fock_spin(e.family, s, e.order)
     else:  # 'st'
-        from .spin_kernel import response_fock_st
+        from .engine.spin_kernel import response_fock_st
         ki = response_fock_st(e.family, e.order, e.parities)
 
     gen = generate_collapsed(ki, e.name, batch=e.batch)
@@ -298,18 +298,18 @@ def _integrand_for(e: CatalogEntry):
                          "dispatch them via build_entry")
     if e.spin == "r":
         if e.order == 1:
-            from .kernel import fock
+            from .engine.kernel import fock
             return fock(e.family)
-        from .response import response_fock
+        from .engine.response import response_fock
         return response_fock(e.family, e.order)
     if e.spin in ("ua", "ub"):
         s = e.spin[1]
         if e.order == 1:
-            from .spin_kernel import fock_spin
+            from .engine.spin_kernel import fock_spin
             return fock_spin(e.family, s)
-        from .spin_kernel import response_fock_spin
+        from .engine.spin_kernel import response_fock_spin
         return response_fock_spin(e.family, s, e.order)
-    from .spin_kernel import response_fock_st
+    from .engine.spin_kernel import response_fock_st
     return response_fock_st(e.family, e.order, e.parities)
 
 
@@ -346,10 +346,10 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
                       f"{npat:3d} patterns", flush=True)
     elif backend == "c":
-        from .cbackend import (_EVALUATOR_HPP, emit_cmake, emit_exc_cpp,
+        from .emitters.cbackend import (_EVALUATOR_HPP, emit_cmake, emit_exc_cpp,
                                emit_exc_hpp, emit_f03, emit_header,
                                emit_kernel_cpp, emit_kernel_hpp)
-        from .codegen import collapse, generate_collapsed
+        from .emitters.codegen import collapse, generate_collapsed
         (out / "src").mkdir(parents=True, exist_ok=True)
         (out / "include" / "xckernel" / "kernels").mkdir(parents=True,
                                                          exist_ok=True)

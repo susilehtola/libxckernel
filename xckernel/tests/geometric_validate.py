@@ -18,10 +18,10 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
-from ..geometric import geometric_fock, spatial_gradient
-from ..kernel import fock
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
+from ..engine.geometric import geometric_fock, spatial_gradient
+from ..engine.kernel import fock
 
 # --- the explicit test functional (mgga_tau family) ---------------------------
 

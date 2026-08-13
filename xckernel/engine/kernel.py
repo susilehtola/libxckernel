@@ -19,7 +19,7 @@ import sympy as sp
 
 from .deriv import directional_derivative
 from .fock import FockIntegrand, fock_integrand
-from .functional import Functional
+from ..inputs.functional import Functional
 
 
 @dataclass

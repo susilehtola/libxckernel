@@ -11,8 +11,8 @@ import numpy as np
 from pyscf import gto, dft
 from pyscf.dft import numint
 
-from ..spin_kernel import fock_spin, kernel_spin
-from ..codegen import generate, compile_function
+from ..engine.spin_kernel import fock_spin, kernel_spin
+from ..emitters.codegen import generate, compile_function
 
 XCTYPE = {"lda": "LDA", "gga": "GGA"}
 XC = {"lda": "LDA_X,", "gga": "PBE"}

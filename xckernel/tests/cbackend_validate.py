@@ -16,11 +16,11 @@ from pathlib import Path
 
 import numpy as np
 
-from ..cbackend import emit_c, scal_order
-from ..codegen import collapse, compile_function, generate_collapsed
-from ..kernel import fock
-from ..response import response_fock
-from ..spin_kernel import fock_spin, response_fock_spin, response_fock_st
+from ..emitters.cbackend import emit_c, scal_order
+from ..emitters.codegen import collapse, compile_function, generate_collapsed
+from ..engine.kernel import fock
+from ..engine.response import response_fock
+from ..engine.spin_kernel import fock_spin, response_fock_spin, response_fock_st
 
 
 _H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")

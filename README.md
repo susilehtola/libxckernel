@@ -166,26 +166,33 @@ ground-state and perturbed fields, and the named Libxc derivative arrays that
 
 ```
 xckernel/
-  basis.py         symbolic basis-function fields (chi, grad, lapl, hess chi)
-  ingredients.py   rho, grad rho, lapl rho, tau, jp, hess rho, eta + seeds
-  functional.py    families as ingredient sets
-  deriv.py         the D operator and the Libxc derivative-name registry
-  fastpoly.py      monomial representation; all derivatives applied here
-  fock.py          F_uv integrand
-  kernel.py        repeated-D kernels (g_uv,ts and higher)
-  response.py      contraction engine (perturbed-field seeds), any order
-  spin.py          spin-resolved ingredients, seeds, component packing
-  spin_kernel.py   open-shell tower, singlet/triplet parities
-  geometric.py     nuclear derivatives incl. quadrature-grid response
-  codegen.py       pattern collapse + NumPy emission (batched; spin;
-                   sesquilinear; two-sided)
-  cbackend.py      C library emitter (static tables + fixed evaluator)
-  psi4backend.py   Psi4 host-idiom emitter (marked source regions)
+  inputs/          what goes in: the symbolic input definitions
+    basis.py         symbolic basis-function fields (chi, grad, lapl, hess chi)
+    ingredients.py   rho, grad rho, lapl rho, tau, jp, hess rho, eta + seeds
+    functional.py    families as ingredient sets
+    fields.py        numerical collocation helpers (incl. complex P)
+  engine/          the derivative tower over the input definitions
+    deriv.py         the D operator and the Libxc derivative-name registry
+    fastpoly.py      monomial representation; all derivatives applied here
+    fock.py          F_uv integrand
+    kernel.py        repeated-D kernels (g_uv,ts and higher)
+    response.py      contraction engine (perturbed-field seeds), any order
+    spin.py          spin-resolved ingredients, seeds, component packing
+    spin_kernel.py   open-shell tower, singlet/triplet parities
+    geometric.py     nuclear derivatives incl. quadrature-grid response
+    london.py        explicit magnetic-field derivatives (London orbitals)
+    mo.py            AO->MO helpers: orbital gradient (kappa sign!) and Hessian
+    algebra.py       response algebra: DM builders, projections, sigma templates
+  emitters/        what comes out: shared IR + code generators
+    codegen.py       pattern collapse + NumPy emission (batched; spin;
+                     sesquilinear; two-sided)
+    compact.py       IR compaction to the minimal contraction form
+    cbackend.py      C library emitter (static tables + fixed evaluator)
+    psi4backend.py   Psi4 host-idiom emitter (xcgen include files)
+    vlxwriter.py     VeloxChem writer plugin
+    release.py       self-contained C source package assembly
   catalog.py       the 156-kernel catalog + machine-readable manifests
-  fields.py        numerical collocation helpers (incl. complex P)
   runtime.py       compiled-library loader
-  mo.py            AO->MO helpers: orbital gradient (kappa sign!) and Hessian
-  algebra.py       response algebra: DM builders, projections, sigma templates
   tests/           validation suites (see table above)
 docs/
   dedup-analysis.md  six-code survey of DFT response stacks and the design

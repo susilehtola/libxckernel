@@ -14,9 +14,9 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..geometric import geometric_fock_spin, geometric_hessian_spin
-from ..fastpoly import from_expr
-from ..spin_kernel import _SYM_SCALARS
+from ..engine.geometric import geometric_fock_spin, geometric_hessian_spin
+from ..engine.fastpoly import from_expr
+from ..engine.spin_kernel import _SYM_SCALARS
 from .geometric2_validate import ALPHA, BF_ATOM, colloc
 
 # --- explicit polarized functional --------------------------------------------

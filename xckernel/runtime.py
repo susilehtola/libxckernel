@@ -136,8 +136,8 @@ class _NumpyKernel:
         entry = next((e for e in entries() if e.name == name), None)
         if entry is None or entry.order == 0:
             raise KeyError(f"unknown kernel {name!r}")
-        from .cbackend import scal_order
-        from .codegen import collapse, compile_function, generate_collapsed
+        from .emitters.cbackend import scal_order
+        from .emitters.codegen import collapse, compile_function, generate_collapsed
         ki = _integrand_for(entry)
         self._ck = collapse(ki)
         self._gen = generate_collapsed(ki, name, batch=False)

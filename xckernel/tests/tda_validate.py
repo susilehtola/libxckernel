@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..algebra import perturbed_dm_order, rpa_sigma, tda_sigma
-from ..codegen import compile_function, generate
-from ..spin_kernel import response_fock_st
+from ..engine.algebra import perturbed_dm_order, rpa_sigma, tda_sigma
+from ..emitters.codegen import compile_function, generate
+from ..engine.spin_kernel import response_fock_st
 
 
 def _setup(family: str):

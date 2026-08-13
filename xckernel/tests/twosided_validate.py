@@ -19,11 +19,11 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
-from ..fields import collocate, collocate_pair
-from ..kernel import fock
-from ..response import response_fock
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
+from ..inputs.fields import collocate, collocate_pair
+from ..engine.kernel import fock
+from ..engine.response import response_fock
 
 _r, _s, _t = sp.symbols("rho sigma tau", positive=True)
 _F = (_r**2 + sp.Rational(3, 10) * _s * _r + sp.Rational(1, 5) * _t**2

@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple
 
 import sympy as sp
 
-from .basis import Orbital
+from ..inputs.basis import Orbital
 from .deriv import libxc_deriv_name
 from .spin import (COMPS, FIELD_PERTS, FIELD_SEEDS, GROUPS, HESS_S,
                    INV_RHO_S, JP_S, SCALARS, Scalar, _GROUP_RANK,
@@ -119,7 +119,7 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     (which reduces to 2 grad_s . grad_s^X for the same-spin components).
     Composite scalars (gauge-corrected tau, eta) carry their own pert closure.
     """
-    from .basis import AXES
+    from ..inputs.basis import AXES
     if sc.pert is not None:
         return sc.pert(label)
     if sc.group == "rho":
@@ -257,7 +257,7 @@ def response_fock_st(family: str, order: int = 2,
     if any(p not in (-1, +1) for p in parities):
         raise ValueError("parities must be +1 (singlet) or -1 (triplet)")
 
-    from .basis import AXES, HESS_COMPS
+    from ..inputs.basis import AXES, HESS_COMPS
     from .fastpoly import subs_signed
     ri = response_fock_spin(family, "a", order, u, v)
     mapping = {}

@@ -25,10 +25,10 @@ from typing import Dict
 import numpy as np
 import sympy as sp
 
-from ..basis import HESS_COMPS
-from ..codegen import compile_function, generate_collapsed
-from ..spin import COMPS
-from ..spin_kernel import (_SYM_SCALARS, fock_spin, response_fock_spin,
+from ..inputs.basis import HESS_COMPS
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.spin import COMPS
+from ..engine.spin_kernel import (_SYM_SCALARS, fock_spin, response_fock_spin,
                            response_fock_st)
 
 SPINS = ("a", "b")

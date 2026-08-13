@@ -20,8 +20,8 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
 
 # --- the explicit test functional -------------------------------------------
 
@@ -104,7 +104,7 @@ def main():
 
     # 1. Fock vs FD in single matrix entries (symmetric AND antisymmetric
     #    information: off-diagonal M_uv displacements are general)
-    from ..kernel import fock
+    from ..engine.kernel import fock
     ki = fock("cmgga_tau")
     gen = generate_collapsed(ki, "cfock")
     fn = compile_function(gen)
@@ -126,7 +126,7 @@ def main():
           float(np.abs(0.5 * (Fj - Fj.T)).max()) > 1e-8, True, 1e-14)
 
     # 2. o2 response contraction vs FD of the Fock matrix
-    from ..response import response_fock
+    from ..engine.response import response_fock
     ki2 = response_fock("cmgga_tau", 2)
     gen2 = generate_collapsed(ki2, "ck2")
     fn2 = compile_function(gen2)

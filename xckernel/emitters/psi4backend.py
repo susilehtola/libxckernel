@@ -180,7 +180,7 @@ def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
     intermediates (dot products, hoisted common factors) and coefficient
     assembly into the right-factor accumulator T, the completion GEMM +
     adjoint, and the diagonal (dphi_i, dphi_i) block."""
-    from .response import response_fock
+    from ..engine.response import response_fock
     ck = collapse(response_fock(family, 2))
     phiphi, mixed, diag = _split_patterns(ck)
     phiphi, mixed, diag, dots, hoists = _compact_patterns(phiphi, mixed, diag)
@@ -191,7 +191,7 @@ def emit_rv_vx_contraction(family: str = "mgga_tau") -> str:
     A = L.append
     A("            // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: response_fock(%s, order=2), restricted] <==" % family)
-    A("            // Reproduce with: python -m xckernel.psi4backend")
+    A("            // Reproduce with: python -m xckernel.emitters.psi4backend")
     A("            // Physics source: the symbolic derivative tower; the")
     A("            // intermediates below are IR compaction output (dot")
     A("            // contraction + common-factor hoisting), not hand-derived.")
@@ -333,7 +333,7 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
     intermediates and both spin coefficient assemblies fused in one
     point loop, per-spin completion GEMMs + adjoint, and the diagonal
     (dphi_i, dphi_i) blocks."""
-    from .spin_kernel import response_fock_spin
+    from ..engine.spin_kernel import response_fock_spin
     base_ops = _uv_operands()
     chan = {}
     dots_all, hoists_all = {}, {}
@@ -357,7 +357,7 @@ def emit_uv_vx_contraction(family: str = "mgga_tau") -> str:
     A = L.append
     A("            // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: response_fock_spin(%s, order=2)] <==" % family)
-    A("            // Reproduce with: python -m xckernel.psi4backend --uv")
+    A("            // Reproduce with: python -m xckernel.emitters.psi4backend --uv")
     A("            // Physics source: the symbolic derivative tower; the")
     A("            // intermediates below are IR compaction output (dot")
     A("            // contraction + common-factor hoisting), not hand-derived.")
@@ -478,7 +478,7 @@ def emit_rv_fx_contraction(family: str = "mgga_tau") -> str:
     Weight rules for this routine (the accumulation visits every function
     pair from both sides, so ACC + ACC^T is applied twice): symmetric
     patterns at QUARTER weight, transpose pairs at HALF weight."""
-    from .geometric import geometric_fock
+    from ..engine.geometric import geometric_fock
     ck = collapse(geometric_fock(family))
 
     field_phiphi = []
@@ -518,7 +518,7 @@ def emit_rv_fx_contraction(family: str = "mgga_tau") -> str:
     A = L.append
     A("                    // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: geometric_fock(%s), restricted] <==" % family)
-    A("                    // Reproduce with: python -m xckernel.psi4backend --fx")
+    A("                    // Reproduce with: python -m xckernel.emitters.psi4backend --fx")
     A("                    // Physics source: the geometric derivative of the")
     A("                    // symbolic tower (basis class, fixed grid); the")
     A("                    // intermediates are IR compaction output.")
@@ -601,8 +601,8 @@ def emit_rv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     """The generated scalar d_d e(r) of the gradient's grid-motion class:
     per (point, direction) after the plumbing computed drho_g, the
     density-Hessian row dgrad_g[3], and dtau_g."""
-    from .fastpoly import from_expr
-    from .geometric import spatial_energy_gradient
+    from ..engine.fastpoly import from_expr
+    from ..engine.geometric import spatial_energy_gradient
     expr = spatial_energy_gradient(family)
     monos = [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
              for key, c in from_expr(expr).items()]
@@ -613,7 +613,7 @@ def emit_rv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     A = L.append
     A("                    // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: spatial_energy_gradient(%s)] <==" % family)
-    A("                    // Reproduce with: python -m xckernel.psi4backend --gridmotion")
+    A("                    // Reproduce with: python -m xckernel.emitters.psi4backend --gridmotion")
     L.extend(defs)
     A("                    double de = 0.0;")
     L.extend(_cxx_sum(_transform_monomials(monos, ops), 1.0, ind, var="de"))
@@ -663,7 +663,7 @@ def _hx(expr, scale: float = 1.0, weight: str = "") -> str:
     """Transform a hint expression to a C sum with the Hessian operand
     map: per-monomial coefficient x mapped factors, optionally times the
     quadrature weight."""
-    from .fastpoly import from_expr
+    from ..engine.fastpoly import from_expr
     terms = []
     for key, coeff in sorted(from_expr(expr).items(),
                              key=lambda kv: str(kv[0])):
@@ -690,8 +690,8 @@ def emit_rv_hessian(family: str = "mgga_tau") -> dict:
     one-center body."""
     from collections import Counter
 
-    from .deriv import libxc_symbol
-    from .geometric import geometric_hessian
+    from ..engine.deriv import libxc_symbol
+    from ..engine.geometric import geometric_hessian
     gh = geometric_hessian(family)
     h = gh.hints
     mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
@@ -829,7 +829,7 @@ def emit_uv_fx_contraction(family: str = "mgga_tau") -> str:
     rules (the accumulation visits every function pair from both sides:
     symmetric patterns at QUARTER weight, transpose pairs at HALF, seeds
     at -1/2 with the -d/dr sign folded into the emission factor)."""
-    from .geometric import geometric_fock_spin
+    from ..engine.geometric import geometric_fock_spin
     base_ops = _uv_fx_operands()
     ind = "                    "
 
@@ -854,7 +854,7 @@ def emit_uv_fx_contraction(family: str = "mgga_tau") -> str:
     A = L.append
     A(ind + "// ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: geometric_fock_spin(%s)] <==" % family)
-    A(ind + "// Reproduce with: python -m xckernel.psi4backend --uvfx")
+    A(ind + "// Reproduce with: python -m xckernel.emitters.psi4backend --uvfx")
     A(ind + "// Physics source: the spin geometric derivative of the")
     A(ind + "// symbolic tower (basis class, fixed grid); the")
     A(ind + "// intermediates are IR compaction output.")
@@ -945,7 +945,7 @@ def _uv_hess_operands() -> Dict[str, Tuple[str, float]]:
 
 def _hx_uv(expr, ops, scale: float = 1.0, weight: str = "w[P]") -> str:
     """Transform an expression to a C sum with a Hessian operand map."""
-    from .fastpoly import from_expr
+    from ..engine.fastpoly import from_expr
     terms = []
     for key, coeff in sorted(from_expr(sp_expand(expr)).items(),
                              key=lambda kv: str(kv[0])):
@@ -981,8 +981,8 @@ def emit_uv_hessian(family: str = "mgga_tau") -> dict:
     fixed-grid GGA/meta term. UV convention: the host ends with
     hermitivitize() alone (no scale(2)), so symmetric classes enter at
     FULL weight and transpose-pair members TWICE."""
-    from .geometric import geometric_hessian_spin
-    from .spin_kernel import _register
+    from ..engine.geometric import geometric_hessian_spin
+    from ..engine.spin_kernel import _register
     gh = geometric_hessian_spin(family)
     h = gh.hints
     scalars = h["scalars"]
@@ -1183,8 +1183,8 @@ def emit_uv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     """The generated scalar d_d e(r) of the UKS gradient's grid-motion
     class: per (point, direction) after the plumbing computed the
     per-channel drho_s_g, dgrad_s[3], and dtau_s_g."""
-    from .fastpoly import from_expr
-    from .geometric import spatial_energy_gradient_spin
+    from ..engine.fastpoly import from_expr
+    from ..engine.geometric import spatial_energy_gradient_spin
     expr = spatial_energy_gradient_spin(family)
     monos = [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
              for key, c in from_expr(expr).items()]
@@ -1195,7 +1195,7 @@ def emit_uv_gradient_gridmotion(family: str = "mgga_tau") -> str:
     A = L.append
     A("                    // ==> BEGIN GENERATED CODE"
       " [xckernel psi4backend: spatial_energy_gradient_spin(%s)] <==" % family)
-    A("                    // Reproduce with: python -m xckernel.psi4backend --uvgridmotion")
+    A("                    // Reproduce with: python -m xckernel.emitters.psi4backend --uvgridmotion")
     L.extend(defs)
     A("                    double de = 0.0;")
     L.extend(_cxx_sum(_transform_monomials(monos, ops), 1.0, ind, var="de"))
@@ -1240,7 +1240,7 @@ def _grid_hess_ops() -> Dict[str, Tuple[str, float]]:
 
 
 def _monos_of(expr):
-    from .fastpoly import from_expr
+    from ..engine.fastpoly import from_expr
     return [(float(c), tuple(sorted((sym.name, e) for sym, e in key)))
             for key, c in from_expr(expr).items()]
 
@@ -1252,7 +1252,7 @@ def emit_rv_hessian_gridresponse(family: str = "mgga_tau") -> dict:
     derivative d2e (grid x grid), and the spatial row gradient mb
     (grid x basis cross). Plumbing supplies only raw collocation dots."""
     import sympy
-    from .geometric import (geometric_hessian, spatial_energy_gradient,
+    from ..engine.geometric import (geometric_hessian, spatial_energy_gradient,
                             spatial_energy_hessian, spatial_row_gradient)
     ops = _grid_hess_ops()
     mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
@@ -1413,7 +1413,7 @@ def emit_uv_hessian_gridresponse(family: str = "mgga_tau") -> dict:
     derivative d2e (grid x grid), and the spatial row gradient mb
     (grid x basis cross). Plumbing supplies only raw per-channel
     collocation dots."""
-    from .geometric import (geometric_hessian_spin,
+    from ..engine.geometric import (geometric_hessian_spin,
                             spatial_energy_gradient_spin,
                             spatial_energy_hessian_spin,
                             spatial_row_gradient_spin)
@@ -1702,8 +1702,8 @@ def emit_rv_fx_gridresponse(family: str = "mgga_tau") -> dict:
     RV::compute_fock_derivatives: the weight class (the Fock integrand
     with weight := dw_X) and the grid-motion class (the spatial gradient
     of the Fock integrand, weight w, parent-atom directions)."""
-    from .geometric import spatial_gradient
-    from .kernel import fock
+    from ..engine.geometric import spatial_gradient
+    from ..engine.kernel import fock
     mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
                          f"{what}, restricted] <==")
     END = "// ==> END GENERATED CODE <=="
@@ -1744,8 +1744,8 @@ def emit_uv_fx_gridresponse(family: str = "mgga_tau") -> dict:
     UV::compute_fock_derivatives, per spin channel: the weight class
     (the spin Fock integrand with weight := dw_X) and the grid-motion
     class (spatial_gradient_spin, weight w, parent-atom directions)."""
-    from .geometric import spatial_gradient_spin
-    from .spin_kernel import fock_spin
+    from ..engine.geometric import spatial_gradient_spin
+    from ..engine.spin_kernel import fock_spin
     mark = lambda what: (f"// ==> BEGIN GENERATED CODE [xckernel psi4backend: "
                          f"{what}] <==")
     END = "// ==> END GENERATED CODE <=="
@@ -1829,7 +1829,7 @@ del _name
 INCLUDE_FILE_NOTICE = (
     "// This file is machine-generated by xckernel in its entirety;\n"
     "// do not edit.  Reproduce with:\n"
-    "//     python -m xckernel.psi4backend --emit-dir <this directory>\n"
+    "//     python -m xckernel.emitters.psi4backend --emit-dir <this directory>\n"
     "// Copyright (c) 2026 Susi Lehtola.\n")
 
 

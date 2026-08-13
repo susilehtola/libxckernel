@@ -15,10 +15,10 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..geometric import (_geo_rows_spin, spatial_energy_hessian_spin,
+from ..engine.geometric import (_geo_rows_spin, spatial_energy_hessian_spin,
                          spatial_gradient_spin, spatial_row_gradient_spin)
-from ..spin import family_scalars
-from ..spin_kernel import _register, fock_spin
+from ..engine.spin import family_scalars
+from ..engine.spin_kernel import _register, fock_spin
 from .geometric2_validate import ALPHA, colloc
 from .geometric_spin_validate import (_ARGS, _F, _deriv_arrays, _spin_fields,
                                       evaluate)

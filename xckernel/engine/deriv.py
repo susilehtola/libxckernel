@@ -39,9 +39,9 @@ from typing import Dict, Iterable, List, Tuple
 
 import sympy as sp
 
-from .basis import Orbital
-from .functional import Functional
-from .ingredients import INGREDIENTS, PRIM_BY_SYMBOL
+from ..inputs.basis import Orbital
+from ..inputs.functional import Functional
+from ..inputs.ingredients import INGREDIENTS, PRIM_BY_SYMBOL
 
 #: Canonical Libxc variable order.  Derivative names concatenate variables in
 #: this order, so it must match Libxc exactly.  Extension variables beyond

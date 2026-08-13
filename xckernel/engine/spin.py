@@ -29,7 +29,7 @@ from typing import Callable, Dict, List, Tuple
 
 import sympy as sp
 
-from .basis import AXES, HESS_COMPS, HESS_INDEX, Orbital, dot
+from ..inputs.basis import AXES, HESS_COMPS, HESS_INDEX, Orbital, dot
 
 SPINS: Tuple[str, str] = ("a", "b")
 GROUPS: Tuple[str, ...] = ("rho", "sigma", "lapl", "tau", "eta")

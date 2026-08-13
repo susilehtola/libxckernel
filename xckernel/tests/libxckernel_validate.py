@@ -16,8 +16,8 @@ from pathlib import Path
 import numpy as np
 
 from ..catalog import CatalogEntry, _integrand_for, build_catalog
-from ..cbackend import scal_order
-from ..codegen import collapse, compile_function, generate_collapsed
+from ..emitters.cbackend import scal_order
+from ..emitters.codegen import collapse, compile_function, generate_collapsed
 
 
 _H6_COMPS = ("xx", "xy", "xz", "yy", "yz", "zz")

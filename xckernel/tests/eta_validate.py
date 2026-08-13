@@ -29,8 +29,8 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
 
 # --- the explicit test functional -------------------------------------------
 
@@ -126,8 +126,8 @@ def main():
             failures += 1
         print(f"  [{'OK' if ok else 'FAIL'}] {label}: max rel {err:.2e}")
 
-    from ..kernel import fock
-    from ..response import response_fock
+    from ..engine.kernel import fock
+    from ..engine.response import response_fock
 
     # 1. Fock vs FD in single matrix entries
     gen1 = generate_collapsed(fock("hmgga"), "hfock")

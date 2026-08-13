@@ -12,10 +12,10 @@ import numpy as np
 from pylibxc import LibXCFunctional
 from scipy.linalg import expm
 
-from ..algebra import quadratic_sigma_xc, response_sigma_xc, unit_rotation
-from ..codegen import compile_function, generate
-from ..kernel import fock
-from ..response import response_fock
+from ..engine.algebra import quadratic_sigma_xc, response_sigma_xc, unit_rotation
+from ..emitters.codegen import compile_function, generate
+from ..engine.kernel import fock
+from ..engine.response import response_fock
 
 NAME = {"lda": "LDA_X", "gga": "GGA_X_PBE"}
 VARS = {"lda": ["rho"], "gga": ["rho", "sigma"]}

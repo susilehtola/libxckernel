@@ -18,8 +18,8 @@ import numpy as np
 from pyscf import gto, dft
 from pyscf.dft import numint
 
-from ..kernel import fock, xc_kernel
-from ..codegen import generate, compile_function
+from ..engine.kernel import fock, xc_kernel
+from ..emitters.codegen import generate, compile_function
 
 XCTYPE = {"lda": "LDA", "gga": "GGA"}
 XC = {"lda": "LDA_X,", "gga": "PBE"}   # ',' => exchange-only LDA (no correlation)

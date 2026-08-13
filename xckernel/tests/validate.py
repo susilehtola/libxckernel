@@ -22,8 +22,8 @@ import numpy as np
 import sympy as sp
 from pylibxc import LibXCFunctional
 
-from ..basis import AXES
-from ..fock import fock_integrand
+from ..inputs.basis import AXES
+from ..engine.fock import fock_integrand
 
 # A representative functional for each family, chosen for which variables it
 # genuinely consumes.
@@ -162,7 +162,7 @@ def check(family: str) -> Dict[str, float]:
 
 def analytic_kernel(family: str, name: str, g: Grid) -> np.ndarray:
     """Contract the AD kernel integrand into a full g[u,v,t,s] tensor."""
-    from ..kernel import xc_kernel
+    from ..engine.kernel import xc_kernel
     ki = xc_kernel(family)
     ing = ingredients_from_P(g, g.P)
     out = libxc_eval(name, family, ing, do_fxc=True)

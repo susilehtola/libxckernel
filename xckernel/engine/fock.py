@@ -18,8 +18,8 @@ from dataclasses import dataclass
 
 import sympy as sp
 
-from .basis import Orbital
-from .functional import Functional
+from ..inputs.basis import Orbital
+from ..inputs.functional import Functional
 
 
 @dataclass

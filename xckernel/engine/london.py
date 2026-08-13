@@ -34,8 +34,8 @@ from typing import List, Tuple
 
 import sympy as sp
 
-from .basis import AXES, Orbital
-from .functional import Functional
+from ..inputs.basis import AXES, Orbital
+from ..inputs.functional import Functional
 from .kernel import KernelIntegrand, fock
 
 #: Levi-Civita symbol.
@@ -133,7 +133,7 @@ def london_fock(family: str, s: int) -> KernelIntegrand:
                       - u.grad[cc] * _m_grad("v", s, cc))
         return t
 
-    from .ingredients import GRAD_RHO
+    from ..inputs.ingredients import GRAD_RHO
     expr = sp.Integer(0)
     for ing in func.ingredients:
         vsym = sp.Symbol(f"v{ing.name}", real=True)

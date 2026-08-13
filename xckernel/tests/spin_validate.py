@@ -18,8 +18,8 @@ import numpy as np
 import sympy as sp
 from pylibxc import LibXCFunctional
 
-from ..basis import AXES
-from ..spin_kernel import fock_spin, kernel_spin
+from ..inputs.basis import AXES
+from ..engine.spin_kernel import fock_spin, kernel_spin
 
 FAMILY_FUNCTIONAL = {"lda": "LDA_X", "gga": "GGA_X_PBE",
                      "mgga_tau": "MGGA_X_SCAN", "mgga": "MGGA_X_BR89"}

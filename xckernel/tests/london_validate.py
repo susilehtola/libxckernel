@@ -13,10 +13,10 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
-from ..kernel import fock
-from ..london import london_fock
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
+from ..engine.kernel import fock
+from ..engine.london import london_fock
 
 C_AU = 137.035999084
 
@@ -140,8 +140,8 @@ def main():
                   f"max rel {err:.2e}")
 
     # --- spin-resolved GIAO kernels vs FD of the sesquilinear spin Fock ---
-    from ..london import london_fock_spin
-    from ..spin_kernel import fock_spin, _SYM_SCALARS as _SS
+    from ..engine.london import london_fock_spin
+    from ..engine.spin_kernel import fock_spin, _SYM_SCALARS as _SS
 
     _ra, _rb = sp.symbols("ra rb", positive=True)
     _saa, _sab, _sbb = sp.symbols("saa sab sbb", positive=True)

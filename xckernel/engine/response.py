@@ -45,11 +45,11 @@ from typing import List, Tuple
 
 import sympy as sp
 
-from .basis import AXES
+from ..inputs.basis import AXES
 from .deriv import LIBXC_MULTISET, VARS, libxc_symbol
 from .fock import fock_integrand
-from .functional import Functional
-from .ingredients import GRAD_RHO, PRIM_BY_SYMBOL
+from ..inputs.functional import Functional
+from ..inputs.ingredients import GRAD_RHO, PRIM_BY_SYMBOL
 
 
 def pert_field(prim_name: str, label: str) -> sp.Symbol:
@@ -113,7 +113,7 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
             total += 2 * p.symbol * sp.Symbol(f"grad_rho_{label}_{ax}", real=True)
         return total
     if var == "eta":
-        from .ingredients import ETA_ING
+        from ..inputs.ingredients import ETA_ING
         return perturbed_ingredient(ETA_ING, label)
     raise ValueError(f"unknown libxc variable {var!r}")
 

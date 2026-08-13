@@ -28,9 +28,9 @@ from __future__ import annotations
 import numpy as np
 import sympy as sp
 
-from ..codegen import compile_function, generate_collapsed
-from ..deriv import LIBXC_MULTISET
-from ..fields import collocate, hermitian_fields, hermitian_fock
+from ..emitters.codegen import compile_function, generate_collapsed
+from ..engine.deriv import LIBXC_MULTISET
+from ..inputs.fields import collocate, hermitian_fields, hermitian_fock
 
 # --- the explicit test functional (same as cdft_validate) -------------------
 
@@ -130,7 +130,7 @@ def main():
         return (4 * d(h) - d(2 * h)) / 3
 
     # 2. current-free family: real Fock from Re P is the full answer ----------
-    from ..kernel import fock
+    from ..engine.kernel import fock
     ki = fock("mgga_tau")
     gen = generate_collapsed(ki, "mfock")
     fn = compile_function(gen)
@@ -170,7 +170,7 @@ def main():
     check("cmgga_tau complex Fock vs FD", err, 1e-6)
 
     # 4. o2 response with a complex Hermitian perturbation ---------------------
-    from ..response import response_fock
+    from ..engine.response import response_fock
     ki2 = response_fock("cmgga_tau", 2)
     gen2 = generate_collapsed(ki2, "ck2")
     fn2 = compile_function(gen2)
