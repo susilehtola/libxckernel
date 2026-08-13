@@ -665,11 +665,19 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                     done.add(j)
             plan.append((k, sign))
 
+    # Emit big sums as chunked += accumulation: a single expression over
+    # tens of thousands of monomials builds an AST deep enough to blow
+    # CPython's fixed compiler recursion cap (<= 3.13).
+    _CHUNK = 64
+
     lines: List[str] = []
     for k, sign in plan:
         ufac, vfac, monos = ck.patterns[k]
-        code = " + ".join(mono_code(coeff, fac) for coeff, fac in monos)
-        lines.append(f"    c = {code}")
+        parts = [" + ".join(mono_code(coeff, fac) for coeff, fac in
+                            monos[i:i + _CHUNK])
+                 for i in range(0, len(monos), _CHUNK)]
+        lines.append(f"    c = {parts[0]}")
+        lines.extend(f"    c += {p}" for p in parts[1:])
         if sesquilinear:
             ucode, vcode = _side_factor(ufac, "_c", "sesquilinear"), vfac
         elif two_sided:

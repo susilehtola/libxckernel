@@ -410,6 +410,24 @@ def emit_header(kernel_names: List[str], version: str) -> str:
     return "\n".join(lines)
 
 
+def _f90_wrap(line: str, limit: int = 132) -> List[str]:
+    """Split an over-long free-form line at commas with & continuations.
+
+    The F2018 free-form limit is 132 columns; only F2023 raised it, and
+    gfortran versions in the field still hard-error past 132.
+    """
+    out = []
+    cont_indent = line[:len(line) - len(line.lstrip())] + "    "
+    while len(line) > limit:
+        cut = line.rfind(", ", 0, limit - 1)
+        if cut < 0:
+            break
+        out.append(line[:cut + 1] + " &")
+        line = cont_indent + line[cut + 2:]
+    out.append(line)
+    return out
+
+
 def emit_f03(kernel_names: List[str], version: str) -> str:
     """The Fortran 2003 ISO_C_BINDING module (the xc_f03 idiom)."""
     lines = [
@@ -448,7 +466,7 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
             f"    end function {name}",
         ]
     lines += ["  end interface", "end module xckernel_f03", ""]
-    return "\n".join(lines)
+    return "\n".join(w for line in lines for w in _f90_wrap(line))
 
 
 def emit_cmake(kernel_names: List[Tuple[str, int]], version: str) -> str:
