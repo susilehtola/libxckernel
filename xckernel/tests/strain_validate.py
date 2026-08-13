@@ -150,7 +150,8 @@ def libxc_eval(func_ids, family, F, orders=(0, 1)):
     out = {}
     for fid in func_ids:
         f = pylibxc.LibXCFunctional(fid, "unpolarized")
-        r = f.compute(inp, do_exc=0 in orders, do_vxc=1 in orders)
+        r = f.compute(inp, do_exc=0 in orders, do_vxc=1 in orders,
+                      do_fxc=2 in orders)
         for k, v in r.items():
             out[k] = out.get(k, 0) + v.reshape(v.shape[0], -1).T.squeeze()
     return out
@@ -171,9 +172,8 @@ def operand_values(F, out):
     for k, (i, j) in enumerate(HESS_COMPS):
         vals[f"hess_rho_{AXES[i]}{AXES[j]}"] = F["hess"][k]
         vals[f"tau_tensor_{AXES[i]}{AXES[j]}"] = F["tau_tensor"][k]
-    for name in ("vrho", "vsigma", "vlapl", "vtau"):
-        if name in out:
-            vals[name] = out[name]
+    for name, v in out.items():
+        vals[name] = v
     return vals
 
 
@@ -263,6 +263,60 @@ def validate_rotation(model, family, func_ids):
     return 0 if ok else 1
 
 
+PAIRS2 = [((0, 0), (0, 0)), ((0, 0), (1, 1)), ((0, 1), (0, 1)),
+          ((0, 1), (1, 0)), ((1, 2), (2, 0)), ((2, 2), (0, 1))]
+
+
+def validate_second(model, family, func_ids):
+    """The order-2 master law: strain_energy_hessian against 2D
+    Richardson finite differences of E(A)."""
+    from ..engine.strain import strain_energy_hessian
+    try:
+        F = model.fields(np.eye(3))
+        out = libxc_eval(func_ids, family, F, orders=(0, 1, 2))
+    except Exception as exc:
+        print(f"  [SKIP] {family:10s} second order: no fxc ({exc})")
+        return 0
+    vals = operand_values(F, out)
+
+    def unit(ab):
+        M = np.zeros((3, 3))
+        M[ab] = 1.0
+        return M
+
+    def Emat(M):
+        return energy(model, func_ids, family, np.eye(3) + M)
+
+    errs, scale = [], 1.0
+    for ab, cd in PAIRS2:
+        expr = strain_energy_hessian(family, ab, cd)
+        syms = sorted(expr.free_symbols, key=lambda s: s.name)
+        fn = sp.lambdify(syms, expr, "numpy")
+        per_point = np.broadcast_to(fn(*[vals[s.name] for s in syms]),
+                                    F["rho"].shape)
+        ana = F["w"] * float(np.sum(per_point))
+        if ab == cd:
+            M = unit(ab)
+            fd = (-Emat(2 * H * M) + 16 * Emat(H * M) - 30 * Emat(0 * M)
+                  + 16 * Emat(-H * M) - Emat(-2 * H * M)) / (12 * H * H)
+        else:
+            Ma, Mc = unit(ab), unit(cd)
+
+            def mixed(h):
+                return (Emat(h * Ma + h * Mc) - Emat(h * Ma - h * Mc)
+                        - Emat(-h * Ma + h * Mc)
+                        + Emat(-h * Ma - h * Mc)) / (4 * h * h)
+            fd = (4 * mixed(H) - mixed(2 * H)) / 3
+        errs.append(abs(ana - fd))
+        scale = max(scale, abs(fd))
+    rel = max(errs) / scale
+    ok = rel < 1e-7
+    print(f"  [{'OK ' if ok else 'FAIL'}] {family:10s} second order "
+          f"({len(PAIRS2)} component pairs): max |ana - fd| / scale = "
+          f"{rel:.2e}")
+    return 0 if ok else 1
+
+
 def validate_pert(model):
     """Strain of a response-level integrand: the perturbed-field seeds
     (label carried through, tau_p1 gaining tau_tensor_p1), via the
@@ -318,10 +372,11 @@ def main():
     for family, func_ids in FAMILIES.items():
         failures += validate_family(model, family, func_ids)
         failures += validate_rotation(model, family, func_ids)
+        failures += validate_second(model, family, func_ids)
     failures += validate_eta(model)
     failures += validate_pert(model)
     status = "OK " if failures == 0 else "FAIL"
-    print(f"[{status}] strain_validate: {len(FAMILIES) * 2 + 2} checks, "
+    print(f"[{status}] strain_validate: {len(FAMILIES) * 3 + 2} checks, "
           f"{failures} failures")
     return failures
 
