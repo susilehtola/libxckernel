@@ -233,6 +233,86 @@ def validate_family_spin(m, F0, pert, family, func_ids, H, tol):
     return 0 if ok else 1
 
 
+def validate_st(m, F0, pert):
+    """Closed-shell singlet/triplet bilinears at the spin-compensated
+    point: the singlet combination must reproduce the unpolarized
+    bilinear exactly, and the triplet combination is checked against
+    finite differences with antisymmetric channel perturbations."""
+    from ..engine.spin_kernel import fxc_bilinear_st
+
+    fails = 0
+    FS = {s: {"rho": F0["rho"] / 2, "grad": F0["grad"] / 2,
+              "tau": F0["tau"] / 2} for s in "ab"}
+    for family, (func_ids, H, tol) in SPIN_FAMILIES.items():
+        try:
+            out = spin_libxc_eval(func_ids, family, FS, orders=(1, 2))
+        except Exception as exc:
+            print(f"  [SKIP] st {family:10s}: no fxc ({exc})")
+            continue
+        vals = {}
+        for name, arr in out.items():
+            for k in range(arr.shape[1]):
+                vals[f"{name}_{k}"] = arr[:, k]
+        vals["rho_a"] = FS["a"]["rho"]
+        vals["tau_a"] = FS["a"]["tau"]
+        for i, ax in enumerate(AXES):
+            vals[f"grad_rho_a_{ax}"] = FS["a"]["grad"][i]
+        for li, p in zip(("p1", "p2"), pert):
+            vals[f"rho_a_{li}"] = p["rho"] / 2
+            vals[f"tau_a_{li}"] = p["tau"] / 2
+            for i, ax in enumerate(AXES):
+                vals[f"grad_rho_a_{li}_{ax}"] = p["grad"][i] / 2
+
+        def evaluate(parities):
+            expr = fxc_bilinear_st(family, parities)
+            syms = sorted(expr.free_symbols, key=lambda s_: s_.name)
+            fn = sp.lambdify(syms, expr, "numpy")
+            per_point = np.broadcast_to(
+                fn(*[vals[s_.name] for s_ in syms]), F0["rho"].shape)
+            return m.w * float(np.sum(per_point))
+
+        # singlet identity vs the unpolarized bilinear
+        unpol_ids = func_ids
+        uout = libxc_eval(unpol_ids, family, F0, orders=(1, 2))
+        uvals = dict(uout)
+        uvals.update({"rho": F0["rho"], "sigma": F0["sigma"],
+                      "lapl_rho": F0["lapl"], "tau": F0["tau"]})
+        for i, ax in enumerate(AXES):
+            uvals[f"grad_rho_{ax}"] = F0["grad"][i]
+        for li, p in zip(("p1", "p2"), pert):
+            uvals[f"rho_{li}"] = p["rho"]
+            uvals[f"tau_{li}"] = p["tau"]
+            uvals[f"lapl_rho_{li}"] = p["lapl"]
+            for i, ax in enumerate(AXES):
+                uvals[f"grad_rho_{li}_{ax}"] = p["grad"][i]
+        uexpr = fxc_bilinear(family)
+        usyms = sorted(uexpr.free_symbols, key=lambda s_: s_.name)
+        uref = m.w * float(np.sum(sp.lambdify(usyms, uexpr, "numpy")(
+            *[uvals[s_.name] for s_ in usyms])))
+        singlet = evaluate((+1, +1))
+        rel_s = abs(singlet - uref) / abs(uref)
+        ok_s = rel_s < 1e-12
+
+        # triplet vs antisymmetric-channel finite differences
+        spert = [{"a": {k: p[k] / 2 for k in ("rho", "grad", "tau")},
+                  "b": {k: -p[k] / 2 for k in ("rho", "grad", "tau")}}
+                 for p in pert]
+        triplet = evaluate((-1, -1))
+
+        def cross(h):
+            E = lambda a, b: spin_energy(m, func_ids, family,  # noqa
+                                         FS, spert, a, b)
+            return (E(h, h) - E(h, -h) - E(-h, h)
+                    + E(-h, -h)) / (4 * h * h)
+        fd = (4 * cross(H) - cross(2 * H)) / 3
+        rel_t = abs(triplet - fd) / max(1.0, abs(fd))
+        ok_t = rel_t < tol
+        print(f"  [{'OK ' if ok_s and ok_t else 'FAIL'}] st {family:10s}: "
+              f"singlet-vs-unpol {rel_s:.2e}, triplet-vs-fd {rel_t:.2e}")
+        fails += 0 if (ok_s and ok_t) else 1
+    return fails
+
+
 def main():
     m, F0, pert = make_setup()
     failures = 0
@@ -242,7 +322,8 @@ def main():
     for family, (func_ids, H, tol) in SPIN_FAMILIES.items():
         failures += validate_family_spin(ms, FS0, spert, family,
                                          func_ids, H, tol)
-    n = len(FAMILIES) + len(SPIN_FAMILIES)
+    failures += validate_st(m, F0, pert)
+    n = len(FAMILIES) + 2 * len(SPIN_FAMILIES)
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] bilinear_validate: {n} checks, "
           f"{failures} failures")

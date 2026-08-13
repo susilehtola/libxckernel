@@ -176,6 +176,56 @@ def fxc_bilinear_spin(family: str, l1: str = "p1",
     return sp.expand(total)
 
 
+def fxc_bilinear_st(family: str, parities: "Tuple[int, int]" = (+1, +1),
+                    l1: str = "p1", l2: str = "p2") -> sp.Expr:
+    """Closed-shell spin-adapted fxc bilinear: the polarized bilinear
+    at the spin-compensated point, with each perturbation carrying a
+    spin parity (+1 singlet-type, -1 triplet-type).  All fields and
+    perturbed fields in the result are ALPHA-channel quantities, and
+    the Libxc derivative components are the polarized ones evaluated
+    at the closed-shell density (rho/2, rho/2).  Mixed parities
+    vanish identically (checked by the validation suite); the
+    (-1, -1) combination is the triplet Casida XC kernel."""
+    from ..inputs.basis import AXES
+    from .fastpoly import from_expr, subs_signed, to_expr
+
+    if any(p not in (-1, +1) for p in parities):
+        raise ValueError("parities must be +1 (singlet) or -1 (triplet)")
+    b = fxc_bilinear_spin(family, l1, l2)
+    mapping = {}
+    for i in range(3):
+        mapping[GRAD["b"][i]] = (GRAD["a"][i], +1)
+    for base in ("rho", "lapl_rho", "tau"):
+        mapping[sp.Symbol(f"{base}_b", real=True)] = \
+            (sp.Symbol(f"{base}_a", real=True), +1)
+    for label, par in zip((l1, l2), parities):
+        for base in ("rho", "lapl_rho", "tau"):
+            mapping[sp.Symbol(f"{base}_b_{label}", real=True)] = \
+                (sp.Symbol(f"{base}_a_{label}", real=True), par)
+        for ax in AXES:
+            mapping[_pert_grad("b", label, ax)] = \
+                (_pert_grad("a", label, ax), par)
+    expr = to_expr(subs_signed(from_expr(b), mapping))
+
+    # closed-shell symmetry of the polarized derivative arrays: at the
+    # spin-compensated point, components related by a global a<->b
+    # exchange are equal; canonicalize to the lexicographically first
+    # partner so parity cancellations become identities (mixed-parity
+    # bilinears vanish symbolically).
+    from .spin import SCALARS
+    _swap = {"a": "b", "b": "a", "aa": "bb", "bb": "aa", "ab": "ab"}
+    canon = {}
+    for atom in expr.free_symbols:
+        scalars = _SYM_SCALARS.get(atom.name)
+        if scalars is None:
+            continue
+        partner = scalars_to_symbol(tuple(
+            SCALARS[(sc.group, _swap[sc.comp])] for sc in scalars))
+        if partner.name < atom.name:
+            canon[atom] = partner
+    return sp.expand(expr.subs(canon, simultaneous=True))
+
+
 def fxc_channels_spin(family: str,
                       label: str = "p1") -> "dict[str, sp.Expr]":
     """Per-point coefficient channels of the polarized fxc contraction
