@@ -151,6 +151,19 @@ radial-grid kernel through the same `calculate_paw_correction`
 machinery. Γ-only/molecular, FD mode: modest scope, immediate
 correctness payoff, exercises the response emitter end to end.
 
+**Status 2026-08-14:** phase 2a is DONE on the GPAW branch — the
+`PWKernel`-based semilocal (GGA) dielectric kernels including PAW
+corrections (the coefficient-field variant of `LocalPAWFTEngine`
+reproduces the ALDA pipeline at 3e-18), wired into
+`DielectricFunction(..., xc='APBE')`.  The library side now also
+carries the spin-polarized and closed-shell singlet/triplet fxc
+bilinears and channel splits (validated in `bilinear_validate`;
+singlet reproduces the unpolarized bilinear exactly), emitted into
+the generated GPAW module; triplet Casida wiring for lrtddft2 is in
+validation.  Remaining from the original plan: the tau channel of
+the periodic kernel (kinetic pair-density response functions in
+chi0) and spin-polarized host wiring.
+
 **Phase 2 — semilocal kernels for the dielectric/TDDFT path (the
 flagship).** A new `PWKernel` subclass that represents the generated
 GGA/mGGA kernel exactly: per-point coefficient fields (the u/v/τ
