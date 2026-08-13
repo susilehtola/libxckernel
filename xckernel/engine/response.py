@@ -191,6 +191,49 @@ def fxc_channels(family: str, label: str = "p1") -> "dict[str, sp.Expr]":
     return out
 
 
+#: derivative slots of the semilocal kernel operator: value, gradient
+#: components, and (tau families) the kinetic-energy density.
+FXC_SLOTS = ("rho", "x", "y", "z", "tau", "lapl")
+
+
+def _slot_symbol(slot: str, label: str) -> sp.Symbol:
+    if slot == "rho":
+        return sp.Symbol(f"rho_{label}", real=True)
+    if slot in ("x", "y", "z"):
+        return sp.Symbol(f"grad_rho_{label}_{slot}", real=True)
+    if slot == "tau":
+        return sp.Symbol(f"tau_{label}", real=True)
+    return sp.Symbol(f"lapl_rho_{label}", real=True)
+
+
+def fxc_coefficient_matrix(family: str) -> "dict[tuple[str, str], sp.Expr]":
+    """The semilocal fxc operator as a symmetric matrix of per-point
+    coefficient fields over the derivative slots,
+
+        B(d1, d2) = sum_ab c_ab(r) D_a[d1](r) D_b[d2](r),
+
+    with D in {1, d_x, d_y, d_z, tau, lapl}: c_ab = the second
+    derivative of the fxc bilinear with respect to the two slots.
+    This is the complete plane-wave representation of the kernel:
+    K_GG' = sum_ab fac_a(q+G)* ctilde_ab(G-G') fac_b(q+G') with
+    fac_rho = 1 and fac_i = i(q+G)_i.  Only nonzero entries are
+    returned."""
+    b = fxc_bilinear(family, l1="p1", l2="p2")
+    out = {}
+    for i, s1 in enumerate(FXC_SLOTS):
+        y1 = _slot_symbol(s1, "p1")
+        if not b.has(y1):
+            continue
+        for s2 in FXC_SLOTS:
+            y2 = _slot_symbol(s2, "p2")
+            if not b.has(y2):
+                continue
+            c = sp.expand(sp.diff(b, y1, y2))
+            if c != 0:
+                out[(s1, s2)] = c
+    return out
+
+
 def _seed_fn(func: Functional, label: str):
     """Monomial-level seed map for fastpoly.seeded_derivative."""
     from collections import Counter

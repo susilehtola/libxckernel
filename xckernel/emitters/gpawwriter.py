@@ -65,9 +65,30 @@ def _emit_function(family: str) -> str:
     return "\n".join(L)
 
 
+def _emit_coefficient_function(family: str) -> str:
+    from ..engine.response import fxc_coefficient_matrix
+    printer = NumPyPrinter()
+    m = fxc_coefficient_matrix(family)
+    names = sorted({s.name for e in m.values() for s in e.free_symbols})
+    L = [f"def fxc_coefficient_fields_{family}(ops):",
+         '    """Symmetric per-point coefficient fields c[(a, b)] of the',
+         "    semilocal fxc operator over the derivative slots",
+         "    ('rho', 'x', 'y', 'z'[, 'tau']): the plane-wave kernel is",
+         "    K_GG' = sum_ab fac_a(q+G)* FT[c_ab](G-G') fac_b(q+G')",
+         '    with fac_rho = 1 and fac_i = 1j (q+G)_i."""']
+    for n in names:
+        L.append(f"    {n} = ops['{n}']")
+    L.append("    c = {}")
+    for (a, b), e in sorted(m.items()):
+        L.append(f"    c[({a!r}, {b!r})] = {printer.doprint(e)}")
+    L.append("    return c")
+    return "\n".join(L)
+
+
 def emit_module() -> str:
     parts = [HEADER]
     parts.extend(_emit_function(f) for f in FAMILIES)
+    parts.extend(_emit_coefficient_function(f) for f in FAMILIES)
     return "\n\n".join(parts) + "\n"
 
 
