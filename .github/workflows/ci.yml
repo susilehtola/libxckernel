@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  validate:
+    name: validation suites (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: ci
+          create-args: >-
+            python=${{ matrix.python-version }}
+            libxc
+            pyscf
+            sympy
+            numpy
+            scipy
+            cmake
+            cxx-compiler
+            fortran-compiler
+          cache-environment: true
+      - name: Install
+        run: pip install -e . --no-deps
+      - name: Run validation suites
+        run: |
+          fail=0
+          for f in xckernel/tests/*validate*.py; do
+            m="xckernel.tests.$(basename "${f%.py}")"
+            echo "::group::$m"
+            if ! python -m "$m"; then
+              echo "FAILED: $m"
+              fail=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $fail
+
+  clib:
+    name: generated C library (${{ matrix.selection.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        selection:
+          - name: reduced
+            families: lda,gga,mgga_tau
+            order: 2
+          - name: full
+            families: lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga
+            order: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install generator dependencies
+        run: pip install sympy numpy
+      - name: Configure (generates the kernel tree)
+        run: >
+          cmake -S clib -B build
+          -DXCKERNEL_FAMILIES=${{ matrix.selection.families }}
+          -DXCKERNEL_MAX_ORDER=${{ matrix.selection.order }}
+      - name: Build
+        run: cmake --build build -j"$(nproc)"

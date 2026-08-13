@@ -195,6 +195,9 @@ docs/
 
 `sympy`, `numpy`; `pylibxc` for evaluating anything numerically. The test
 suites additionally use `pyscf` (reference values) and `scipy` (`expm`).
+Note that `pylibxc` is not installable from PyPI (the `pylibxc2` name
+there is an unrelated empty stub); it ships with Libxc itself, e.g. as
+the conda-forge `libxc` package or the Fedora `python3-libxc` RPM.
 
 ## License
 
