@@ -169,6 +169,28 @@ def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2") -> sp.Expr:
     return sp.expand(total)
 
 
+def fxc_channels(family: str, label: str = "p1") -> "dict[str, sp.Expr]":
+    """Per-point coefficient channels of the fxc contraction with ONE
+    perturbation: the derivative of the bilinear form with respect to
+    the second perturbation's operands.  Returns {'rho': u, 'grad_x':
+    v_x, ..., 'tau': w_tau (tau families only)}: the XC pair potential
+    is u - div(v) plus the tau-channel operator term, and a Casida
+    coupling element is sum_g w [u drho' + v . grad drho' + w_tau
+    dtau'] against a second perturbation's fields."""
+    b = fxc_bilinear(family, l1=label, l2="_q")
+    out = {"rho": sp.expand(sp.diff(b, sp.Symbol("rho__q", real=True)))}
+    for ax in AXES:
+        out[f"grad_{ax}"] = sp.expand(
+            sp.diff(b, sp.Symbol(f"grad_rho__q_{ax}", real=True)))
+    tau_q = sp.Symbol("tau__q", real=True)
+    if b.has(tau_q):
+        out["tau"] = sp.expand(sp.diff(b, tau_q))
+    lapl_q = sp.Symbol("lapl_rho__q", real=True)
+    if b.has(lapl_q):
+        out["lapl"] = sp.expand(sp.diff(b, lapl_q))
+    return out
+
+
 def _seed_fn(func: Functional, label: str):
     """Monomial-level seed map for fastpoly.seeded_derivative."""
     from collections import Counter
