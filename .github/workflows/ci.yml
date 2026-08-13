@@ -41,13 +41,16 @@ jobs:
           for f in xckernel/tests/*validate*.py; do
             m="xckernel.tests.$(basename "${f%.py}")"
             echo "::group::$m"
-            if ! python -m "$m"; then
-              echo "FAILED: $m"
+            rc=0
+            python -m "$m" || rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "FAILED: $m (rc=$rc)"
               fail=1
             fi
             echo "::endgroup::"
           done
-          exit $fail
+          echo "all suites done; fail=$fail"
+          exit "$fail"
 
   clib:
     name: generated C library (${{ matrix.selection.name }})
