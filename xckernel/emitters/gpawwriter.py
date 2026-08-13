@@ -85,10 +85,39 @@ def _emit_coefficient_function(family: str) -> str:
     return "\n".join(L)
 
 
+def _emit_spin_function(family: str) -> str:
+    from ..engine.spin_kernel import fxc_channels_spin
+    printer = NumPyPrinter()
+    ch = fxc_channels_spin(family)
+    names = sorted({s.name for e in ch.values() for s in e.free_symbols})
+    L = [f"def fxc_pair_coefficients_{family}_spin(ops):",
+         '    """Spin-polarized per-point coefficient channels of the',
+         "    fxc contraction with the pair fields labelled p1: keys",
+         "    'rho_a'/'rho_b' (local), 'grad_a'/'grad_b' (vector), and",
+         "    'tau_a'/'tau_b' (tau families).  Polarized Libxc arrays",
+         '    carry their flat component packing (v2rho2_0..)."""']
+    for n in names:
+        L.append(f"    {n} = ops['{n}']")
+    entries = []
+    for s in ("a", "b"):
+        L.append(f"    u_{s} = {printer.doprint(ch[f'rho_{s}'])}")
+        entries.append(f"'rho_{s}': u_{s}")
+        for ax in AXES:
+            L.append(f"    v_{s}_{ax} = "
+                     f"{printer.doprint(ch[f'grad_{s}_{ax}'])}")
+        entries.append(f"'grad_{s}': [v_{s}_x, v_{s}_y, v_{s}_z]")
+        if f"tau_{s}" in ch:
+            L.append(f"    w_{s} = {printer.doprint(ch[f'tau_{s}'])}")
+            entries.append(f"'tau_{s}': w_{s}")
+    L.append("    return {" + ", ".join(entries) + "}")
+    return "\n".join(L)
+
+
 def emit_module() -> str:
     parts = [HEADER]
     parts.extend(_emit_function(f) for f in FAMILIES)
     parts.extend(_emit_coefficient_function(f) for f in FAMILIES)
+    parts.extend(_emit_spin_function(f) for f in FAMILIES)
     return "\n\n".join(parts) + "\n"
 
 

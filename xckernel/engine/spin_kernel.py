@@ -176,6 +176,29 @@ def fxc_bilinear_spin(family: str, l1: str = "p1",
     return sp.expand(total)
 
 
+def fxc_channels_spin(family: str,
+                      label: str = "p1") -> "dict[str, sp.Expr]":
+    """Per-point coefficient channels of the polarized fxc contraction
+    with one perturbation: derivatives of the spin bilinear with
+    respect to the second perturbation's operands, keyed
+    'rho_a'/'rho_b', 'grad_a_x'/... and (tau families)
+    'tau_a'/'tau_b'.  The polarized counterpart of
+    response.fxc_channels."""
+    from ..inputs.basis import AXES
+    b = fxc_bilinear_spin(family, l1=label, l2="_q")
+    out = {}
+    for s in ("a", "b"):
+        out[f"rho_{s}"] = sp.expand(
+            sp.diff(b, sp.Symbol(f"rho_{s}__q", real=True)))
+        for ax in AXES:
+            out[f"grad_{s}_{ax}"] = sp.expand(
+                sp.diff(b, sp.Symbol(f"grad_rho_{s}__q_{ax}", real=True)))
+        tau_q = sp.Symbol(f"tau_{s}__q", real=True)
+        if b.has(tau_q):
+            out[f"tau_{s}"] = sp.expand(sp.diff(b, tau_q))
+    return out
+
+
 def _seed_fn_spin(family: str, label: str):
     """Monomial-level seed map for the spin engine (fastpoly)."""
     from .fastpoly import from_expr
