@@ -50,7 +50,10 @@ jobs:
             echo "::endgroup::"
           done
           echo "all suites done; fail=$fail"
-          exit "$fail"
+          # no explicit exit: the micromamba login-shell wrapper
+          # (bash -el) corrupts an explicit exit status via logout
+          # processing; the step verdict is this last command's status
+          test "$fail" -eq 0
 
   clib:
     name: generated C library (${{ matrix.selection.name }})
