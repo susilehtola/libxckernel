@@ -6,10 +6,14 @@ where the host is Python, and as compiled code elsewhere, with
 [Einsums](https://github.com/Einsums/Einsums) (J. Turney) as the common C++
 backend and a C ABI for Fortran hosts.
 
-Status: 2026-07-04, complete — incorporates the OpenMolcas source survey and
-the Einsums API survey, on top of the six-code survey
-(`dedup-analysis.md`) and the validated engine. The pattern-collapse
-lowering pass (phase 1) is implemented and verified.
+Status: **historical design document** (written 2026-07-04, when only the
+pattern-collapse lowering pass of phase 1 was implemented). The plan has
+since been carried out well past that point: the C backend and the compiled
+`libxckernel` package (phases 2–3), the Psi4 emitter (now emitting
+standalone `xcgen/*.inc` include files), and the VeloxChem writer are all
+complete and validated — see the README for current state. Kept for the
+OpenMolcas/Einsums survey material and the host-interface rationale;
+module paths predate the `inputs/`/`engine/`/`emitters/` layout split.
 
 ## 1. The deliverable: a finite kernel catalog
 

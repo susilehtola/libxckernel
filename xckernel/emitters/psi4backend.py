@@ -5,9 +5,11 @@ The interfaces-are-generated contract: the physics (which monomials, which
 coefficients, which functional-derivative arrays) lives in the symbolic
 tower and its collapsed einsum IR; this backend only rewrites operands
 into Psi4's naming and scaling conventions and prints the loop shapes that
-libfock uses. The emitted region is marked and reproducible; the
-surrounding plumbing (collocation, perturbed densities, GEMMs against
-scratch, scatter) stays host code.
+libfock uses. Each emitted region is a standalone machine-generated
+include file (written wholesale by `--emit-dir` into the Psi4 tree's
+`xcgen/` directory, where the host sources #include it); the surrounding
+plumbing (collocation, perturbed densities, GEMMs against scratch,
+scatter) stays host code.
 
 Conventions encoded here (established and validated against Psi4 in the
 mgga-vx work):

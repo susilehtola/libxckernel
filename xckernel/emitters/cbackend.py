@@ -1,4 +1,4 @@
-"""C backend: emit self-contained, table-driven C kernels (plan phase 3).
+"""C backend: emit self-contained, table-driven C kernels.
 
 Design: the largest kernels have >100k scalar monomials per coefficient sum;
 emitting them as inline expressions would defeat any compiler, and full CSE is

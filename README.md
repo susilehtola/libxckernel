@@ -1,5 +1,7 @@
 # libxckernel
 
+[![CI](https://github.com/susilehtola/libxckernel/actions/workflows/ci.yml/badge.svg)](https://github.com/susilehtola/libxckernel/actions/workflows/ci.yml)
+
 > The project (and the generated C library) is **libxckernel**;
 > the Python generator package imports as `xckernel`
 > (as `pylibxc` is to `libxc`).
@@ -160,7 +162,7 @@ fn = xk.compile_function(gen)   # live callable
 The generated functions take grid collocation data (`chi`, `dchi`, weights),
 ground-state and perturbed fields, and the named Libxc derivative arrays that
 `pylibxc` returns — see `xckernel/tests/pyscf_demo.py` and
-`tests/tda_validate.py` for complete wirings into PySCF.
+`xckernel/tests/tda_validate.py` for complete wirings into PySCF.
 
 ## Layout
 
@@ -217,8 +219,10 @@ Psi4 emitter backends, complex orbitals, the matrix-free two-sided mode, and
 the geometric derivatives with quadrature-grid response. The Psi4
 integration (meta-GGA TDDFT/CPKS/stability, GGA and meta-GGA nuclear
 Hessians, grid response) is available as
-[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458). A manuscript
-describing the library is in preparation.
+[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458); its generated
+regions are standalone include files, regenerated wholesale with
+`python -m xckernel.emitters.psi4backend --emit-dir <psi4>/psi4/src/psi4/libfock/xcgen`.
+A manuscript describing the library is in preparation.
 
 Not yet done: the exact-exchange energy density e_x(r) as a primitive
 ingredient (local hybrids; the density-Hessian calibration variable η is
