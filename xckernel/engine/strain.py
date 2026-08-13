@@ -218,6 +218,34 @@ def deform(expr: sp.Expr, func: Functional, order: int = 2) -> sp.Expr:
     return _trunc(expr.subs(subs, simultaneous=True), order)
 
 
+def scale_operands(expr: sp.Expr,
+                   factors: "dict[str, float]") -> sp.Expr:
+    """Translate operand normalization conventions.
+
+    ``factors`` maps an operand base name to the factor s such that
+    host_array = s * xckernel_operand; every matching symbol y (the
+    base name itself, or base name + label/component suffixes, e.g.
+    ``tau_tensor`` matches ``tau_tensor_xy`` and ``tau_tensor_p1_xy``)
+    is substituted by y/s, so the returned expression consumes the
+    host's arrays directly and every derivative coefficient absorbs
+    the conversion automatically.
+
+    Example: GPAW's kinetic-energy-density tensor omits the 1/2
+    (its trace is 2 tau), so an expression destined for GPAW arrays is
+    translated with ``scale_operands(expr, {"tau_tensor": 2.0})``.
+    The longest matching base name wins (``tau`` does not capture
+    ``tau_tensor_...``)."""
+    keys = sorted(factors, key=len, reverse=True)
+    subs = {}
+    for atom in expr.free_symbols:
+        for k in keys:
+            if atom.name == k or atom.name.startswith(k + "_"):
+                if factors[k] != 1:
+                    subs[atom] = atom / factors[k]
+                break
+    return expr.subs(subs, simultaneous=True)
+
+
 def strain_diff(expr: sp.Expr, func: Functional,
                 *components: "tuple[int, int]") -> sp.Expr:
     """d^n/d eps_{a1 b1} .. d eps_{an bn} of an integrand at eps = 0,

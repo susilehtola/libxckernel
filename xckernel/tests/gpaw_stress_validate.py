@@ -12,8 +12,9 @@ Operand map (spin-paired):
   vrho         = vt_sr[0]            sigma = sigma_xr[0]
   vsigma       = dedsigma_xr[0]      grad_rho_i = gradn_svr[0, i]
   tau          = taut_sr[0]          vtau = dedtaut_sr[0]
-  tau_tensor_w = interpolate(taut_swR[0, w]) / 2
-(GPAW's KED tensor carries no 1/2; xckernel's tau_tensor has trace tau.)
+  tau_tensor_w = interpolate(taut_swR[0, w])
+(GPAW's KED tensor carries no 1/2; the convention is declared through
+scale_operands({"tau_tensor": 2.0}) rather than hand-scaled arrays.)
 """
 try:
     import gpaw  # noqa: F401
@@ -24,7 +25,8 @@ except ImportError:
 import numpy as np
 import sympy as sp
 
-from ..engine.strain import strain_energy_derivative  # noqa: E402
+from ..engine.strain import (scale_operands,  # noqa: E402
+                             strain_energy_derivative)
 from ..inputs.basis import AXES, HESS_COMPS  # noqa: E402
 
 from ase.build import bulk  # noqa: E402
@@ -77,13 +79,14 @@ def run(xcname, family, ecut=340, shear=0.02):
         taut_swR = kwargs['taut_swR']
         for w, (i, j) in enumerate(HESS_COMPS):
             tt_r = interpolate(taut_swR[0, w])
-            vals[f'tau_tensor_{AXES[i]}{AXES[j]}'] = tt_r.data / 2.0
+            vals[f'tau_tensor_{AXES[i]}{AXES[j]}'] = tt_r.data
 
     dv = nt_sr.desc.dv
     s_ours = np.zeros((3, 3))
     for a in range(3):
         for b in range(3):
-            expr = strain_energy_derivative(family, a, b)
+            expr = scale_operands(strain_energy_derivative(family, a, b),
+                                  {'tau_tensor': 2.0})
             syms = sorted(expr.free_symbols, key=lambda s_: s_.name)
             fn = sp.lambdify(syms, expr, 'numpy')
             per_point = np.broadcast_to(fn(*[vals[s_.name] for s_ in syms]),

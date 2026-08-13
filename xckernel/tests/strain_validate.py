@@ -366,6 +366,29 @@ def validate_pert(model):
     return fails
 
 
+def validate_conventions():
+    """scale_operands: declaring host_array = s * operand and feeding
+    the host's scaled arrays must reproduce the native result exactly
+    (symbolic identity), with the longest base name winning (tau and
+    tau_tensor scaled independently)."""
+    from ..engine.strain import scale_operands
+
+    expr = strain_energy_derivative("mgga_tau", 0, 1) \
+        + strain_energy_derivative("mgga_tau", 1, 1)
+    scaled = scale_operands(expr, {"tau": 3.0, "tau_tensor": 2.0})
+    subs = {}
+    for s in scaled.free_symbols:
+        if s.name.startswith("tau_tensor"):
+            subs[s] = 2 * s
+        elif s.name == "tau" or s.name.startswith("tau_"):
+            subs[s] = 3 * s
+    diff = sp.simplify(scaled.subs(subs, simultaneous=True) - expr)
+    ok = diff == 0
+    print(f"  [{'OK ' if ok else 'FAIL'}] operand-convention scaling "
+          f"(tau x3, tau_tensor x2): exact symbolic identity")
+    return 0 if ok else 1
+
+
 def main():
     model = PWModel()
     failures = 0
@@ -375,8 +398,9 @@ def main():
         failures += validate_second(model, family, func_ids)
     failures += validate_eta(model)
     failures += validate_pert(model)
+    failures += validate_conventions()
     status = "OK " if failures == 0 else "FAIL"
-    print(f"[{status}] strain_validate: {len(FAMILIES) * 3 + 2} checks, "
+    print(f"[{status}] strain_validate: {len(FAMILIES) * 3 + 3} checks, "
           f"{failures} failures")
     return failures
 
