@@ -137,12 +137,40 @@ def _emit_triplet_function(family: str) -> str:
     return "\n".join(L)
 
 
+def _emit_stress_function(family: str) -> str:
+    from ..engine.strain import scale_operands, strain_energy_derivative
+    printer = NumPyPrinter()
+    comps = {}
+    for a in range(3):
+        for b in range(3):
+            comps[(a, b)] = scale_operands(
+                strain_energy_derivative(family, a, b),
+                {"tau_tensor": 2.0})
+    names = sorted({s.name for e in comps.values()
+                    for s in e.free_symbols})
+    L = [f"def xc_stress_fields_{family}(ops):",
+         '    """Per-point integrand fields of the explicit XC strain',
+         "    derivative dExc/deps_ab (the XC stress contribution",
+         "    BEFORE symmetrization and 1/V): the host multiplies by",
+         "    the quadrature weight and sums.  tau_tensor components",
+         "    follow GPAW's convention (no 1/2; trace = 2 tau), and zk",
+         '    is the per-particle Libxc energy density."""']
+    for n in names:
+        L.append(f"    {n} = ops['{n}']")
+    L.append("    s = {}")
+    for (a, b), e in sorted(comps.items()):
+        L.append(f"    s[({a}, {b})] = {printer.doprint(e)}")
+    L.append("    return s")
+    return "\n".join(L)
+
+
 def emit_module() -> str:
     parts = [HEADER]
     parts.extend(_emit_function(f) for f in FAMILIES)
     parts.extend(_emit_coefficient_function(f) for f in FAMILIES)
     parts.extend(_emit_spin_function(f) for f in FAMILIES)
     parts.extend(_emit_triplet_function(f) for f in FAMILIES)
+    parts.extend(_emit_stress_function(f) for f in FAMILIES)
     return "\n\n".join(parts) + "\n"
 
 
