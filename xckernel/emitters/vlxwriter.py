@@ -11,13 +11,15 @@ the real/imaginary decomposition, which is what makes them tens of
 thousands of lines long.
 
 This module emits those branches from the pairing table.  The product
-template per family is fixed by VeloxChem's generic contraction stage:
+template is fixed by VeloxChem's generic contraction stage and is stated
+ONCE, as :data:`PRODUCT_ROWS`; ``emit_branch`` walks it rather than
+restating it in control flow.  Each row is tied to the functional
+ingredient it serves, so which rows apply to a family follows from that
+family's ingredient set -- a tau family is data, not new branching.
 
-    gam    +=     rho_A rho_B            (both orderings)
-    gamK   += 2 * dK rho_A rho_B         (both orderings, K in xyz)
-    gamKL  +=     dK rho_A dL rho_B      (both orderings)
-
-complex products expand through VeloxChem's prod2_r/prod2_i helpers.
+Complex products expand through VeloxChem's prod2_r/prod2_i helpers,
+whose algebra is owned by :func:`..emitters.codegen.part_product`; only
+the helper NAMES are VeloxChem's, and they live in one table here.
 The pairing tables below follow the density layout documented in each
 python response driver's get_densities().
 """
@@ -68,35 +70,97 @@ MODES = {
 }
 
 
-def _gam_decl(n_out: int, gga: bool, ind: str) -> List[str]:
+def _gam_decl(n_out: int, rows, ind: str) -> List[str]:
+    """Declare the gam output slots each product row writes into.
+
+    The accessor name is ``gam`` suffixed with the slot's uppercased
+    Cartesian indices, which is exactly the row's axis structure."""
     lines = []
     for slot in range(n_out):
-        pos = f"{2 * n_out} * j + {2 * slot}" if n_out > 1 \
-            else f"2 * j"
-        pos_i = f"{2 * n_out} * j + {2 * slot + 1}" if n_out > 1 \
-            else f"2 * j + 1"
-        lines.append(f"{ind}auto gam{slot}_r = gam({pos});")
-        lines.append(f"{ind}auto gam{slot}_i = gam({pos_i});")
-        if gga:
-            for ax in AXES:
-                lines.append(f"{ind}auto gam{slot}_{ax}_r = "
-                             f"gam{ax.upper()}({pos});")
-                lines.append(f"{ind}auto gam{slot}_{ax}_i = "
-                             f"gam{ax.upper()}({pos_i});")
-            for a1 in AXES:
-                for a2 in AXES:
-                    lines.append(f"{ind}auto gam{slot}_{a1}{a2}_r = "
-                                 f"gam{a1.upper()}{a2.upper()}({pos});")
-                    lines.append(f"{ind}auto gam{slot}_{a1}{a2}_i = "
-                                 f"gam{a1.upper()}{a2.upper()}({pos_i});")
+        pos = f"{2 * n_out} * j + {2 * slot}" if n_out > 1 else "2 * j"
+        pos_i = (f"{2 * n_out} * j + {2 * slot + 1}" if n_out > 1
+                 else "2 * j + 1")
+        for row in rows:
+            for axes in _slot_axes(row):
+                sfx = "".join(axes)
+                acc = "gam" + "".join(a.upper() for a in axes)
+                name = f"gam{slot}" + (f"_{sfx}" if sfx else "")
+                lines.append(f"{ind}auto {name}_r = {acc}({pos});")
+                lines.append(f"{ind}auto {name}_i = {acc}({pos_i});")
     return lines
 
 
-#: VeloxChem pointwise helper realizing each plain-product decomposition
-#: row set of :func:`..emitters.codegen.part_product` (conjugate_left=False):
-#: prod2_r(ar,ai,br,bi) = ar*br - ai*bi, prod2_i = ar*bi + ai*br.
-_PROD_HELPER = {"re": "prod2_r", "im": "prod2_i"}
-_VLX_PART = {"r": "re", "i": "im"}
+#: VeloxChem's pointwise helpers, one row per part: (canonical part name
+#: as used by codegen.part_product, VeloxChem's tag for it, helper name).
+#: The decomposition itself -- prod2_r(ar,ai,br,bi) = ar*br - ai*bi and
+#: prod2_i = ar*bi + ai*br -- is owned by part_product; this table only
+#: names the helpers that realize it.
+_HELPERS = (("re", "r", "prod2_r"), ("im", "i", "prod2_i"))
+_VLX_PART = {tag: part for part, tag, _h in _HELPERS}
+_PROD_HELPER = {part: h for part, _tag, h in _HELPERS}
+#: VeloxChem's part tags, in emission order
+PARTS = tuple(tag for _p, tag, _h in _HELPERS)
+
+
+@dataclass(frozen=True)
+class ProductRow:
+    """One row of the generic contraction stage's product template.
+
+    ingredient: the functional ingredient this row serves; the row applies
+                to a family exactly when the family has that ingredient
+    naxes:      Cartesian indices carried by the output slot (0, 1 or 2)
+    factor:     prefactor in front of the symmetrized product
+    left/right: which field of each density enters, per side; the axes of
+                the slot are handed to the sides in order
+    """
+
+    ingredient: str
+    naxes: int
+    factor: float
+    left: str
+    right: str
+
+
+#: THE product template of VeloxChem's generic contraction stage:
+#:     gam    +=     rho_A rho_B            (both orderings)
+#:     gamK   += 2 * dK rho_A rho_B         (both orderings, K in xyz)
+#:     gamKL  +=     dK rho_A dL rho_B      (both orderings)
+#: stated here only.
+PRODUCT_ROWS = (
+    ProductRow("rho",   0, 1.0, "rho",  "rho"),
+    ProductRow("sigma", 1, 2.0, "grad", "rho"),
+    ProductRow("sigma", 2, 1.0, "grad", "grad"),
+)
+
+
+def rows_for(family: str):
+    """The product rows a family needs, from its ingredient set."""
+    from ..inputs.functional import Functional
+    have = {i.name for i in Functional.of_family(family).ingredients}
+    rows = tuple(r for r in PRODUCT_ROWS if r.ingredient in have)
+    missing = have - {r.ingredient for r in PRODUCT_ROWS}
+    if missing:
+        raise NotImplementedError(
+            f"family {family!r} needs ingredient(s) {sorted(missing)}, for "
+            "which no VeloxChem product rows are declared; add them to "
+            "PRODUCT_ROWS together with the matching gam accessors")
+    return rows
+
+
+def _slot_axes(row: ProductRow):
+    """The Cartesian index tuples a row's output slot ranges over."""
+    if row.naxes == 0:
+        return ((),)
+    if row.naxes == 1:
+        return tuple((a,) for a in AXES)
+    return tuple((a1, a2) for a1 in AXES for a2 in AXES)
+
+
+def _field(kind: str, label: str, axes) -> str:
+    """The split-storage field stem for one side of a product."""
+    if kind == "rho":
+        return f"rho{label}"
+    return f"{kind}{label}_{axes[0]}"
 
 
 def prod_expansion(part: str) -> str:
@@ -131,11 +195,13 @@ def _accum(target: str, factor: float, part: str,
 def emit_branch(mode: str, family: str, indent: int = 8) -> str:
     """The full quadMode branch body for DensityProdFor{LDA,GGA}."""
     spec = MODES[mode.upper()]
-    gga = {"lda": False, "gga": True}[family]
+    rows = rows_for(family)
     ind0 = " " * indent
     ind1 = ind0 + " " * 4
     ind2 = ind1 + " " * 4
-    ind3 = ind2 + " " * 4
+
+    #: which per-density fields the rows reference at all
+    kinds = {k for row in rows for k in (row.left, row.right)}
 
     nden = 2 * len(spec.densities)   # real slots per block
     lines = [f"{ind0}// generated by xckernel vlxwriter: mode {spec.name}, "
@@ -143,39 +209,35 @@ def emit_branch(mode: str, family: str, indent: int = 8) -> str:
              f"{ind0}for (int j = 0; j < numdens / {2 * spec.n_out}; j++)",
              ind0 + "{"]
     for k, lbl in enumerate(spec.densities):
-        for part, off in (("r", 0), ("i", 1)):
+        for part, off in zip(PARTS, (0, 1)):
             lines.append(f"{ind1}auto rho{lbl}_{part} = "
                          f"rwDensityGrid.alphaDensity"
                          f"({nden} * j + {2 * k + off});")
-            if gga:
+            if "grad" in kinds:
                 for ax in AXES:
                     lines.append(f"{ind1}auto grad{lbl}_{ax}_{part} = "
                                  f"rwDensityGrid.alphaDensityGradient"
                                  f"{ax.upper()}({nden} * j + {2 * k + off});")
         lines.append("")
-    lines += _gam_decl(spec.n_out, gga, ind1)
+    lines += _gam_decl(spec.n_out, rows, ind1)
     lines.append("")
     lines.append(f"{ind1}for (int i = 0; i < npoints; i++)")
     lines.append(ind1 + "{")
     for p in spec.pairs:
-        A, B, s = p.a, p.b, p.out
-        for part in ("r", "i"):
-            lines += _accum(f"gam{s}_{part}", p.factor, part,
-                            f"rho{A}", f"rho{B}",
-                            f"rho{B}", f"rho{A}", ind2)
-        if not gga:
-            continue
-        for ax in AXES:
-            for part in ("r", "i"):
-                lines += _accum(f"gam{s}_{ax}_{part}", 2.0 * p.factor, part,
-                                f"grad{A}_{ax}", f"rho{B}",
-                                f"grad{B}_{ax}", f"rho{A}", ind2)
-        for a1 in AXES:
-            for a2 in AXES:
-                for part in ("r", "i"):
-                    lines += _accum(f"gam{s}_{a1}{a2}_{part}", p.factor, part,
-                                    f"grad{A}_{a1}", f"grad{B}_{a2}",
-                                    f"grad{B}_{a1}", f"grad{A}_{a2}", ind2)
+        A, B, s_ = p.a, p.b, p.out
+        for row in rows:
+            for axes in _slot_axes(row):
+                sfx = "".join(axes)
+                target = f"gam{s_}" + (f"_{sfx}" if sfx else "")
+                # the slot's axes are handed to the sides in order
+                la = axes[:1] if row.left == "grad" else ()
+                ra = axes[-1:] if row.right == "grad" else ()
+                for part in PARTS:
+                    lines += _accum(
+                        f"{target}_{part}", row.factor * p.factor, part,
+                        _field(row.left, A, la), _field(row.right, B, ra),
+                        _field(row.left, B, la), _field(row.right, A, ra),
+                        ind2)
     lines.append(ind1 + "}")
     lines.append(ind0 + "}")
     return "\n".join(lines)
