@@ -348,10 +348,92 @@ def main():
     check("4C d2E/dlambda2 vs generated fxc kernel",
           abs(fd2 - an2) / abs(an2), 1e-7)
 
+    # 6. the emitted C++ against the NumPy reference ---------------------------
+    cxx_err = _check_cxx(V4, fn4, uvals, ns)
+    if cxx_err is None:
+        print("  [SKIP] emitted C++ vs NumPy (no C++ compiler)")
+    else:
+        check("emitted C++ vs NumPy (vxc, fxc contraction)", cxx_err, 1e-12)
+
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] noncollinear_validate: {tested} checks, "
           f"{failures} failures")
     return failures
+
+
+def _check_cxx(V, fnab, uvals, ns):
+    """Compile the emitted C++ header and compare its GGA potential and
+    kernel contraction against the NumPy path at one grid point.  Returns
+    the max relative deviation, or None when no compiler is available."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    cxx = shutil.which("g++") or shutil.which("clang++")
+    if cxx is None:
+        return None
+
+    from ..emitters.ncwriter import emit_cxx
+    fnames = _field_names("gga")
+    args1 = _params("gga", 1)
+    args2 = _params("gga", 2)
+
+    rng = np.random.default_rng(5)
+    pt = 0                                   # compare at one grid point
+    u = uvals("gga", V, fnab)
+    lx1 = _deriv_arrays(libxc_args("gga", 1), u)
+    lx2 = _deriv_arrays(libxc_args("gga", 2), u)
+    trial = [rng.standard_normal(len(V[0])) for _ in fnames]
+
+    vals = {n: float(a[pt]) for n, a in zip(fnames, V)}
+    vals.update({k: float(v[pt]) for k, v in lx1.items()})
+    vals.update({k: float(v[pt]) for k, v in lx2.items()})
+    vals["f_nabla"] = float(fnab[pt])
+    tvals = {f"t{n}": float(t[pt]) for n, t in zip(fnames, trial)}
+
+    n = len(fnames)
+    with tempfile.TemporaryDirectory() as d:
+        with open(f"{d}/nc.hpp", "w") as f:
+            f.write(emit_cxx(("gga",)))
+        argv = ", ".join(repr(vals[a]) for a in args1)
+        argw = ", ".join(repr(vals[a]) for a in args2)
+        argt = ", ".join(repr(tvals[f"t{q}"]) for q in fnames)
+        src = f'''#include "nc.hpp"
+#include <cstdio>
+int main() {{
+  double v[{n}], k[{n}];
+  xckernel::nc_vxc_gga({argv}, {", ".join(f"v[{i}]" for i in range(n))});
+  xckernel::nc_fxc_contract_gga({argw}, {argt},
+    {", ".join(f"k[{i}]" for i in range(n))});
+  for (int i = 0; i < {n}; ++i) printf("%.17e %.17e\\n", v[i], k[i]);
+  return 0;
+}}
+'''
+        with open(f"{d}/main.cpp", "w") as f:
+            f.write(src)
+        r = subprocess.run([cxx, "-std=c++17", "-O2", "-I", d,
+                            f"{d}/main.cpp", "-o", f"{d}/a.out"],
+                           capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError("generated C++ failed to compile:\n"
+                               + r.stderr[:2000])
+        out = subprocess.run([f"{d}/a.out"], capture_output=True, text=True,
+                             check=True).stdout.split()
+
+    got_v = np.array([float(x) for x in out[0::2]])
+    got_k = np.array([float(x) for x in out[1::2]])
+
+    fn_v = ns["nc_vxc_gga"]
+    ref_v = np.array([r[pt] for r in _call(fn_v, args1, {
+        **{n_: a for n_, a in zip(fnames, V)}, **lx1, "f_nabla": fnab})])
+    fn_c = ns["nc_fxc_gga"]
+    C = _call(fn_c, args2, {**{n_: a for n_, a in zip(fnames, V)},
+                            **lx2, "f_nabla": fnab})
+    ref_k = np.einsum("ijg,jg->ig", C, np.array(trial))[:, pt]
+
+    scale = max(np.abs(ref_v).max(), np.abs(ref_k).max(), 1e-30)
+    return float(max(np.abs(got_v - ref_v).max(),
+                     np.abs(got_k - ref_k).max()) / scale)
 
 
 def _field_names(family):
