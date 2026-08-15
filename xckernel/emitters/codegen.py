@@ -224,6 +224,7 @@ class GeneratedFunction:
     pert_grads: List[str] = None      # perturbation labels needing grad_rho_pN
     pert_scalars: List[str] = None    # perturbed scalar field parameter names
     batch: bool = False               # perturbed operands carry a batch axis
+    part: str = None                  # split-storage output part, if any
 
 
 def _iter_terms(ki: KernelIntegrand):
@@ -547,6 +548,24 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
 #: basis arrays that gain a conjugated companion in sesquilinear emission.
 _SESQUI_BASES = ("chi", "dchi", "lapl_chi", "hess_chi")
 
+#: Re/Im decomposition of a complex product a*b (plain) or conj(a)*b
+#: (conjugate_left): rows (sign, part of a, part of b) such that
+#: part(product) = sum sign * a_part * b_part.  The single source of truth
+#: for every split-storage lowering: the part-extracted matrix emission
+#: below and the pointwise complex products of the VeloxChem writer.
+_PART_PRODUCT = {
+    ("re", False): ((1, "re", "re"), (-1, "im", "im")),
+    ("im", False): ((1, "re", "im"), (1, "im", "re")),
+    ("re", True): ((1, "re", "re"), (1, "im", "im")),
+    ("im", True): ((1, "re", "im"), (-1, "im", "re")),
+}
+
+
+def part_product(part: str, conjugate_left: bool):
+    """Decomposition rows (sign, left part, right part) of the real or
+    imaginary part of a complex product; see :data:`_PART_PRODUCT`."""
+    return _PART_PRODUCT[(part, bool(conjugate_left))]
+
 
 def _side_factor(fac: str, suffix: str, why: str) -> str:
     """A basis factor code with a side suffix, e.g. chi -> chi_l."""
@@ -561,7 +580,9 @@ def _side_factor(fac: str, suffix: str, why: str) -> str:
 def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                        batch: bool = False,
                        sesquilinear: bool = False,
-                       two_sided: bool = False) -> GeneratedFunction:
+                       two_sided: bool = False,
+                       part: str = None,
+                       input_parts: Dict[str, str] = None) -> GeneratedFunction:
     """Pattern-collapsed NumPy emission (the production lowering).
 
     Every monomial of a one-free-pair integrand factorizes as
@@ -570,12 +591,31 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     collapse() for the structured intermediate shared with other backends.
 
     With ``sesquilinear=True`` (complex basis functions), the free pair
-    contracts the CONJUGATED basis values on the u side: the emitted function
-    takes companion arrays ``chi_c`` (= conj(chi)), ``dchi_c``, ... after
-    each plain basis array, accumulates in complex arithmetic, and returns
+    contracts the CONJUGATED basis values on the u side, returning
     ``F_uv = dE/dP_uv`` for the convention ``rho = sum_uv P_uv chi_u^* chi_v``.
     The per-point scalar coefficients are untouched: all ingredient fields of
     a Hermitian density matrix remain real for a complex basis as well.
+    The RECOMMENDED storage convention for complex quantities is separate
+    real and imaginary arrays (``part`` below); the interleaved-complex
+    lowering (``part=None``), which takes companion arrays ``chi_c``
+    (= conj(chi)), ``dchi_c``, ... after each plain basis array and
+    accumulates in complex arithmetic, is kept for hosts with native
+    complex storage.
+
+    With ``part`` in ``{'re', 'im', 'both'}`` (requires ``sesquilinear``),
+    the emission switches to SPLIT STORAGE: every basis array is passed as
+    separate real and imaginary parts (``chi_re``, ``chi_im``, ...), the
+    requested part of the output matrix is accumulated in real arithmetic,
+    and each basis-pair pattern lowers to two real matrix products instead
+    of one complex one (four real products' work) -- 50% fewer
+    multiplications when a single part is requested, identical work but
+    real-arithmetic-only when both are.  ``input_parts`` maps a basis array
+    base (e.g. ``'chi'``) to ``'re'`` or ``'im'`` when that operand is known
+    purely real or imaginary: its zero part is eliminated at generation
+    time, only the surviving array is taken as a parameter, and pattern
+    terms touching the zero part are dropped (a real basis reduces the Re
+    output to single real products and empties the Im output).
+    ``part='both'`` returns the tuple ``(out_re, out_im)``.
 
     With ``two_sided=True``, the u and v sides take INDEPENDENT collocation
     arrays (``chi_l``/``chi_r``, ``dchi_l``/``dchi_r``, ...), and the output
@@ -589,19 +629,46 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     if sesquilinear and two_sided:
         raise ValueError("sesquilinear and two_sided are mutually exclusive; "
                          "two_sided callers pass conjugated left arrays")
+    if part is not None:
+        if part not in ("re", "im", "both"):
+            raise ValueError(f"unknown part {part!r}")
+        if not sesquilinear:
+            raise ValueError("part extraction applies to the sesquilinear "
+                             "(complex-basis) emission; pass sesquilinear="
+                             "True")
+    elif input_parts:
+        raise ValueError("input_parts requires part extraction")
+    input_parts = dict(input_parts or {})
+    for base, msk in input_parts.items():
+        if base not in _SESQUI_BASES or msk not in ("re", "im"):
+            raise ValueError(f"bad input_parts entry {base!r}: {msk!r}")
+
+    def _mask(fac: str) -> Tuple[str, ...]:
+        m = input_parts.get(fac.split("[", 1)[0])
+        return ("re", "im") if m is None else (m,)
+
     ck = collapse(ki)
     u_lbl, v_lbl = ck.u_lbl, ck.v_lbl
     libxc_args = ck.libxc_args
     pert_grads, pert_scalars = ck.pert_grads, ck.pert_scalars
     uses, params, n_terms = ck.uses, ck.params, ck.n_terms
 
-    if sesquilinear:
+    if sesquilinear and part is None:
         for ufac, _vfac, _monos in ck.patterns:
             _side_factor(ufac, "_c", "sesquilinear")   # reject early
         params = list(params)
         for base in reversed(_SESQUI_BASES):
             if base in params:
                 params.insert(params.index(base) + 1, base + "_c")
+    if part is not None:
+        for ufac, vfac, _monos in ck.patterns:
+            _side_factor(ufac, "_re", "split")         # reject early
+            _side_factor(vfac, "_re", "split")
+        params = list(params)
+        for base in reversed(_SESQUI_BASES):
+            if base in params:
+                i = params.index(base)
+                params[i:i + 1] = [base + "_" + p for p in _mask(base)]
     if two_sided:
         for ufac, vfac, _monos in ck.patterns:
             _side_factor(ufac, "_l", "two-sided")      # reject early
@@ -670,14 +737,64 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
     # CPython's fixed compiler recursion cap (<= 3.13).
     _CHUNK = 64
 
+    #: output array name per requested part
+    outs = [(part, "out")] if part in ("re", "im") else \
+        [("re", "out_re"), ("im", "out_im")]
+
+    def _gemm(ucode, vcode):
+        if batch:
+            return (f"np.einsum('ug,xg,vg->xuv', {ucode}, "
+                    f"c, {vcode}, optimize=True)")
+        return f"({ucode} * c) @ {vcode}.T"
+
     lines: List[str] = []
     for k, sign in plan:
         ufac, vfac, monos = ck.patterns[k]
-        parts = [" + ".join(mono_code(coeff, fac) for coeff, fac in
-                            monos[i:i + _CHUNK])
-                 for i in range(0, len(monos), _CHUNK)]
-        lines.append(f"    c = {parts[0]}")
-        lines.extend(f"    c += {p}" for p in parts[1:])
+
+        if part is not None:
+            # split-storage lowering: the requested part of the (u-side
+            # conjugated) pattern product from real matrix products, with
+            # terms touching a statically-zero operand part eliminated
+            umask, vmask = _mask(ufac), _mask(vfac)
+            terms = {}
+            for p, out_name in outs:
+                terms[p] = [
+                    (s, _side_factor(ufac, "_" + lp, "split"),
+                     _side_factor(vfac, "_" + rp, "split"))
+                    for s, lp, rp in part_product(p, True)
+                    if lp in umask and rp in vmask]
+            if not any(terms.values()):
+                continue                     # pattern is identically zero
+        chunks = [" + ".join(mono_code(coeff, fac) for coeff, fac in
+                             monos[i:i + _CHUNK])
+                  for i in range(0, len(monos), _CHUNK)]
+        lines.append(f"    c = {chunks[0]}")
+        lines.extend(f"    c += {p}" for p in chunks[1:])
+
+        if part is not None:
+            tT = "np.transpose(t, (0, 2, 1))" if batch else "t.T"
+            for p, out_name in outs:
+                if not terms[p]:
+                    continue
+                if sign is None:
+                    for s, a, b in terms[p]:
+                        lines.append(f"    {out_name} "
+                                     f"{'+' if s > 0 else '-'}= {_gemm(a, b)}")
+                else:
+                    s0, a0, b0 = terms[p][0]
+                    lines.append(f"    t = {'-' if s0 < 0 else ''}"
+                                 f"{_gemm(a0, b0)}")
+                    for s, a, b in terms[p][1:]:
+                        lines.append(f"    t {'+' if s > 0 else '-'}= "
+                                     f"{_gemm(a, b)}")
+                    lines.append(f"    {out_name} += t")
+                    # the fused partner adds sign * t^dagger, whose real
+                    # part is +t_re^T and imaginary part is -t_im^T
+                    ts = sign if p == "re" else -sign
+                    lines.append(f"    {out_name} "
+                                 f"{'+' if ts > 0 else '-'}= {tT}")
+            continue
+
         if sesquilinear:
             ucode, vcode = _side_factor(ufac, "_c", "sesquilinear"), vfac
         elif two_sided:
@@ -685,13 +802,11 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
             vcode = _side_factor(vfac, "_r", "two-sided")
         else:
             ucode, vcode = ufac, vfac
+        gemm = _gemm(ucode, vcode)
         if batch:
-            gemm = (f"np.einsum('ug,xg,vg->xuv', {ucode}, "
-                    f"c, {vcode}, optimize=True)")
             tr = ("np.conjugate(np.transpose(t, (0, 2, 1)))"
                   if sesquilinear else "np.transpose(t, (0, 2, 1))")
         else:
-            gemm = f"({ucode} * c) @ {vcode}.T"
             tr = "t.conj().T" if sesquilinear else "t.T"
         if sign is None:
             lines.append(f"    out += {gemm}")
@@ -711,29 +826,39 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         header += ["    nl = chi_l.shape[0]",
                    "    nr = chi_r.shape[0]"]
         shape, dtype = "(nl, nr)", ", dtype=np.result_type(chi_l, chi_r)"
+    elif part is not None:
+        bsrc = next(p for p in params
+                    if p.rsplit("_", 1)[0] in _SESQUI_BASES)
+        header += [f"    nao = {bsrc}.shape[-2]"]
+        shape, dtype = "(nao, nao)", ""
     else:
         header += ["    nao = chi.shape[0]"]
         shape = "(nao, nao)"
         dtype = ", dtype=complex" if sesquilinear else ""
+    out_names = [name for _p, name in outs] if part is not None else ["out"]
     if batch:
         if not (pert_scalars or pert_grads):
             raise ValueError("batch=True requires perturbed-field operands")
         nx_src = pert_scalars[0] if pert_scalars \
             else f"grad_rho_{pert_grads[0]}"
-        header += [f"    nx = {nx_src}.shape[0]",
-                   f"    out = np.zeros((nx,) + {shape}{dtype})"
+        header += [f"    nx = {nx_src}.shape[0]"]
+        header += [f"    {name} = np.zeros((nx,) + {shape}{dtype})"
                    if two_sided else
-                   f"    out = np.zeros((nx, nao, nao){dtype})"]
+                   f"    {name} = np.zeros((nx, nao, nao){dtype})"
+                   for name in out_names]
     else:
-        header += [f"    out = np.zeros({shape}{dtype})"]
-    source = "\n".join(header + lines + ["    return out", ""])
+        header += [f"    {name} = np.zeros({shape}{dtype})"
+                   for name in out_names]
+    source = "\n".join(header + lines
+                       + [f"    return {', '.join(out_names)}", ""])
 
     return GeneratedFunction(
         name=func_name, source=source, out_indices=u_lbl + v_lbl,
         libxc_args=libxc_args, uses_lapl_chi=("lapl" in uses),
         uses_grad_rho=("grad" in uses),
         uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses),
-        pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch)
+        pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch,
+        part=part)
 
 
 def compile_function(gen: GeneratedFunction):

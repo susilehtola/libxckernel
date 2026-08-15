@@ -225,6 +225,54 @@ def main():
                 print(f"  [{'OK' if ok else 'FAIL'}] {fam:9s} spin {spin} "
                       f"B_{'xyz'[sidx]}: max rel {err:.2e}")
 
+    # --- split-storage retrofit: only the imaginary part of the Fock moves
+    # with B at a real reference, so the part='im' emission halves the work
+    # of the finite-difference reference (two real matrix products per
+    # pattern instead of one complex product): 2c * FD[Im F](B_s) = K^s.
+    for fam in ("gga", "mgga"):
+        s = 1
+        ki = fock(fam)
+        gim = generate_collapsed(ki, "sqi", sesquilinear=True, part="im")
+        fnim = compile_function(gim)
+
+        def Fim_at(x):
+            Bv = np.zeros(3)
+            Bv[s] = x
+            chiB, dchiB, laplB = _phased(Bv, R, rg, chi, dchi, lapl_chi)
+            rho, grad, sigma, tau, lapl = _fields(P, chiB, dchiB, laplB)
+            lx = _deriv_arrays(gim.libxc_args, (rho, sigma, lapl, tau))
+            args = {"w": w, "chi_re": chiB.real, "chi_im": chiB.imag,
+                    "dchi_re": dchiB.real, "dchi_im": dchiB.imag,
+                    "lapl_chi_re": laplB.real, "lapl_chi_im": laplB.imag,
+                    "grad_rho": grad, **lx}
+            sig = gim.source.split("(", 1)[1].split(")", 1)[0]
+            return fnim(*[args[p.strip()] for p in sig.split(",")])
+
+        kig = london_fock(fam, s)
+        geng = generate_collapsed(kig, "Kg")
+        fng = compile_function(geng)
+        chiB0, dchiB0, laplB0 = _phased(np.zeros(3), R, rg, chi, dchi,
+                                        lapl_chi)
+        rho, grad, sigma, tau, lapl = _fields(P, chiB0, dchiB0, laplB0)
+        lx = _deriv_arrays(geng.libxc_args, (rho, sigma, lapl, tau))
+        args = {"w": w, "chi": chi, "dchi": dchi, "lapl_chi": lapl_chi,
+                "Rchi": Rchi, "Rdchi": Rdchi, "Rlapl_chi": Rlapl,
+                "rg": rg, "grad_rho": grad, **lx}
+        sig = geng.source.split("(", 1)[1].split(")", 1)[0]
+        K = fng(*[args[p.strip()] for p in sig.split(",")])
+
+        h = 1e-4
+        d1 = (Fim_at(h) - Fim_at(-h)) / (2 * h)
+        d2 = (Fim_at(2 * h) - Fim_at(-2 * h)) / (4 * h)
+        fd = (4 * d1 - d2) / 3
+        err = np.abs(2 * C_AU * fd - K).max() / max(np.abs(K).max(), 1e-14)
+        tested += 1
+        ok = err < 1e-7
+        if not ok:
+            failures += 1
+        print(f"  [{'OK' if ok else 'FAIL'}] {fam:9s} B_{'xyz'[s]} "
+              f"im-part reference: max rel {err:.2e}")
+
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] london_validate: {tested} checks, {failures} failures")
     return failures

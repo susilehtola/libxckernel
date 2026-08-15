@@ -92,9 +92,28 @@ def _gam_decl(n_out: int, gga: bool, ind: str) -> List[str]:
     return lines
 
 
+#: VeloxChem pointwise helper realizing each plain-product decomposition
+#: row set of :func:`..emitters.codegen.part_product` (conjugate_left=False):
+#: prod2_r(ar,ai,br,bi) = ar*br - ai*bi, prod2_i = ar*bi + ai*br.
+_PROD_HELPER = {"re": "prod2_r", "im": "prod2_i"}
+_VLX_PART = {"r": "re", "i": "im"}
+
+
+def prod_expansion(part: str) -> str:
+    """The expanded expression a helper must implement, from the shared
+    decomposition table -- pinned against the emitted helper calls by the
+    validation suite."""
+    from .codegen import part_product
+    rows = part_product(_VLX_PART[part], conjugate_left=False)
+    return " ".join(f"{'+' if s > 0 else '-'} a_{lp[:1]}*b_{rp[:1]}"
+                    for s, lp, rp in rows).lstrip("+ ")
+
+
 def _prod(part: str, fa: str, fb: str) -> str:
-    """prod2_{part} of two complex fields given by their stem names."""
-    return (f"prod2_{part}({fa}_r[i],{fa}_i[i],{fb}_r[i],{fb}_i[i])")
+    """The ``part`` of the plain complex product fa*fb of two split-storage
+    fields, emitted as the VeloxChem helper call for that decomposition."""
+    helper = _PROD_HELPER[_VLX_PART[part]]
+    return (f"{helper}({fa}_r[i],{fa}_i[i],{fb}_r[i],{fb}_i[i])")
 
 
 def _fmt_factor(x: float) -> str:

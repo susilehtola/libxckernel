@@ -87,7 +87,11 @@ factor of dF/dB_s = (i/2c) K_s at a real reference. Every kernel
 ships with a machine-readable manifest declaring its operands and shapes,
 the Libxc arrays it consumes by name, and its term ownership. Beyond the
 catalog: complex orbitals and complex basis functions (sesquilinear
-emission), a matrix-free two-sided mode that emits σ-vector contractions
+emission, with split Re/Im storage as the recommended layout: the
+requested part of the output is accumulated in real arithmetic, at half
+the multiplication count when one part suffices, and operands declared
+purely real or imaginary have their zero parts eliminated at generation
+time), a matrix-free two-sided mode that emits σ-vector contractions
 from MO-pair collocation, and nuclear derivatives of the XC contribution
 including the full quadrature-grid response (`geometric.py`).
 
@@ -133,6 +137,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | complex orbitals/basis (sesquilinear) | LDA–mGGA | R | FD in complex P | machine ε |
+| split-storage Re/Im parts | LDA–mGGA | R | complex path | machine ε |
 | two-sided (matrix-free) σ | LDA–mGGA | R | AO-route kernels | machine ε |
 | current-density (τ̃, jp seeds) | cmgga_tau | R + U + s/t | FD in general M | ~1e-12 |
 | density-Hessian (η) | hmgga | R + U + s/t | FD in general M | ~1e-11 |
