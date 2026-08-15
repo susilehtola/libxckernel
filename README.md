@@ -138,6 +138,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | complex orbitals/basis (sesquilinear) | LDA–mGGA | R | FD in complex P | machine ε |
 | split-storage Re/Im parts | LDA–mGGA | R | complex path | machine ε |
+| noncollinear/relativistic (4C) vxc + fxc | LDA/GGA | locally collinear | FD in 4C spinor DM | ~1e-8 |
 | two-sided (matrix-free) σ | LDA–mGGA | R | AO-route kernels | machine ε |
 | current-density (τ̃, jp seeds) | cmgga_tau | R + U + s/t | FD in general M | ~1e-12 |
 | density-Hessian (η) | hmgga | R + U + s/t | FD in general M | ~1e-11 |
@@ -187,7 +188,10 @@ xckernel/
     spin.py          spin-resolved ingredients, seeds, component packing
     spin_kernel.py   open-shell tower, singlet/triplet parities
     geometric.py     nuclear derivatives incl. quadrature-grid response
+    strain.py        cell-deformation (strain) seeds from the master law
     london.py        explicit magnetic-field derivatives (London orbitals)
+    noncollinear.py  locally collinear map: noncollinear/relativistic
+                     potential and fxc (4C/2C response kernels)
     mo.py            AO->MO helpers: orbital gradient (kappa sign!) and Hessian
     algebra.py       response algebra: DM builders, projections, sigma templates
   emitters/        what comes out: shared IR + code generators
@@ -197,6 +201,8 @@ xckernel/
     cbackend.py      C library emitter (static tables + fixed evaluator)
     psi4backend.py   Psi4 host-idiom emitter (xcgen include files)
     vlxwriter.py     VeloxChem writer plugin
+    gpawwriter.py    GPAW pair-coefficient/stress-field emitter
+    ncwriter.py      noncollinear (relativistic) kernel emitter
     release.py       self-contained C source package assembly
   catalog.py       the 156-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
@@ -231,7 +237,11 @@ A manuscript describing the library is in preparation.
 
 Not yet done: the exact-exchange energy density e_x(r) as a primitive
 ingredient (local hybrids; the density-Hessian calibration variable η is
-already in); noncollinear spin; matrix-form (commutator-algebra) lowering of
+already in); the noncollinear tau channel (the lda/gga noncollinear and
+four-component relativistic kernels are in, via the locally collinear
+map; the tau channel awaits a noncollinear KED definition, and native
+noncollinear functionals await the next major Libxc release); matrix-form
+(commutator-algebra) lowering of
 the response σ assembly; active-space (MCSCF-type) gradient projector;
 spin-basis (`ud2ts`) transformation maps; rank-1 (occupation × orbital)
 density-matrix form. Hybrid/range-separated exchange remains host-owned, and
