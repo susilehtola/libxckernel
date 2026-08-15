@@ -124,12 +124,18 @@ SPECS = (_channels, _coefficient_fields, _spin_channels, _triplet_channels,
          _stress_fields)
 
 
-def emit_module(cse: bool = False) -> str:
+def emit_module(cse: bool = True) -> str:
     """The complete generated module.
 
     ``cse`` eliminates common subexpressions across the channels of each
     emitted function; it changes only the shape of the emitted code, not
-    the values it computes."""
+    the values it computes.  On by default: the channels of one function
+    share a great deal of structure (the pair fields and the Libxc
+    derivative combinations recur across every component), so this cuts
+    the emitted module by about a quarter and removes the corresponding
+    repeated work at run time.  Pass ``cse=False`` to recover the
+    literal one-expression-per-channel form, which is easier to read
+    against the symbolic derivation."""
     parts = [HEADER]
     for spec in SPECS:
         parts.extend(fieldkernel.emit(spec(f), cse=cse) for f in FAMILIES)
