@@ -39,7 +39,9 @@ from typing import List
 
 import sympy as sp
 from sympy.printing.c import C99CodePrinter
-from sympy.printing.numpy import NumPyPrinter
+
+from . import fieldkernel
+from .fieldkernel import ExplicitLayout, FieldKernel
 
 from ..engine.noncollinear import (libxc_args, nc_fields, nc_fxc_matrix,
                                    nc_potential)
@@ -55,23 +57,16 @@ import numpy
 '''
 
 
-def _emit_function(name: str, params: List[str], exprs, assigns: List[str],
-                   alloc: str, ret: str) -> str:
-    """One generated function: allocate, CSE the expressions, print the
-    reductions, and assign each result to its target index expression."""
-    p = NumPyPrinter()
-    rep, red = sp.cse(exprs, optimizations="basic",
-                      symbols=sp.numbered_symbols("t"))
-    lines = [f"def {name}({', '.join(params)}):",
-             "    ng = numpy.shape(rho_s)",
-             f"    {alloc}"]
-    lines += [f"    {s} = {p.doprint(e)}" for s, e in rep]
-    for target, e in zip(assigns, red):
-        if e == 0:
-            continue
-        lines.append(f"    {target} = {p.doprint(e)}")
-    lines.append(f"    return {ret}")
-    return "\n".join(lines) + "\n\n"
+def _numpy_kernel(name: str, params: List[str], exprs, assigns: List[str],
+                  alloc: str, ret: str) -> FieldKernel:
+    """A noncollinear kernel as a shared field-kernel spec: positional
+    operands, a preallocated output array, caller-formed index targets."""
+    return FieldKernel(
+        name=name, binding="positional", params=params,
+        exprs={i: e for i, e in enumerate(exprs)},
+        layout=ExplicitLayout(targets=assigns, ret=ret,
+                              pre=("    ng = numpy.shape(rho_s)",
+                                   f"    {alloc}")))
 
 
 def emit(families=("lda", "gga")) -> str:
@@ -81,13 +76,13 @@ def emit(families=("lda", "gga")) -> str:
         fields, pot = nc_potential(family)
         fnames = [s.name for s in fields]
         n = len(fields)
-        src += _emit_function(
+        src += fieldkernel.emit(_numpy_kernel(
             f"nc_vxc_{family}",
             fnames + libxc_args(family, 1) + ["f_nabla"],
             pot,
             [f"out[{i}]" for i in range(n)],
             f"out = numpy.zeros(({n},) + ng)",
-            "out")
+            "out"), cse=True, drop_zero=True) + "\n\n"
         fields2, C = nc_fxc_matrix(family)
         assert [s.name for s in fields2] == fnames
         exprs, assigns = [], []
@@ -96,13 +91,13 @@ def emit(families=("lda", "gga")) -> str:
                 exprs.append(C[i][j])
                 assigns.append(f"out[{i}, {i}]" if i == j else
                                f"out[{i}, {j}] = out[{j}, {i}]")
-        src += _emit_function(
+        src += fieldkernel.emit(_numpy_kernel(
             f"nc_fxc_{family}",
             fnames + libxc_args(family, 2) + ["f_nabla"],
             exprs,
             assigns,
             f"out = numpy.zeros(({n}, {n}) + ng)",
-            "out")
+            "out"), cse=True, drop_zero=True) + "\n\n"
     return src
 
 

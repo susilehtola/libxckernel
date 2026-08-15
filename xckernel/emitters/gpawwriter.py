@@ -19,8 +19,9 @@ Reproduce with: python -m xckernel.emitters.gpawwriter --emit <file>
 
 from __future__ import annotations
 
-from sympy.printing.numpy import NumPyPrinter
-
+from . import fieldkernel
+from .fieldkernel import (ChannelLayout, FieldKernel, MappingLayout,
+                          SpinChannelLayout)
 from ..engine.response import fxc_channels
 from ..inputs.basis import AXES
 
@@ -47,130 +48,91 @@ import numpy as np  # noqa: F401
 '''
 
 
-def _emit_function(family: str) -> str:
-    printer = NumPyPrinter()
-    ch = fxc_channels(family)
-    names = sorted({s.name for e in ch.values() for s in e.free_symbols})
-    L = [f"def fxc_pair_coefficients_{family}(ops):"]
-    for n in names:
-        L.append(f"    {n} = ops['{n}']")
-    L.append(f"    u = {printer.doprint(ch['rho'])}")
-    for ax in AXES:
-        L.append(f"    v_{ax} = {printer.doprint(ch[f'grad_{ax}'])}")
-    out = "{'rho': u, 'grad': [v_x, v_y, v_z]"
-    if "tau" in ch:
-        L.append(f"    w_tau = {printer.doprint(ch['tau'])}")
-        out += ", 'tau': w_tau"
-    L.append(f"    return {out}}}")
-    return "\n".join(L)
+def _channels(family: str) -> FieldKernel:
+    """Pair-coefficient channels of the fxc contraction."""
+    return FieldKernel(
+        name=f"fxc_pair_coefficients_{family}",
+        exprs=fxc_channels(family),
+        layout=ChannelLayout(axes=AXES))
 
 
-def _emit_coefficient_function(family: str) -> str:
+def _coefficient_fields(family: str) -> FieldKernel:
+    """Symmetric coefficient matrix over the derivative slots."""
     from ..engine.response import fxc_coefficient_matrix
-    printer = NumPyPrinter()
-    m = fxc_coefficient_matrix(family)
-    names = sorted({s.name for e in m.values() for s in e.free_symbols})
-    L = [f"def fxc_coefficient_fields_{family}(ops):",
-         '    """Symmetric per-point coefficient fields c[(a, b)] of the',
-         "    semilocal fxc operator over the derivative slots",
-         "    ('rho', 'x', 'y', 'z'[, 'tau']): the plane-wave kernel is",
-         "    K_GG' = sum_ab fac_a(q+G)* FT[c_ab](G-G') fac_b(q+G')",
-         '    with fac_rho = 1 and fac_i = 1j (q+G)_i."""']
-    for n in names:
-        L.append(f"    {n} = ops['{n}']")
-    L.append("    c = {}")
-    for (a, b), e in sorted(m.items()):
-        L.append(f"    c[({a!r}, {b!r})] = {printer.doprint(e)}")
-    L.append("    return c")
-    return "\n".join(L)
+    return FieldKernel(
+        name=f"fxc_coefficient_fields_{family}",
+        exprs=fxc_coefficient_matrix(family),
+        layout=MappingLayout(var="c"),
+        doc=('    """Symmetric per-point coefficient fields c[(a, b)] of the',
+             "    semilocal fxc operator over the derivative slots",
+             "    ('rho', 'x', 'y', 'z'[, 'tau']): the plane-wave kernel is",
+             "    K_GG' = sum_ab fac_a(q+G)* FT[c_ab](G-G') fac_b(q+G')",
+             '    with fac_rho = 1 and fac_i = 1j (q+G)_i."""'))
 
 
-def _emit_spin_function(family: str) -> str:
+def _spin_channels(family: str) -> FieldKernel:
+    """Spin-polarized pair-coefficient channels."""
     from ..engine.spin_kernel import fxc_channels_spin
-    printer = NumPyPrinter()
-    ch = fxc_channels_spin(family)
-    names = sorted({s.name for e in ch.values() for s in e.free_symbols})
-    L = [f"def fxc_pair_coefficients_{family}_spin(ops):",
-         '    """Spin-polarized per-point coefficient channels of the',
-         "    fxc contraction with the pair fields labelled p1: keys",
-         "    'rho_a'/'rho_b' (local), 'grad_a'/'grad_b' (vector), and",
-         "    'tau_a'/'tau_b' (tau families).  Polarized Libxc arrays",
-         '    carry their flat component packing (v2rho2_0..)."""']
-    for n in names:
-        L.append(f"    {n} = ops['{n}']")
-    entries = []
-    for s in ("a", "b"):
-        L.append(f"    u_{s} = {printer.doprint(ch[f'rho_{s}'])}")
-        entries.append(f"'rho_{s}': u_{s}")
-        for ax in AXES:
-            L.append(f"    v_{s}_{ax} = "
-                     f"{printer.doprint(ch[f'grad_{s}_{ax}'])}")
-        entries.append(f"'grad_{s}': [v_{s}_x, v_{s}_y, v_{s}_z]")
-        if f"tau_{s}" in ch:
-            L.append(f"    w_{s} = {printer.doprint(ch[f'tau_{s}'])}")
-            entries.append(f"'tau_{s}': w_{s}")
-    L.append("    return {" + ", ".join(entries) + "}")
-    return "\n".join(L)
+    return FieldKernel(
+        name=f"fxc_pair_coefficients_{family}_spin",
+        exprs=fxc_channels_spin(family),
+        layout=SpinChannelLayout(axes=AXES),
+        doc=('    """Spin-polarized per-point coefficient channels of the',
+             "    fxc contraction with the pair fields labelled p1: keys",
+             "    'rho_a'/'rho_b' (local), 'grad_a'/'grad_b' (vector), and",
+             "    'tau_a'/'tau_b' (tau families).  Polarized Libxc arrays",
+             '    carry their flat component packing (v2rho2_0..)."""'))
 
 
-def _emit_triplet_function(family: str) -> str:
+def _triplet_channels(family: str) -> FieldKernel:
+    """Closed-shell triplet (spin-flip) pair-coefficient channels."""
     from ..engine.spin_kernel import fxc_channels_st
-    printer = NumPyPrinter()
-    ch = fxc_channels_st(family, parity=-1)
-    names = sorted({s.name for e in ch.values() for s in e.free_symbols})
-    L = [f"def fxc_pair_coefficients_{family}_triplet(ops):",
-         '    """Closed-shell TRIPLET (spin-flip) per-point coefficient',
-         "    channels: the polarized Libxc arrays are evaluated at the",
-         "    spin-compensated point (rho/2 per channel, flat packing",
-         "    v2rho2_0..) and all fields/pair fields are ALPHA-channel",
-         '    quantities (half the total pair density etc.)."""']
-    for n in names:
-        L.append(f"    {n} = ops['{n}']")
-    L.append(f"    u = {printer.doprint(ch['rho'])}")
-    for ax in AXES:
-        L.append(f"    v_{ax} = {printer.doprint(ch[f'grad_{ax}'])}")
-    out = "{'rho': u, 'grad': [v_x, v_y, v_z]"
-    if "tau" in ch:
-        L.append(f"    w_tau = {printer.doprint(ch['tau'])}")
-        out += ", 'tau': w_tau"
-    L.append(f"    return {out}}}")
-    return "\n".join(L)
+    return FieldKernel(
+        name=f"fxc_pair_coefficients_{family}_triplet",
+        exprs=fxc_channels_st(family, parity=-1),
+        layout=ChannelLayout(axes=AXES),
+        doc=('    """Closed-shell TRIPLET (spin-flip) per-point coefficient',
+             "    channels: the polarized Libxc arrays are evaluated at the",
+             "    spin-compensated point (rho/2 per channel, flat packing",
+             "    v2rho2_0..) and all fields/pair fields are ALPHA-channel",
+             '    quantities (half the total pair density etc.)."""'))
 
 
-def _emit_stress_function(family: str) -> str:
+def _stress_fields(family: str) -> FieldKernel:
+    """Per-point integrand of the explicit XC strain derivative."""
     from ..engine.strain import scale_operands, strain_energy_derivative
-    printer = NumPyPrinter()
     comps = {}
     for a in range(3):
         for b in range(3):
             comps[(a, b)] = scale_operands(
                 strain_energy_derivative(family, a, b),
                 {"tau_tensor": 2.0})
-    names = sorted({s.name for e in comps.values()
-                    for s in e.free_symbols})
-    L = [f"def xc_stress_fields_{family}(ops):",
-         '    """Per-point integrand fields of the explicit XC strain',
-         "    derivative dExc/deps_ab (the XC stress contribution",
-         "    BEFORE symmetrization and 1/V): the host multiplies by",
-         "    the quadrature weight and sums.  tau_tensor components",
-         "    follow GPAW's convention (no 1/2; trace = 2 tau), and zk",
-         '    is the per-particle Libxc energy density."""']
-    for n in names:
-        L.append(f"    {n} = ops['{n}']")
-    L.append("    s = {}")
-    for (a, b), e in sorted(comps.items()):
-        L.append(f"    s[({a}, {b})] = {printer.doprint(e)}")
-    L.append("    return s")
-    return "\n".join(L)
+    return FieldKernel(
+        name=f"xc_stress_fields_{family}",
+        exprs=comps,
+        layout=MappingLayout(var="s"),
+        doc=('    """Per-point integrand fields of the explicit XC strain',
+             "    derivative dExc/deps_ab (the XC stress contribution",
+             "    BEFORE symmetrization and 1/V): the host multiplies by",
+             "    the quadrature weight and sums.  tau_tensor components",
+             "    follow GPAW's convention (no 1/2; trace = 2 tau), and zk",
+             '    is the per-particle Libxc energy density."""'))
 
 
-def emit_module() -> str:
+#: every kernel the emitted module provides, in emission order
+SPECS = (_channels, _coefficient_fields, _spin_channels, _triplet_channels,
+         _stress_fields)
+
+
+def emit_module(cse: bool = False) -> str:
+    """The complete generated module.
+
+    ``cse`` eliminates common subexpressions across the channels of each
+    emitted function; it changes only the shape of the emitted code, not
+    the values it computes."""
     parts = [HEADER]
-    parts.extend(_emit_function(f) for f in FAMILIES)
-    parts.extend(_emit_coefficient_function(f) for f in FAMILIES)
-    parts.extend(_emit_spin_function(f) for f in FAMILIES)
-    parts.extend(_emit_triplet_function(f) for f in FAMILIES)
-    parts.extend(_emit_stress_function(f) for f in FAMILIES)
+    for spec in SPECS:
+        parts.extend(fieldkernel.emit(spec(f), cse=cse) for f in FAMILIES)
     return "\n\n".join(parts) + "\n"
 
 
