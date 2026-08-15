@@ -20,6 +20,8 @@ ABI (v1, one perturbation-batch entry per call; hosts loop the batch):
              const double* chi,        /* nbf x npts, row-major */
              const double* dchi,       /* 3 x nbf x npts */
              const double* lapl_chi,   /* nbf x npts, may be NULL if unused */
+             const double* hess_chi,   /* 6 x nbf x npts, packed
+                                          xx,xy,xz,yy,yz,zz; NULL if unused */
              const double* const* scal,/* n_scal arrays (npts,) -- see the
                                           generated <name>_scal_names table */
              double* out);             /* nbf x nbf, accumulated (+=) */
@@ -64,9 +66,12 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
-        elif p.startswith(("grad_rho", "jp")):
+        elif p.startswith(("grad_rho", "jp")) or p.startswith("dgrad_rho"):
             for ax in ("x", "y", "z"):
-                # grad_rho -> grad_rho_x; grad_rho_a_p1 -> grad_rho_a_p1_x
+                # grad_rho -> grad_rho_x; grad_rho_a_p1 -> grad_rho_a_p1_x;
+                # dgrad_rho_g (the direction-resolved density-Hessian row of
+                # the grid-response class) is a 3-vector too, despite not
+                # sharing the grad_rho prefix
                 order.append(f"{p}_{ax}")
         else:
             order.append(p)

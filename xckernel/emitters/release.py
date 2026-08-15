@@ -3,7 +3,7 @@ package, distributable and buildable with only CMake + a C compiler
 (no Python/SymPy/NumPy on the consumer side -- the Libxc distribution model:
 generators are developer tools, releases ship generated source).
 
-    python -m xckernel.release [outdir] [version]
+    python -m xckernel.emitters.release [outdir] [version]
 
 produces outdir/libxckernel-<version>/ and libxckernel-<version>.tar.gz.
 """
@@ -13,7 +13,7 @@ from __future__ import annotations
 import tarfile
 from pathlib import Path
 
-from . import catalog
+from .. import catalog
 
 README = """\
 libxckernel {version}
