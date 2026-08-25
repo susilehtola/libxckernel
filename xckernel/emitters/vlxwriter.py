@@ -243,11 +243,18 @@ def emit_branch(mode: str, family: str, indent: int = 8) -> str:
     return "\n".join(lines)
 
 
-def main() -> None:
-    import sys
-    mode = sys.argv[1] if len(sys.argv) > 1 else "QRF"
-    family = sys.argv[2] if len(sys.argv) > 2 else "gga"
-    print(emit_branch(mode, family))
+def main(argv=None) -> None:
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m xckernel.emitters.vlxwriter",
+        description="Emit a VeloxChem quadMode branch body.")
+    p.add_argument("mode", nargs="?", default="QRF",
+                   choices=sorted(MODES), type=str.upper,
+                   help="response mode (default: QRF)")
+    p.add_argument("family", nargs="?", default="gga",
+                   help="functional family (default: gga)")
+    a = p.parse_args(argv)
+    print(emit_branch(a.mode, a.family))
 
 
 if __name__ == "__main__":

@@ -142,12 +142,22 @@ def emit_module(cse: bool = True) -> str:
     return "\n\n".join(parts) + "\n"
 
 
-if __name__ == "__main__":
-    import sys
-    if "--emit" in sys.argv:
-        path = sys.argv[sys.argv.index("--emit") + 1]
-        with open(path, "w") as f:
-            f.write(emit_module())
-        print(path)
+def main(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m xckernel.emitters.gpawwriter",
+        description=__doc__.splitlines()[0])
+    p.add_argument("--emit", metavar="FILE",
+                   help="write the module here instead of stdout")
+    a = p.parse_args(argv)
+    src = emit_module()
+    if a.emit:
+        with open(a.emit, "w") as f:
+            f.write(src)
+        print(a.emit)
     else:
-        print(emit_module())
+        print(src)
+
+
+if __name__ == "__main__":
+    main()

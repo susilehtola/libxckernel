@@ -59,9 +59,25 @@ def build_release(outdir: str = "dist", version: str = catalog.VERSION,
     return tarball
 
 
-if __name__ == "__main__":
-    import sys
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "dist"
-    version = sys.argv[2] if len(sys.argv) > 2 else catalog.VERSION
-    tb = build_release(outdir, version)
+def main(argv=None):
+    """Assemble the release tarball.
+
+    Positional and optional as before, but parsed rather than indexed
+    off sys.argv: read by position, ``--help`` was taken as the output
+    directory and a distribution was written into a folder of that name.
+    """
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m xckernel.emitters.release",
+        description="Assemble the self-contained C source package.")
+    p.add_argument("outdir", nargs="?", default="dist",
+                   help="output directory (default: dist)")
+    p.add_argument("version", nargs="?", default=catalog.VERSION,
+                   help=f"release version (default: {catalog.VERSION})")
+    a = p.parse_args(argv)
+    tb = build_release(a.outdir, a.version)
     print(f"release: {tb} ({tb.stat().st_size/1e6:.1f} MB)")
+
+
+if __name__ == "__main__":
+    main()
