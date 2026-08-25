@@ -62,18 +62,17 @@ OWNERSHIP = ("xc-only: Coulomb, HF and range-separated exchange are "
              "host-owned; kernels contain exclusively density-functional "
              "exchange-correlation terms")
 
-#: per-family cap on the shipped derivative order.  eta (hmgga) is cubic in
-#: P-linear primitives, so its order-4 contraction has ~5e5 monomials
-#: (~30 MB of source); orders above the cap remain generatable on demand.
-FAMILY_MAX_ORDER = {"hmgga": 3}
+#: per-family cap on the shipped derivative order.  None at present: every
+#: family is generated through ``max_order``.  The largest entry is the
+#: spin-resolved order-4 hmgga contraction (6.6e6 monomials, ~0.5 GB of
+#: expression source), which the table-driven C backend emits as data.
+FAMILY_MAX_ORDER: Dict[str, int] = {}
 
 #: families with GIAO magnetic-field derivative kernels (London orbitals).
 GIAO_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga")
 
-#: additional cap for the SPIN-RESOLVED cases: the 1/rho tower of the gauge
-#: correction makes the spin-resolved fourth-order cmgga_tau contractions
-#: ~7e7 chars of source; the unpolarized set still ships through order 4.
-FAMILY_SPIN_MAX_ORDER = {"cmgga_tau": 3}
+#: additional cap for the SPIN-RESOLVED cases.  None at present.
+FAMILY_SPIN_MAX_ORDER: Dict[str, int] = {}
 
 
 @dataclass
@@ -281,11 +280,17 @@ def manifest_for(e: CatalogEntry, gen) -> Dict:
         return m
 
     import re
-    sig = re.search(rf"def {e.name}\(([^)]*)\)", gen.source).group(1)
+    # GIAO entries generate one function per Cartesian axis plus a stacking
+    # wrapper; gen is the x-axis generator, whose signature the wrapper shares.
+    m_sig = re.search(rf"def {re.escape(gen.name)}\(([^)]*)\)", gen.source)
+    if m_sig is None:
+        raise RuntimeError(f"no signature for {gen.name} in generated source")
+    sig = m_sig.group(1)
     params = [p.strip() for p in sig.split(",")]
     m["params"] = [{"name": p, **_param_meta(p, e.batch)} for p in params]
     m["libxc"]["derivative_arrays"] = gen.libxc_args
-    m["n_patterns"] = gen.source.count("out +=")
+    m["n_patterns"] = gen.n_patterns
+    m["n_products"] = gen.n_products
     return m
 
 
@@ -342,9 +347,11 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 "import numpy as np\n\n" + source)
             manifest["kernels"].append(manifest_for(e, gen))
             if verbose:
-                npat = gen.source.count("out +=") if gen else 0
+                npat = gen.n_patterns if gen else 0
+                nprod = gen.n_products if gen else 0
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
-                      f"{npat:3d} patterns", flush=True)
+                      f"{npat:3d} patterns {nprod:3d} products",
+                      flush=True)
     elif backend == "c":
         from .emitters.cbackend import (_EVALUATOR_HPP, emit_cmake, emit_exc_cpp,
                                emit_exc_hpp, emit_f03, emit_header,
