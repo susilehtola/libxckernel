@@ -33,7 +33,8 @@ class KernelIntegrand:
 
 
 def kernel_integrand(family: str,
-                     index_pairs: List[Tuple[str, str]]) -> KernelIntegrand:
+                     index_pairs: List[Tuple[str, str]],
+                     coords=None) -> KernelIntegrand:
     """Build the integrand of D_{i_n j_n} ... D_{i_1 j_1}[Exc].
 
     ``index_pairs`` gives the free index labels for each derivative, outermost
@@ -43,8 +44,8 @@ def kernel_integrand(family: str,
     if not index_pairs:
         raise ValueError("need at least one index pair (the Fock matrix)")
 
-    func = Functional.of_family(family)
-    fi: FockIntegrand = fock_integrand(family, *index_pairs[0])
+    func = Functional.of_family(family, coords)
+    fi: FockIntegrand = fock_integrand(family, *index_pairs[0], coords=coords)
     expr = fi.expr
     for (u_label, v_label) in index_pairs[1:]:
         expr = directional_derivative(expr, func, u_label, v_label)
@@ -53,8 +54,9 @@ def kernel_integrand(family: str,
                            expr=expr)
 
 
-def fock(family: str, u="u", v="v") -> KernelIntegrand:
-    return kernel_integrand(family, [(u, v)])
+def fock(family: str, u="u", v="v", coords=None) -> KernelIntegrand:
+    """The XC Fock matrix integrand, optionally in a curvilinear system."""
+    return kernel_integrand(family, [(u, v)], coords=coords)
 
 
 def xc_kernel(family: str, u="u", v="v", t="t", s="s") -> KernelIntegrand:

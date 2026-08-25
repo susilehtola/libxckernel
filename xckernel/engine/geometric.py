@@ -96,7 +96,7 @@ def _spatial_seed(func: Functional):
             if prim.name == "rho":
                 return from_expr(DRHO_G)
             if prim.name.startswith("grad_rho_"):
-                i = AXES.index(prim.name[-1])
+                i = AXES.index(prim.name[len("grad_rho_"):])
                 return from_expr(DGRAD_RHO_G[i])
             if prim.name == "tau":
                 return from_expr(DTAU_G)
@@ -667,7 +667,7 @@ def spatial_row_gradient(family: str, u: str = "u") -> sp.Expr:
                 return from_expr(dddgh[i])
         prim = PRIM_BY_SYMBOL.get(atom)
         if prim is not None and prim.name.startswith("grad_rho_"):
-            ax = prim.name[-1]
+            ax = prim.name[len("grad_rho_"):]
             return from_expr(sp.Symbol(f"dgrad_rho_h_{ax}", real=True))
         if name in LIBXC_MULTISET:
             ms = LIBXC_MULTISET[name]

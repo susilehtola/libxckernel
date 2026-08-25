@@ -30,23 +30,50 @@ from typing import Dict, List, Tuple
 
 import sympy as sp
 
-from ..inputs.basis import AXES
+from ..inputs.basis import (AXES, PROLATE, PROLATE_PUREM, RADIAL,
+                            SPHERICAL)
 from ..engine.deriv import LIBXC_MULTISET
 from ..engine.kernel import KernelIntegrand
 
 _AX = {ax: i for i, ax in enumerate(AXES)}
+
+#: Symbols a curvilinear coordinate system introduces into the integrand:
+#: the scale factors themselves and the angular-momentum factor of an
+#: l-blocked density matrix. They are per-point host data, not fields
+#: derived from the density.
+_GEOMETRY_OPERANDS = {"r", "sin_theta", "l_factor", "m_factor",
+                      "scale_mu", "scale_nu", "scale_phi"}
+
+_AX_ANY = dict(_AX)
+for _c in (SPHERICAL, PROLATE, RADIAL, PROLATE_PUREM):
+    for _i, _a in enumerate(_c.axes):
+        _AX_ANY.setdefault(_a, _i)
+
+#: alternation of every known axis name, longest first so that
+#: 'theta' is preferred over any prefix of it
+_AXRE = "|".join(sorted(_AX_ANY, key=len, reverse=True))
+
+#: Axis index for every coordinate system the generator knows. Names are
+#: unique across systems, so one flat table suffices and no context has to
+#: be threaded into the classifier.
+
 #: packed symmetric-tensor component -> index (xx,xy,xz,yy,yz,zz)
 _H6 = {"xx": 0, "xy": 1, "xz": 2, "yy": 3, "yz": 4, "zz": 5}
 _CHI = re.compile(r"^chi_(\w+)$")
-_DCHI = re.compile(r"^dchi_(\w+)_([xyz])$")
+#: Basis-function derivative component. The axis suffix is whatever the
+#: coordinate system calls it -- x/y/z in Cartesian, r/theta/phi in
+#: spherical -- so the pattern lists the KNOWN axis names rather than any
+#: token, which would otherwise swallow operands such as ``dchi_g_v``
+#: whose trailing label is a perturbation index, not an axis.
+_DCHI = re.compile(rf"^dchi_(\w+?)_({_AXRE})$")
 _LAPL = re.compile(r"^lapl_chi_(\w+)$")
 _HESS_CHI = re.compile(r"^hess_chi_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
-_GRAD = re.compile(r"^grad_rho_([xyz])$")
-_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_([xyz])$")
+_GRAD = re.compile(rf"^grad_rho_({_AXRE})$")
+_GRAD_SPIN = re.compile(rf"^grad_rho_([ab])_({_AXRE})$")
 _LIBXC_SPIN = re.compile(r"^v\w+_\d+$")
 # perturbed fields of the response contraction engine (labels p1, p2, ...)
 _PERT_SCALAR = re.compile(r"^(?:rho|lapl_rho|tau)_(p\d+)$")
-_PERT_GRAD = re.compile(r"^grad_rho_(p\d+)_([xyz])$")
+_PERT_GRAD = re.compile(rf"^grad_rho_(p\d+)_({_AXRE})$")
 # spin-resolved perturbed fields (rho_a_p1, grad_rho_a_p1_x, ...)
 _PERT_SCALAR_SPIN = re.compile(r"^(?:rho|lapl_rho|tau)_([ab])_(p\d+)$")
 _PERT_GRAD_SPIN = re.compile(r"^grad_rho_([ab])_(p\d+)_([xyz])$")
@@ -101,7 +128,8 @@ def _classify(name: str) -> Tuple[Operand, str]:
         return Operand("chi", f"{m.group(1)}g"), "basis"
     m = _DCHI.match(name)
     if m:
-        return Operand(f"dchi[{_AX[m.group(2)]}]", f"{m.group(1)}g"), "basis"
+        return Operand(f"dchi[{_AX_ANY[m.group(2)]}]",
+                       f"{m.group(1)}g"), "basis"
     m = _LAPL.match(name)
     if m:
         return Operand("lapl_chi", f"{m.group(1)}g"), "basis"
@@ -111,21 +139,21 @@ def _classify(name: str) -> Tuple[Operand, str]:
                        f"{m.group(1)}g"), "basis"
     m = _RCHI.match(name)
     if m:
-        return Operand(f"Rchi[{_AX[m.group(2)]}]", f"{m.group(1)}g"), "basis"
+        return Operand(f"Rchi[{_AX_ANY[m.group(2)]}]", f"{m.group(1)}g"), "basis"
     m = _RDCHI.match(name)
     if m:
-        return Operand(f"Rdchi[{_AX[m.group(2)]}][{_AX[m.group(3)]}]",
+        return Operand(f"Rdchi[{_AX_ANY[m.group(2)]}][{_AX_ANY[m.group(3)]}]",
                        f"{m.group(1)}g"), "basis"
     m = _RLAPL.match(name)
     if m:
-        return Operand(f"Rlapl_chi[{_AX[m.group(2)]}]",
+        return Operand(f"Rlapl_chi[{_AX_ANY[m.group(2)]}]",
                        f"{m.group(1)}g"), "basis"
     m = _RG.match(name)
     if m:
-        return Operand(f"rg[{_AX[m.group(1)]}]", "g"), "gscalar:rg"
+        return Operand(f"rg[{_AX_ANY[m.group(1)]}]", "g"), "gscalar:rg"
     m = _DDCHI_G.match(name)
     if m:
-        return Operand(f"ddchi_{m.group(1)}[{_AX[m.group(3)]}]",
+        return Operand(f"ddchi_{m.group(1)}[{_AX_ANY[m.group(3)]}]",
                        f"{m.group(2)}g"), "basis"
     m = _DCHI_G.match(name)
     if m:
@@ -135,7 +163,7 @@ def _classify(name: str) -> Tuple[Operand, str]:
         return Operand("d2chi_g2", f"{m.group(1)}g"), "basis"
     m = _D3CHI_G2.match(name)
     if m:
-        return Operand(f"d3chi_g2[{_AX[m.group(2)]}]", f"{m.group(1)}g"), "basis"
+        return Operand(f"d3chi_g2[{_AX_ANY[m.group(2)]}]", f"{m.group(1)}g"), "basis"
     m = _UROW.match(name)
     if m:
         return Operand(f"U{m.group(1)}", f"{m.group(2)}g"), "basis"
@@ -144,41 +172,42 @@ def _classify(name: str) -> Tuple[Operand, str]:
         return Operand("Dloc", f"{m.group(1)}{m.group(2)}"), "dpair"
     m = _DGRAD_G.match(name)
     if m:
-        return Operand(f"dgrad_rho_g[{_AX[m.group(1)]}]", "g"), "dgrad_g"
+        return Operand(f"dgrad_rho_g[{_AX_ANY[m.group(1)]}]", "g"), "dgrad_g"
     m = _DGRAD_G_SPIN.match(name)
     if m:
-        return Operand(f"dgrad_rho_{m.group(1)}_g[{_AX[m.group(2)]}]", "g"), \
+        return Operand(f"dgrad_rho_{m.group(1)}_g[{_AX_ANY[m.group(2)]}]", "g"), \
             f"dgrad_g_{m.group(1)}"
-    m = _GRAD.match(name)
+    m = None if (_GRAD_SPIN.match(name) or _PERT_GRAD.match(name)) \
+        else _GRAD.match(name)
     if m:
-        return Operand(f"grad_rho[{_AX[m.group(1)]}]", "g"), "grad"
+        return Operand(f"grad_rho[{_AX_ANY[m.group(1)]}]", "g"), "grad"
     m = _GRAD_SPIN.match(name)
     if m:
-        return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+        return Operand(f"grad_rho_{m.group(1)}[{_AX_ANY[m.group(2)]}]", "g"), \
             f"grad_{m.group(1)}"
     m = _PERT_GRAD.match(name)
     if m:
-        return Operand(f"grad_rho_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+        return Operand(f"grad_rho_{m.group(1)}[{_AX_ANY[m.group(2)]}]", "g"), \
             f"pgrad:{m.group(1)}"
     m = _PERT_GRAD_SPIN.match(name)
     if m:
         lbl = f"{m.group(1)}_{m.group(2)}"
-        return Operand(f"grad_rho_{lbl}[{_AX[m.group(3)]}]", "g"), f"pgrad:{lbl}"
+        return Operand(f"grad_rho_{lbl}[{_AX_ANY[m.group(3)]}]", "g"), f"pgrad:{lbl}"
     m = _JP.match(name)
     if m:
-        return Operand(f"jp[{_AX[m.group(1)]}]", "g"), "jp"
+        return Operand(f"jp[{_AX_ANY[m.group(1)]}]", "g"), "jp"
     m = _JP_SPIN.match(name)
     if m:
-        return Operand(f"jp_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+        return Operand(f"jp_{m.group(1)}[{_AX_ANY[m.group(2)]}]", "g"), \
             f"jp_{m.group(1)}"
     m = _PERT_JP.match(name)
     if m:
-        return Operand(f"jp_{m.group(1)}[{_AX[m.group(2)]}]", "g"), \
+        return Operand(f"jp_{m.group(1)}[{_AX_ANY[m.group(2)]}]", "g"), \
             f"pjp:{m.group(1)}"
     m = _PERT_JP_SPIN.match(name)
     if m:
         lbl = f"{m.group(1)}_{m.group(2)}"
-        return Operand(f"jp_{lbl}[{_AX[m.group(3)]}]", "g"), f"pjp:{lbl}"
+        return Operand(f"jp_{lbl}[{_AX_ANY[m.group(3)]}]", "g"), f"pjp:{lbl}"
     m = _HRHO.match(name)
     if m:
         return Operand(f"hess_rho[{_H6[m.group(1)]}]", "g"), "hrho"
@@ -205,6 +234,11 @@ def _classify(name: str) -> Tuple[Operand, str]:
         return Operand(name, "g"), f"pscalar:{name}"
     if name == "w":
         return Operand("w", "g"), "weight"
+    if name in _GEOMETRY_OPERANDS:
+        # Coordinate-system data the host supplies per grid point: the
+        # Lame factors and, for a density matrix blocked by angular
+        # momentum, the l(l+1) of the block being contracted.
+        return Operand(name, "g"), f"geometry:{name}"
     if name in LIBXC_MULTISET or _LIBXC_SPIN.match(name):
         # each Libxc derivative component is passed as its own (ng,) parameter.
         return Operand(name, "g"), "libxc"
@@ -225,6 +259,8 @@ class GeneratedFunction:
     pert_scalars: List[str] = None    # perturbed scalar field parameter names
     batch: bool = False               # perturbed operands carry a batch axis
     part: str = None                  # split-storage output part, if any
+    n_patterns: int = 0               # collapsed basis-pair patterns
+    n_products: int = 0               # emitted matrix products after fusion
 
 
 def _iter_terms(ki: KernelIntegrand):
@@ -374,6 +410,9 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
     params += [f"jp_{lbl}" for lbl in pert_jps]
     params += [f"hess_rho_{lbl}" for lbl in pert_hrhos]
     params += pert_scalars
+    # coordinate-system data (scale factors, the l(l+1) of the block)
+    params += sorted(u.split(":", 1)[1] for u in uses
+                     if u.startswith("geometry:"))
     params += libxc_args
 
     shape = ", ".join("nao" for _ in out_indices)
@@ -465,7 +504,7 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                       "hrho", "hrho_a", "hrho_b", "dgrad_g"):
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
-                                      "gscalar:")):
+                                      "gscalar:", "geometry:")):
                     uses.add(kind)
                 smono.append((base, e))
         if ufac is None or vfac is None:
@@ -531,6 +570,11 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
     params += [f"jp_{lbl}" for lbl in pert_jps]
     params += [f"hess_rho_{lbl}" for lbl in pert_hrhos]
     params += pert_scalars
+    # coordinate-system data: Lame factors, and the l(l+1) of the block
+    # being contracted when the density matrix is blocked by angular
+    # momentum. Empty for Cartesian, so the signature is unchanged there.
+    params += sorted(u.split(":", 1)[1] for u in uses
+                     if u.startswith("geometry:"))
     params += libxc_args
 
     plist = []
@@ -694,7 +738,14 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         factors = [repr(coeff)]
         for name, e in factors_:
             c = scalar_code(name)
-            factors.append(f"{c}**{e}" if e > 1 else c)
+            if e == 1:
+                factors.append(c)
+            elif e > 1:
+                factors.append(f"{c}**{e}")
+            else:
+                # negative powers arise from curvilinear scale factors,
+                # e.g. the 1/r^2 of an l-blocked centrifugal term
+                factors.append(f"{c}**({e})")
         return "*".join(factors)
 
     # Transpose-partner deduplication: patterns (u, v) and (v, u) whose
@@ -732,6 +783,64 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                     done.add(j)
             plan.append((k, sign))
 
+    # Cartesian fusion: patterns that share their u-side factor and whose
+    # v-side factors are components of one collocation array contract
+    # against the SAME left operand, so the Cartesian sum can be carried
+    # out on the grid before the matrix product,
+    #
+    #   sum_c (u * c_c) @ dchi[c].T  =  u @ (sum_c c_c * dchi[c]).T,
+    #
+    # trading n_c matrix products for n_c elementwise scalings of an
+    # (nbf, ngrid) array.  A diagonal pattern (u == v) joins the group with
+    # half its coefficient, since its product is (anti)symmetric and the
+    # transposed accumulation restores the other half.  This is the fusion
+    # that hand-written GGA Fock builds perform by folding the potential
+    # into a single modified collocation array.  Restricted to the plain
+    # single-array lowering: the two-sided mode has different bra and ket
+    # arrays, and split storage fuses per part elsewhere.  Batched kernels
+    # fuse inside an explicit loop over the perturbation index, so that the
+    # fused array stays (nbf, ngrid) rather than growing an nbatch axis;
+    # the coefficient assembly, which carries the monomials, stays
+    # vectorized over the batch.
+    _COMPONENT = re.compile(r"^(.*)\[(\d)\]$")
+
+    def _fuse(plan_in):
+        """Group plan entries into ``(entries, sign)`` fusion bundles.
+
+        Entries are ``(pattern index, halve)``.  Patterns that share their
+        u-side factor contract against the same left operand, so their sum
+        can be formed on the grid before the matrix product.  Only patterns
+        accumulated the same way may share a bundle: a transpose-paired
+        group closes as ``t +- t^T``, whereas an unpaired group closes as
+        ``t`` alone.  A diagonal pattern (u == v) is symmetric and has no
+        distinct partner; it joins a transpose-paired group of its own
+        u-side factor with half its coefficient, the transposed
+        accumulation supplying the other half, and otherwise joins the
+        unpaired group at full strength.
+        """
+        buckets: Dict[tuple, List[tuple]] = {}
+        order: List[tuple] = []
+
+        def _put(key, entry):
+            if key not in buckets:
+                buckets[key] = []
+                order.append(key)
+            buckets[key].append(entry)
+
+        pending = []
+        for k, sign in plan_in:
+            ufac, vfac, _ = ck.patterns[k]
+            if sign is not None and not two_sided:
+                _put((ufac, sign), (k, False))
+            else:
+                pending.append((k, ufac, vfac))
+        for k, ufac, vfac in pending:
+            if not two_sided and ufac == vfac and (ufac, 1) in buckets:
+                _put((ufac, 1), (k, True))       # half now, half by t^T
+            else:
+                _put((ufac, None), (k, False))
+        return [(buckets[key], key[1]) for key in order]
+
     # Emit big sums as chunked += accumulation: a single expression over
     # tens of thousands of monomials builds an AST deep enough to blow
     # CPython's fixed compiler recursion cap (<= 3.13).
@@ -747,9 +856,97 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                     f"c, {vcode}, optimize=True)")
         return f"({ucode} * c) @ {vcode}.T"
 
+    def _chunked(name, monos):
+        """Emit ``name`` as a chunked accumulation of the monomial sum."""
+        ch = [" + ".join(mono_code(coeff, fac) for coeff, fac in
+                         monos[i:i + _CHUNK])
+              for i in range(0, len(monos), _CHUNK)]
+        return [f"    {name} = {ch[0]}"] + [f"    {name} += {p}" for p in ch[1:]]
+
     lines: List[str] = []
-    for k, sign in plan:
+    for bundle, bsign in _fuse(plan):
+        if len(bundle) > 1 and part is not None:
+            # --- fusion in split storage: the part decomposition turns each
+            # pattern into real products (sign, a, b); those sharing a left
+            # operand a fuse into one product against the summed right one
+            for i, (k, _h) in enumerate(bundle):
+                lines += _chunked(f"c{i}", ck.patterns[k][2])
+            tT = "np.transpose(t, (0, 2, 1))" if batch else "t.T"
+            bx = "[:, None, :]" if batch else ""
+            for p, out_name in outs:
+                groups: Dict[str, List[tuple]] = {}
+                gorder: List[str] = []
+                for i, (k, halve) in enumerate(bundle):
+                    kufac, kvfac, _ = ck.patterns[k]
+                    umask, vmask = _mask(kufac), _mask(kvfac)
+                    half = halve
+                    for sg, lp, rp in part_product(p, True):
+                        if lp not in umask or rp not in vmask:
+                            continue
+                        a = _side_factor(kufac, "_" + lp, "split")
+                        b = _side_factor(kvfac, "_" + rp, "split")
+                        groups.setdefault(a, []) or gorder.append(a) \
+                            if a not in gorder else None
+                        groups.setdefault(a, []).append((sg, b, i, half))
+                if not groups:
+                    continue
+                first = True
+                for a in gorder:
+                    for j, (sg, b, i, half) in enumerate(groups[a]):
+                        sc = ("-" if sg < 0 else "") + \
+                             ("0.5 * " if half else "")
+                        op = "d = " if j == 0 else "d += "
+                        lines.append(f"    {op}{sc}c{i}{bx} * {b}")
+                    prod = (f"np.einsum('ug,xvg->xuv', {a}, d, optimize=True)"
+                            if batch else f"{a} @ d.T")
+                    lines.append(f"    t {'=' if first else '+='} {prod}")
+                    first = False
+                lines.append(f"    {out_name} += t")
+                if bsign is not None:
+                    ts = bsign if p == "re" else -bsign
+                    lines.append(f"    {out_name} "
+                                 f"{'+' if ts > 0 else '-'}= {tT}")
+            continue
+
+        if len(bundle) > 1:
+            # --- Cartesian fusion: one matrix product for the group -------
+            bu = ck.patterns[bundle[0][0]][0]
+            if sesquilinear:
+                ucode = _side_factor(bu, "_c", "sesquilinear")
+            elif two_sided:
+                ucode = _side_factor(bu, "_l", "two-sided")
+            else:
+                ucode = bu
+            for i, (k, _s) in enumerate(bundle):
+                lines += _chunked(f"c{i}", ck.patterns[k][2])
+            # the fused operand carries the batch axis, so the whole
+            # bundle becomes ONE batched matrix product; the grid batch
+            # size is the host's knob for the (nx, nbf, ng) intermediate
+            bx = "[:, None, :]" if batch else ""
+            for i, (k, halve) in enumerate(bundle):
+                kufac, kvfac, _ = ck.patterns[k]
+                half = "0.5 * " if halve else ""
+                vcode = (_side_factor(kvfac, "_r", "two-sided")
+                         if two_sided else kvfac)
+                op = "d = " if i == 0 else "d += "
+                lines.append(f"    {op}{half}c{i}{bx} * {vcode}")
+            if batch:
+                lines.append(f"    t = np.einsum('ug,xvg->xuv', {ucode}, "
+                             f"d, optimize=True)")
+                tr = ("np.conjugate(np.transpose(t, (0, 2, 1)))"
+                      if sesquilinear else "np.transpose(t, (0, 2, 1))")
+            else:
+                lines.append(f"    t = {ucode} @ d.T")
+                tr = "t.conj().T" if sesquilinear else "t.T"
+            lines.append("    out += t")
+            if bsign is not None:
+                lines.append(f"    out {'+' if bsign > 0 else '-'}= {tr}")
+            continue
+
+        k, _halve = bundle[0]
+        sign = bsign
         ufac, vfac, monos = ck.patterns[k]
+
 
         if part is not None:
             # split-storage lowering: the requested part of the (u-side
@@ -858,7 +1055,10 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         uses_grad_rho=("grad" in uses),
         uses_grad_rho_a=("grad_a" in uses), uses_grad_rho_b=("grad_b" in uses),
         pert_grads=pert_grads, pert_scalars=pert_scalars, batch=batch,
-        part=part)
+        part=part, n_patterns=len(ck.patterns),
+        n_products=(source.count(" @ ")
+                    + source.count("np.einsum('ug,xvg->xuv'")
+                    + source.count("np.einsum('ug,xg,vg->xuv'")))
 
 
 def compile_function(gen: GeneratedFunction):

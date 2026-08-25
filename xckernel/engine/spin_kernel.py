@@ -20,6 +20,7 @@ import sympy as sp
 
 from ..inputs.basis import Orbital
 from .deriv import libxc_deriv_name
+from ..inputs.basis import AXES
 from .spin import (COMPS, FIELD_PERTS, FIELD_SEEDS, GROUPS, HESS_S,
                    INV_RHO_S, JP_S, SCALARS, Scalar, _GROUP_RANK,
                    family_scalars, GRAD)
@@ -111,7 +112,7 @@ def _pert_grad(spin: str, label: str, ax: str) -> sp.Symbol:
     return sp.Symbol(f"grad_rho_{spin}_{label}_{ax}", real=True)
 
 
-def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
+def pert_scalar_value(sc: Scalar, label: str, coords=None) -> sp.Expr:
     """Perturbed value of a Libxc scalar variable under perturbation ``label``.
 
     A perturbation carries BOTH spin channels (D^{X,a}, D^{X,b}); the perturbed
@@ -119,7 +120,9 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     (which reduces to 2 grad_s . grad_s^X for the same-spin components).
     Composite scalars (gauge-corrected tau, eta) carry their own pert closure.
     """
-    from ..inputs.basis import AXES
+    from .spin import grad_syms
+    axes = AXES if coords is None else coords.axes
+    grad = grad_syms(coords)
     if sc.pert is not None:
         return sc.pert(label)
     if sc.group == "rho":
@@ -132,31 +135,32 @@ def pert_scalar_value(sc: Scalar, label: str) -> sp.Expr:
     from .spin import COMP_SPINS
     s1, s2 = COMP_SPINS["sigma"][sc.comp]
     total = sp.Integer(0)
-    for i, ax in enumerate(AXES):
-        total += _pert_grad(s1, label, ax) * GRAD[s2][i] \
-            + GRAD[s1][i] * _pert_grad(s2, label, ax)
+    for i, ax in enumerate(axes):
+        total += _pert_grad(s1, label, ax) * grad[s2][i] \
+            + grad[s1][i] * _pert_grad(s2, label, ax)
     return total
 
 
-def pert2_scalar_value(sc: Scalar, l1: str, l2: str) -> sp.Expr:
+def pert2_scalar_value(sc: Scalar, l1: str, l2: str,
+                       coords=None) -> sp.Expr:
     """Second-order perturbed value of a polarized Libxc scalar under
     two independent perturbations: nonzero only through the scalar's
     own nonlinearity (the sigma components; composite scalars carry
     their own closure if they define one)."""
-    from ..inputs.basis import AXES
+    axes = AXES if coords is None else coords.axes
     if sc.group != "sigma":
         return sp.Integer(0)
     from .spin import COMP_SPINS
     s1, s2 = COMP_SPINS["sigma"][sc.comp]
     total = sp.Integer(0)
-    for ax in AXES:
+    for ax in axes:
         total += _pert_grad(s1, l1, ax) * _pert_grad(s2, l2, ax) \
             + _pert_grad(s2, l1, ax) * _pert_grad(s1, l2, ax)
     return total
 
 
-def fxc_bilinear_spin(family: str, l1: str = "p1",
-                      l2: str = "p2") -> sp.Expr:
+def fxc_bilinear_spin(family: str, l1: str = "p1", l2: str = "p2",
+                      coords=None) -> sp.Expr:
     """Per-point integrand of the spin-polarized XC kernel bilinear
     form between two perturbations (each carrying both spin channels),
 
@@ -166,13 +170,14 @@ def fxc_bilinear_spin(family: str, l1: str = "p1",
     host multiplies by the quadrature weight and sums.  The polarized
     counterpart of response.fxc_bilinear."""
     from .spin import family_scalars
-    scalars = family_scalars(family)
+    scalars = family_scalars(family, coords)
     total = sp.Integer(0)
     for K in scalars:
         for L in scalars:
             total += _register((K, L)) \
-                * pert_scalar_value(K, l1) * pert_scalar_value(L, l2)
-        total += _register((K,)) * pert2_scalar_value(K, l1, l2)
+                * pert_scalar_value(K, l1, coords) \
+                * pert_scalar_value(L, l2, coords)
+        total += _register((K,)) * pert2_scalar_value(K, l1, l2, coords)
     return sp.expand(total)
 
 
@@ -246,21 +251,21 @@ def fxc_channels_st(family: str, parity: int = -1,
     return out
 
 
-def fxc_channels_spin(family: str,
-                      label: str = "p1") -> "dict[str, sp.Expr]":
+def fxc_channels_spin(family: str, label: str = "p1",
+                      coords=None) -> "dict[str, sp.Expr]":
     """Per-point coefficient channels of the polarized fxc contraction
     with one perturbation: derivatives of the spin bilinear with
     respect to the second perturbation's operands, keyed
     'rho_a'/'rho_b', 'grad_a_x'/... and (tau families)
     'tau_a'/'tau_b'.  The polarized counterpart of
     response.fxc_channels."""
-    from ..inputs.basis import AXES
-    b = fxc_bilinear_spin(family, l1=label, l2="_q")
+    axes = AXES if coords is None else coords.axes
+    b = fxc_bilinear_spin(family, l1=label, l2="_q", coords=coords)
     out = {}
     for s in ("a", "b"):
         out[f"rho_{s}"] = sp.expand(
             sp.diff(b, sp.Symbol(f"rho_{s}__q", real=True)))
-        for ax in AXES:
+        for ax in axes:
             out[f"grad_{s}_{ax}"] = sp.expand(
                 sp.diff(b, sp.Symbol(f"grad_rho_{s}__q_{ax}", real=True)))
         tau_q = sp.Symbol(f"tau_{s}__q", real=True)
@@ -416,3 +421,81 @@ def response_fock_st(family: str, order: int = 2,
     poly = subs_signed(ri.poly, mapping)
     return SpinResponseIntegrand(family=family, spin="a", labels=ri.labels,
                                  index_pairs=[(u, v)], poly=poly)
+
+
+# --- ground-state potential channels, spin-resolved -----------------------
+
+def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
+    """Ground-state value of a polarized Libxc scalar in terms of the
+    spin-resolved primitive fields.  Only sigma is composite; the rest
+    are primitives in their own right."""
+    from .spin import _sigma_value
+    if sc.group == "sigma":
+        return _sigma_value(sc.comp, coords)
+    if sc.group == "rho":
+        return sp.Symbol(f"rho_{sc.comp}", real=True)
+    if sc.group == "lapl":
+        return sp.Symbol(f"lapl_rho_{sc.comp}", real=True)
+    if sc.group == "tau":
+        return sp.Symbol(f"tau_{sc.comp}", real=True)
+    raise NotImplementedError(
+        f"no ground-state value for the {sc.group!r} scalar; the composite "
+        "families (gauge-corrected tau, eta) carry their own closures and "
+        "are not supported by the potential-channel generator")
+
+
+def _spin_primitives(coords=None):
+    """(channel key, symbol, seed) for every spin-resolved primitive field."""
+    from .spin import SPINS, _seed_grad, _seed_rho, _seed_tau, grad_syms
+    grad = grad_syms(coords)
+    axes = AXES if coords is None else coords.axes
+    out = []
+    for s in SPINS:
+        out.append((f"rho_{s}", sp.Symbol(f"rho_{s}", real=True),
+                    _seed_rho(s)))
+        for i, ax in enumerate(axes):
+            out.append((f"grad_{s}_{ax}", grad[s][i], _seed_grad(s, i, coords)))
+        out.append((f"tau_{s}", sp.Symbol(f"tau_{s}", real=True),
+                    _seed_tau(s, coords)))
+    return out
+
+
+def vxc_channels_spin(family: str, coords=None) -> "dict[str, sp.Expr]":
+    """Spin-resolved counterpart of :func:`~xckernel.engine.fock.vxc_channels`:
+    the per-point coefficients of the ground-state XC potential, keyed
+    ``rho_a``/``rho_b``, ``grad_a_<axis>``/``grad_b_<axis>`` and (tau
+    families) ``tau_a``/``tau_b``.
+
+    The polarized Libxc arrays keep their flat component packing, so
+    ``vsigma_1`` is the ab component of the caller's vsigma.  Channels
+    that vanish for the family are omitted."""
+    from .spin import family_scalars
+    scalars = family_scalars(family, coords)
+    energy = sum((_register((K,)) * _scalar_value_spin(K, coords)
+                  for K in scalars), sp.Integer(0))
+    out = {}
+    for key, sym, _seed in _spin_primitives(coords):
+        d = sp.expand(sp.diff(energy, sym))
+        if d != 0:
+            out[key] = d
+    return out
+
+
+def check_vxc_channels_spin(family: str, coords=None) -> sp.Expr:
+    """Residual between the spin channel form and the direct derivative
+    sum_K v_K dK/dP^s, for both spins.  Identically zero when they agree."""
+    from ..inputs.basis import Orbital
+    from .spin import SPINS, family_scalars
+    u, v = Orbital.make("u", coords), Orbital.make("v", coords)
+    scalars = family_scalars(family, coords)
+    ch = vxc_channels_spin(family, coords)
+    prims = _spin_primitives(coords)
+    resid = sp.Integer(0)
+    for s in SPINS:
+        direct = sum((_register((K,)) * K.seed(s, u, v) for K in scalars),
+                     sp.Integer(0))
+        built = sum((ch[key] * seed(s, u, v)
+                     for key, _sym, seed in prims if key in ch),
+                    sp.Integer(0))
+        resid += sp.expand(direct - built)
+    return sp.expand(resid)

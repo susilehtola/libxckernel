@@ -35,6 +35,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Tuple
 
+from functools import lru_cache
+
 import sympy as sp
 
 from .basis import AXES, HESS_COMPS, Orbital, dot
@@ -63,21 +65,40 @@ def _k_rho(a: Orbital, b: Orbital) -> sp.Expr:
     return a.val * b.val
 
 
-def _k_grad(ax: int) -> Kernel:
-    # d/dx (chi_a chi_b) = (dchi_a) chi_b + chi_a (dchi_b)
+def _k_grad(ax: int, coords=None) -> Kernel:
+    # d/dx (chi_a chi_b) = (dchi_a) chi_b + chi_a (dchi_b), divided by the
+    # Lame factor so the field is the PHYSICAL gradient component
+    h = 1 if coords is None else coords.scale[ax]
     def kernel(a: Orbital, b: Orbital) -> sp.Expr:
-        return a.grad[ax] * b.val + a.val * b.grad[ax]
+        num = a.grad[ax] * b.val + a.val * b.grad[ax]
+        return num if h == 1 else num / h
     return kernel
 
 
 def _k_lapl(a: Orbital, b: Orbital) -> sp.Expr:
     # laplacian(chi_a chi_b) = (lapl chi_a) chi_b + 2 grad.grad + chi_a (lapl chi_b)
+    #
+    # Cartesian only: in curvilinear coordinates this is the
+    # Laplace-Beltrami operator, which brings in derivatives of the scale
+    # factors. Callers must not request it for a non-Cartesian system;
+    # ingredient construction raises rather than emit a wrong seed.
     return a.lapl * b.val + 2 * dot(a.grad, b.grad) + a.val * b.lapl
 
 
-def _k_tau(a: Orbital, b: Orbital) -> sp.Expr:
-    # tau = 1/2 sum_i grad chi_i . grad chi_i  ->  1/2 grad chi_a . grad chi_b
-    return sp.Rational(1, 2) * dot(a.grad, b.grad)
+def _k_tau(a: Orbital, b: Orbital, coords=None) -> sp.Expr:
+    # tau = 1/2 sum_i |grad chi_i|^2 -> 1/2 sum_i (d_i chi_a)(d_i chi_b)/h_i^2,
+    # plus the angular term that survives an angular average (see
+    # Coordinates.angular): for a density matrix blocked by angular
+    # momentum, block l contributes l(l+1)/r^2 chi_a chi_b.
+    if coords is None:
+        return sp.Rational(1, 2) * dot(a.grad, b.grad)
+    terms = [a.grad[i] * b.grad[i] / (h * h) if h != 1
+             else a.grad[i] * b.grad[i]
+             for i, h in enumerate(coords.scale)]
+    total = sum(terms)
+    if coords.angular != 0:
+        total = total + coords.angular * a.val * b.val
+    return sp.Rational(1, 2) * total
 
 
 # --- the primitive fields --------------------------------------------------
@@ -179,6 +200,24 @@ def _sigma_seed(u: Orbital, v: Orbital) -> sp.Expr:
 
 SIGMA_ING = Ingredient("sigma", _SIGMA_VALUE, _sigma_seed)
 
+
+def _sigma_ingredient(grads):
+    """sigma = sum_i g_i^2 over the given gradient primitives.
+
+    In physical components this is the same dot product in every
+    coordinate system -- the metric is already inside each g_i -- so the
+    value expression is built the same way and only the seeds differ.
+    """
+    value = sum(p.symbol**2 for p in grads)
+
+    def seed(u: Orbital, v: Orbital) -> sp.Expr:
+        total = sp.Integer(0)
+        for p in grads:
+            total += sp.diff(value, p.symbol) * p.seed(u, v)
+        return sp.expand(total)
+
+    return Ingredient("sigma", value, seed)
+
 # Gauge-corrected kinetic energy density for current-density DFT:
 #   tau~ = tau - j_p.j_p / (2 rho)
 # (Dobson; Maximoff & Scuseria; Becke).  The functional library is evaluated
@@ -243,6 +282,97 @@ INGREDIENTS: Dict[str, Ingredient] = {
 PRIM_BY_SYMBOL: Dict[sp.Symbol, Primitive] = {
     p.symbol: p for p in PRIMITIVES.values()
 }
+
+
+#: Families whose ingredient set contains the density Laplacian. In a
+#: curvilinear system the Laplacian is the Laplace-Beltrami operator,
+#: which brings in derivatives of the scale factors; the seed here is the
+#: Cartesian one, so these families are refused outside Cartesian rather
+#: than emitted wrongly. Laplacian-dependent functionals are numerically
+#: ill-behaved in any case, so nothing is lost by the restriction.
+LAPLACIAN_FAMILIES = ("mgga", "mgga_lapl")
+
+#: Families whose extra ingredients rest on Cartesian-only
+#: constructions: the paramagnetic current density (cmgga_tau) and the
+#: density Hessian (hmgga).  Neither is a dot product of physical
+#: gradient components, so neither survives a change of coordinates
+#: untouched the way sigma and tau do.
+CARTESIAN_ONLY_FAMILIES = ("cmgga_tau", "hmgga")
+
+
+def check_coordinates(family: str, coords) -> None:
+    """Raise if a family cannot be expressed in the given coordinates."""
+    if family in LAPLACIAN_FAMILIES and coords is not None \
+            and not coords.is_cartesian:
+        raise NotImplementedError(
+            f"family {family!r} contains the density Laplacian, whose seed "
+            f"is Cartesian-only; the {coords.name} system would need the "
+            "Laplace-Beltrami form, which is not implemented.")
+    if family in CARTESIAN_ONLY_FAMILIES and coords is not None \
+            and not coords.is_cartesian:
+        raise NotImplementedError(
+            f"family {family!r} rests on Cartesian-only ingredients (the "
+            f"paramagnetic current density or the density Hessian); the "
+            f"{coords.name} system is not supported for it.")
+
+def primitives_for(coords):
+    """Build the metric-aware primitives for one coordinate system.
+
+    Only the gradient components and tau carry the metric; rho and the
+    pseudo-primitives are geometry-free. The component symbols are named
+    after the system's own axes, so a spherical kernel takes
+    ``grad_rho_r`` rather than ``grad_rho_x`` and the emitted source
+    reads the way the host's own code does.
+    """
+    from .basis import CARTESIAN
+    if coords is None or coords is CARTESIAN:
+        return {"rho": RHO, "grad": GRAD_RHO, "tau": TAU}
+    grad = tuple(
+        Primitive(f"grad_rho_{ax}", sp.Symbol(f"grad_rho_{ax}", real=True),
+                  _k_grad(i, coords))
+        for i, ax in enumerate(coords.axes))
+    tau = Primitive("tau", sp.Symbol("tau", real=True),
+                    lambda a, b: _k_tau(a, b, coords))
+    return {"rho": RHO, "grad": grad, "tau": tau}
+
+
+@lru_cache(maxsize=None)
+def prim_by_symbol_for(coords):
+    """Symbol -> Primitive lookup for one coordinate system.
+
+    The response engine recognizes a primitive field by its symbol; in a
+    curvilinear system the gradient components are named after that
+    system's axes, so the Cartesian table would silently fail to match
+    them -- and a perturbed ingredient would quietly lose its gradient
+    terms rather than raise.
+    """
+    if coords is None or coords.is_cartesian:
+        return PRIM_BY_SYMBOL
+    prims = primitives_for(coords)
+    out = dict(PRIM_BY_SYMBOL)
+    for g in prims["grad"]:
+        out[g.symbol] = g
+    out[prims["tau"].symbol] = prims["tau"]
+    return out
+
+
+def families_for(coords):
+    """The family -> ingredient-list table in the given coordinates.
+
+    Laplacian families are omitted rather than emitted with a Cartesian
+    seed; see :func:`check_coordinates`.
+    """
+    from .basis import CARTESIAN
+    if coords is None or coords is CARTESIAN:
+        return FAMILIES
+    p = primitives_for(coords)
+    sigma = _sigma_ingredient(p["grad"])
+    rho_i = _primitive_ingredient(p["rho"], "rho")
+    tau_i = _primitive_ingredient(p["tau"], "tau")
+    out = {"lda": [rho_i],
+           "gga": [rho_i, sigma],
+           "mgga_tau": [rho_i, sigma, tau_i]}
+    return out
 
 
 #: Libxc-family -> ordered list of the ingredients it consumes.

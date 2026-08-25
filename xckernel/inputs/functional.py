@@ -41,11 +41,21 @@ class Functional:
     ingredients: List[Ingredient]
 
     @classmethod
-    def of_family(cls, family: str) -> "Functional":
-        if family not in FAMILIES:
+    def of_family(cls, family: str, coords=None) -> "Functional":
+        """The family's ingredient set, optionally in a curvilinear system.
+
+        ``coords=None`` (or Cartesian) reproduces the historical table
+        exactly; any other system rebuilds the metric-carrying seeds and
+        refuses the families whose seeds are Cartesian-only.
+        """
+        from .ingredients import check_coordinates, families_for
+        table = families_for(coords)
+        if family not in table:
+            check_coordinates(family, coords)
             raise ValueError(
-                f"unknown family {family!r}; known: {sorted(FAMILIES)}")
-        return cls(family=family, ingredients=FAMILIES[family])
+                f"unknown family {family!r}; known: {sorted(table)}")
+        check_coordinates(family, coords)
+        return cls(family=family, ingredients=table[family])
 
     def vsymbol(self, ingredient: Ingredient) -> sp.Symbol:
         """The opaque Libxc derivative symbol d Exc / d ingredient."""

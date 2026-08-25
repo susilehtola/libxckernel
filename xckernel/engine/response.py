@@ -49,7 +49,8 @@ from ..inputs.basis import AXES
 from .deriv import LIBXC_MULTISET, VARS, libxc_symbol
 from .fock import fock_integrand
 from ..inputs.functional import Functional
-from ..inputs.ingredients import GRAD_RHO, PRIM_BY_SYMBOL
+from ..inputs.ingredients import (GRAD_RHO, PRIM_BY_SYMBOL,
+                                  prim_by_symbol_for)
 
 
 def pert_field(prim_name: str, label: str) -> sp.Symbol:
@@ -58,14 +59,17 @@ def pert_field(prim_name: str, label: str) -> sp.Symbol:
     if prim_name == "rho":
         return sp.Symbol(f"rho_{label}", real=True)
     if prim_name.startswith("grad_rho_"):
-        ax = prim_name[-1]
+        # slice the prefix, never the last character: a curvilinear axis
+        # name is not one letter, and "theta"/"phi" would collapse to
+        # "a"/"i" while prolate "mu"/"nu" would collide on "u"
+        ax = prim_name[len("grad_rho_"):]
         return sp.Symbol(f"grad_rho_{label}_{ax}", real=True)
     if prim_name == "lapl_rho":
         return sp.Symbol(f"lapl_rho_{label}", real=True)
     if prim_name == "tau":
         return sp.Symbol(f"tau_{label}", real=True)
     if prim_name.startswith("jp_"):
-        ax = prim_name[-1]
+        ax = prim_name[len("jp_"):]
         return sp.Symbol(f"jp_{label}_{ax}", real=True)
     if prim_name.startswith("hess_rho_"):
         comp = prim_name[len("hess_rho_"):]
@@ -83,15 +87,16 @@ def _pert_atom(prim, label: str) -> sp.Expr:
     return pert_field(prim.name, label)
 
 
-def perturbed_ingredient(ing, label: str) -> sp.Expr:
+def perturbed_ingredient(ing, label: str, coords=None) -> sp.Expr:
     """Perturbed value Y^X of a Libxc input variable, generically from the
     ingredient's value expression: Y^X = sum_p (dY/d p) p^X over the primitive
     fields p it contains.  Reproduces sigma^X = 2 grad rho . grad rho^X and
     extends to mapped ingredients (gauge-corrected tau, etc.)."""
     E = ing.value
+    by_sym = prim_by_symbol_for(coords)
     total = sp.Integer(0)
     for atom in E.free_symbols:
-        prim = PRIM_BY_SYMBOL.get(atom)
+        prim = by_sym.get(atom)
         if prim is not None:
             total += sp.diff(E, atom) * _pert_atom(prim, label)
     return sp.expand(total)
@@ -109,7 +114,7 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
         # sigma = grad rho . grad rho  =>  sigma^X = 2 grad rho . grad rho^X
         total = sp.Integer(0)
         for p in GRAD_RHO:
-            ax = p.name[-1]
+            ax = p.name[len("grad_rho_"):]
             total += 2 * p.symbol * sp.Symbol(f"grad_rho_{label}_{ax}", real=True)
         return total
     if var == "eta":
@@ -118,7 +123,8 @@ def perturbed_variable(var: str, label: str) -> sp.Expr:
     raise ValueError(f"unknown libxc variable {var!r}")
 
 
-def perturbed_ingredient2(ing, l1: str, l2: str) -> sp.Expr:
+def perturbed_ingredient2(ing, l1: str, l2: str,
+                          coords=None) -> sp.Expr:
     """Second-order perturbed value Y^{X1 X2} of a Libxc input variable:
     the part bilinear in two independent perturbations through the
     ingredient's own nonlinearity, sum_pq (d2 Y/dp dq) p^X1 q^X2.
@@ -126,18 +132,20 @@ def perturbed_ingredient2(ing, l1: str, l2: str) -> sp.Expr:
     2 grad rho^X1 . grad rho^X2 and extends to the mapped ingredients
     (gauge-corrected tau, eta) through their primitive expressions."""
     E = ing.value
-    prims = [a for a in E.free_symbols if PRIM_BY_SYMBOL.get(a) is not None]
+    by_sym = prim_by_symbol_for(coords)
+    prims = [a for a in E.free_symbols if by_sym.get(a) is not None]
     total = sp.Integer(0)
     for p in prims:
         for q in prims:
             d2 = sp.diff(E, p, q)
             if d2 != 0:
-                total += d2 * _pert_atom(PRIM_BY_SYMBOL[p], l1) \
-                    * _pert_atom(PRIM_BY_SYMBOL[q], l2)
+                total += d2 * _pert_atom(by_sym[p], l1) \
+                    * _pert_atom(by_sym[q], l2)
     return sp.expand(total)
 
 
-def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2") -> sp.Expr:
+def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2",
+                 coords=None) -> sp.Expr:
     """Per-point integrand of the XC kernel bilinear form between two
     perturbations (the E[2] coupling / Casida fxc matrix element),
 
@@ -151,7 +159,7 @@ def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2") -> sp.Expr:
     of both labels."""
     from .deriv import libxc_symbol as _ls
 
-    func = Functional.of_family(family)
+    func = Functional.of_family(family, coords)
     by_name = {ing.name: ing for ing in func.ingredients}
     from collections import Counter as _C
     total = sp.Integer(0)
@@ -164,12 +172,14 @@ def fxc_bilinear(family: str, l1: str = "p1", l2: str = "p2") -> sp.Expr:
             if iZ is None:
                 continue
             total += _ls(_C({Y: 1}) + _C({Z: 1})) \
-                * perturbed_ingredient(iY, l1) * perturbed_ingredient(iZ, l2)
-        total += func.vsymbol(iY) * perturbed_ingredient2(iY, l1, l2)
+                * perturbed_ingredient(iY, l1, coords) \
+                * perturbed_ingredient(iZ, l2, coords)
+        total += func.vsymbol(iY) * perturbed_ingredient2(iY, l1, l2, coords)
     return sp.expand(total)
 
 
-def fxc_channels(family: str, label: str = "p1") -> "dict[str, sp.Expr]":
+def fxc_channels(family: str, label: str = "p1",
+                 coords=None) -> "dict[str, sp.Expr]":
     """Per-point coefficient channels of the fxc contraction with ONE
     perturbation: the derivative of the bilinear form with respect to
     the second perturbation's operands.  Returns {'rho': u, 'grad_x':
@@ -177,9 +187,9 @@ def fxc_channels(family: str, label: str = "p1") -> "dict[str, sp.Expr]":
     is u - div(v) plus the tau-channel operator term, and a Casida
     coupling element is sum_g w [u drho' + v . grad drho' + w_tau
     dtau'] against a second perturbation's fields."""
-    b = fxc_bilinear(family, l1=label, l2="_q")
+    b = fxc_bilinear(family, l1=label, l2="_q", coords=coords)
     out = {"rho": sp.expand(sp.diff(b, sp.Symbol("rho__q", real=True)))}
-    for ax in AXES:
+    for ax in (AXES if coords is None else coords.axes):
         out[f"grad_{ax}"] = sp.expand(
             sp.diff(b, sp.Symbol(f"grad_rho__q_{ax}", real=True)))
     tau_q = sp.Symbol("tau__q", real=True)

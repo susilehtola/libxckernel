@@ -23,12 +23,14 @@ arrays (vrho[:,c], v2rhosigma[:,c], ...).
 from __future__ import annotations
 
 from collections import Counter
+from functools import lru_cache
 from dataclasses import dataclass
 from itertools import product
 from typing import Callable, Dict, List, Tuple
 
 import sympy as sp
 
+from ..inputs import ingredients as _ing
 from ..inputs.basis import AXES, HESS_COMPS, HESS_INDEX, Orbital, dot
 
 SPINS: Tuple[str, str] = ("a", "b")
@@ -62,7 +64,18 @@ def _grad_sym(spin: str, ax: str) -> sp.Symbol:
     return sp.Symbol(f"grad_rho_{spin}_{ax}", real=True)
 
 
-GRAD = {s: tuple(_grad_sym(s, ax) for ax in AXES) for s in SPINS}
+@lru_cache(maxsize=None)
+def grad_syms(coords=None) -> Dict[str, Tuple[sp.Symbol, ...]]:
+    """Spin-resolved gradient field symbols named after the system's own
+    axes: ``grad_rho_a_x`` in Cartesian, ``grad_rho_a_r`` for a radial
+    worker, ``grad_rho_a_mu`` for prolate spheroidal.  The chain rule
+    itself is unchanged -- the components are PHYSICAL ones -- so only
+    the names and their number depend on the coordinate system."""
+    axes = AXES if coords is None else coords.axes
+    return {s: tuple(_grad_sym(s, ax) for ax in axes) for s in SPINS}
+
+
+GRAD = grad_syms()
 
 #: spin-resolved paramagnetic-current, inverse-density, and density-Hessian
 #: fields (current-density and density-Hessian meta-GGA families).
@@ -75,52 +88,59 @@ HESS_S = {s: tuple(sp.Symbol(f"hess_rho_{s}_{AXES[i]}{AXES[j]}", real=True)
 
 # --- scalar-variable seeds  d(scalar)/dP^s at orbital pair (u, v) ----------
 
+# The spin-resolved seeds are the SAME bilinear forms as the
+# spin-summed ones, restricted to one spin channel, so they delegate to
+# the single coordinate-aware implementation in inputs.ingredients
+# rather than repeating it.  That is what lets a spin-polarized kernel
+# be emitted for a curvilinear system at all: the metric lives in one
+# place, and the two cannot drift apart.
+
 def _seed_rho(spin: str):
     def f(s: str, u: Orbital, v: Orbital) -> sp.Expr:
-        return u.val * v.val if s == spin else sp.Integer(0)
+        return _ing._k_rho(u, v) if s == spin else sp.Integer(0)
     return f
 
 
 def _seed_lapl(spin: str):
     def f(s: str, u: Orbital, v: Orbital) -> sp.Expr:
-        if s != spin:
-            return sp.Integer(0)
-        return u.lapl * v.val + 2 * dot(u.grad, v.grad) + u.val * v.lapl
+        return _ing._k_lapl(u, v) if s == spin else sp.Integer(0)
     return f
 
 
-def _seed_tau(spin: str):
+def _seed_tau(spin: str, coords=None):
     def f(s: str, u: Orbital, v: Orbital) -> sp.Expr:
-        return sp.Rational(1, 2) * dot(u.grad, v.grad) if s == spin \
-            else sp.Integer(0)
+        return _ing._k_tau(u, v, coords) if s == spin else sp.Integer(0)
     return f
 
 
-def _seed_grad(spin: str, ax: int):
+def _seed_grad(spin: str, ax: int, coords=None):
+    kernel = _ing._k_grad(ax, coords)
+
     def f(s: str, u: Orbital, v: Orbital) -> sp.Expr:
-        if s != spin:
-            return sp.Integer(0)
-        return u.grad[ax] * v.val + u.val * v.grad[ax]
+        return kernel(u, v) if s == spin else sp.Integer(0)
     return f
 
 
-def _sigma_value(comp: str) -> sp.Expr:
+def _sigma_value(comp: str, coords=None) -> sp.Expr:
     s1, s2 = COMP_SPINS["sigma"][comp]
-    return dot(GRAD[s1], GRAD[s2])
+    g = grad_syms(coords)
+    return dot(g[s1], g[s2])
 
 
-def _seed_sigma(comp: str):
+def _seed_sigma(comp: str, coords=None):
     # chain rule through the spin-resolved gradient fields
-    value = _sigma_value(comp)
+    value = _sigma_value(comp, coords)
+    g = grad_syms(coords)
     grad_seed_of = {}  # symbol -> (spin, axis)
     for spin in SPINS:
-        for ax in range(3):
-            grad_seed_of[GRAD[spin][ax]] = (spin, ax)
+        for ax in range(len(g[spin])):
+            grad_seed_of[g[spin][ax]] = (spin, ax)
 
     def f(s: str, u: Orbital, v: Orbital) -> sp.Expr:
         total = sp.Integer(0)
         for gsym, (spin, ax) in grad_seed_of.items():
-            total += sp.diff(value, gsym) * _seed_grad(spin, ax)(s, u, v)
+            total += sp.diff(value, gsym) \
+                * _seed_grad(spin, ax, coords)(s, u, v)
         return sp.expand(total)
     return f
 
@@ -310,7 +330,31 @@ FAMILY_GROUPS: Dict[str, List[str]] = {
 }
 
 
-def family_scalars(family: str) -> List[Scalar]:
+@lru_cache(maxsize=None)
+def _scalars_for(coords) -> Dict[Tuple[str, str], Scalar]:
+    """Scalar table for one coordinate system.
+
+    Only the seeds carry the metric, and only rho/sigma/tau have seeds
+    that a curvilinear system can express -- ``check_coordinates``
+    refuses the families that need the others -- so a non-Cartesian
+    table is built over those three groups alone.
+    """
+    if coords is None or coords.is_cartesian:
+        return SCALARS
+    out: Dict[Tuple[str, str], Scalar] = {}
+    for comp in COMPS["rho"]:
+        out[("rho", comp)] = Scalar("rho", comp, _seed_rho(comp))
+    for comp in COMPS["sigma"]:
+        out[("sigma", comp)] = Scalar("sigma", comp,
+                                      _seed_sigma(comp, coords))
+    for comp in COMPS["tau"]:
+        out[("tau", comp)] = Scalar("tau", comp, _seed_tau(comp, coords))
+    return out
+
+
+def family_scalars(family: str, coords=None) -> List[Scalar]:
+    _ing.check_coordinates(family, coords)
+    table = _scalars_for(coords)
     over = FAMILY_SCALAR_OVERRIDES.get(family, {})
-    return [over.get((g, c), SCALARS[(g, c)])
+    return [over.get((g, c), table[(g, c)])
             for g in FAMILY_GROUPS[family] for c in COMPS[g]]
