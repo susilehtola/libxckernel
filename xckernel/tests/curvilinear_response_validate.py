@@ -486,24 +486,113 @@ def check_spin_fxc(family, name, coords, factors, tol=5e-5):
     return (f"{name:14s} {family:9s} fxc_spin vs FD(vxc)", worst < tol, worst)
 
 
-def check_no_cartesian_leak(coords, name):
-    """A curvilinear kernel must not mix coordinate systems.
+def _all_symbols(obj, coords, seen=None):
+    """Every sympy symbol reachable from a generator return value.
 
-    ``kernel_integrand`` seeds the first derivative through
-    ``fock_integrand``, which is coordinate-aware, but every further
-    derivative goes through ``directional_derivative``.  When that built
-    its orbitals in the default (Cartesian) system, the second pair of an
-    order-2 kernel came out carrying dchi_t_x against the first pair's
-    dchi_u_r -- a silently mixed expression, not an error.
+    Handles the shapes the coordinate-aware API actually returns:
+    expressions, dicts of them, sequences, and the Scalar/Ingredient
+    records whose content is a seed that has to be applied to an
+    orbital pair before any symbol exists.
     """
-    from ..engine.kernel import kernel_integrand
+    out = set()
+    if isinstance(obj, sp.Basic):
+        return set(obj.free_symbols)
+    if isinstance(obj, dict):
+        for v in obj.values():
+            out |= _all_symbols(v, coords)
+        return out
+    if isinstance(obj, (list, tuple, set)):
+        for v in obj:
+            out |= _all_symbols(v, coords)
+        return out
+    u, v = Orbital.make("u", coords), Orbital.make("v", coords)
+    seed = getattr(obj, "seed", None)
+    if callable(seed):
+        try:                       # Ingredient.seed(u, v)
+            return set(seed(u, v).free_symbols)
+        except TypeError:          # Scalar.seed(spin, u, v)
+            for spin in ("a", "b"):
+                out |= set(seed(spin, u, v).free_symbols)
+            return out
+    if hasattr(obj, "expr"):
+        return set(obj.expr.free_symbols)
+    if hasattr(obj, "value"):
+        return _all_symbols(obj.value, coords)
+    return out
+
+
+#: Every coordinate-aware entry point that returns expressions, as
+#: (label, thunk).  Three bugs of one shape have been found here -- a
+#: coords-aware entry point delegating to a Cartesian-only helper --
+#: and none of them was catchable by comparing Cartesian output against
+#: a baseline, because Cartesian is exactly where each was invisible.
+#: The cure is to exercise the whole surface in a system whose axes are
+#: NOT x/y/z, and insist that nothing Cartesian comes back.
+def _surface(coords):
+    from ..engine.fock import (check_vxc_channels, fock_integrand,
+                               vxc_channels)
+    from ..engine.kernel import fock, kernel_integrand
+    from ..engine.response import fxc_bilinear
+    from ..engine.spin import family_scalars, grad_syms
+    from ..engine.spin_kernel import (check_vxc_channels_spin,
+                                      fxc_bilinear_spin)
+    from ..inputs.functional import Functional
+    from ..inputs.ingredients import primitives_for
+
+    items = [("primitives_for", lambda: primitives_for(coords)),
+             ("grad_syms", lambda: grad_syms(coords))]
+    for fam in FAMILY_FUNCTIONAL:
+        items += [
+            (f"Functional.of_family/{fam}",
+             lambda f=fam, _=0: Functional.of_family(f, coords).ingredients),
+            (f"fock_integrand/{fam}",
+             lambda f=fam, _=0: fock_integrand(f, coords=coords)),
+            (f"fock/{fam}", lambda f=fam, _=0: fock(f, coords=coords)),
+            (f"kernel_integrand.o2/{fam}",
+             lambda f=fam, _=0: kernel_integrand(
+                 f, [("u", "v"), ("t", "s")], coords=coords)),
+            (f"vxc_channels/{fam}", lambda f=fam, _=0: vxc_channels(f, coords)),
+            (f"check_vxc_channels/{fam}",
+             lambda f=fam, _=0: check_vxc_channels(f, coords)),
+            (f"fxc_bilinear/{fam}",
+             lambda f=fam, _=0: fxc_bilinear(f, coords=coords)),
+            (f"fxc_channels/{fam}",
+             lambda f=fam, _=0: fxc_channels(f, coords=coords)),
+            (f"family_scalars/{fam}",
+             lambda f=fam, _=0: family_scalars(f, coords)),
+            (f"fxc_bilinear_spin/{fam}",
+             lambda f=fam, _=0: fxc_bilinear_spin(f, coords=coords)),
+            (f"fxc_channels_spin/{fam}",
+             lambda f=fam, _=0: fxc_channels_spin(f, coords=coords)),
+            (f"vxc_channels_spin/{fam}",
+             lambda f=fam, _=0: vxc_channels_spin(f, coords)),
+            (f"check_vxc_channels_spin/{fam}",
+             lambda f=fam, _=0: check_vxc_channels_spin(f, coords)),
+        ]
+    return items
+
+
+def check_axis_purity(coords, name):
+    """No Cartesian axis may survive anywhere in the coords-aware API.
+
+    A curvilinear system never names an axis x, y or z, so a symbol
+    ending in one is proof that some helper fell back on the Cartesian
+    default -- which is how kernel_integrand came to emit dchi_t_x
+    beside dchi_u_r, and how pert_field turned "theta" into "a".
+    """
     axes = tuple(coords.axes)
-    ki = kernel_integrand("gga", [("u", "v"), ("t", "s")], coords=coords)
-    bad = sorted(sym.name for sym in ki.expr.free_symbols
-                 if sym.name.startswith("dchi_")
-                 and sym.name.rsplit("_", 1)[1] not in axes)
-    return (f"{name:14s} {'gga':9s} no Cartesian leak at order 2",
-            not bad, 0.0 if not bad else float(len(bad)))
+    cart = tuple(a for a in ("x", "y", "z") if a not in axes)
+    leaks = []
+    for label, thunk in _surface(coords):
+        syms = _all_symbols(thunk(), coords)
+        bad = sorted(t.name for t in syms
+                     if t.name.rsplit("_", 1)[-1] in cart)
+        if bad:
+            leaks.append(f"{label}: {bad[:4]}")
+    if leaks:
+        print("      leaks: " + "; ".join(leaks[:4]))
+    return (f"{name:14s} {'(all)':9s} no Cartesian axis in the coords API",
+            not leaks, float(len(leaks)))
 
 
 def main():
@@ -514,7 +603,7 @@ def main():
             checks.append(check_fxc(family, name, coords, factors))
             checks.append(check_spin_fock(family, name, coords, factors))
             checks.append(check_spin_fxc(family, name, coords, factors))
-        checks.append(check_no_cartesian_leak(coords, name))
+        checks.append(check_axis_purity(coords, name))
     bad = [c for c in checks if not c[1]]
     for label, ok, err in checks:
         print(f"  {'ok  ' if ok else 'FAIL'} {label}  rel={err:.2e}")
