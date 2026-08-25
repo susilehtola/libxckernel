@@ -122,14 +122,22 @@ def _atom_derivative(atom: sp.Symbol, func: Functional,
 
 
 def directional_derivative(expr: sp.Expr, func: Functional,
-                           u_label: str, v_label: str) -> sp.Expr:
+                           u_label: str, v_label: str,
+                           coords=None) -> sp.Expr:
     """Apply D_uv = d/dP_uv to an integrand expression.
+
+    ``coords`` must be the coordinate system ``func`` was built in: the
+    seeds applied here come from the functional's ingredients, so the
+    orbitals they are applied to have to carry the same axes.  Left at
+    the default while the functional is curvilinear, the derivative
+    silently mixes coordinate systems -- the second pair of a kernel
+    picks up Cartesian dchi_t_x against a radial dchi_u_r.
 
     Applied monomial-wise via the fastpoly representation, like every
     other derivative operator of the library."""
     from .fastpoly import from_expr, seeded_derivative, to_expr
-    u = Orbital.make(u_label)
-    v = Orbital.make(v_label)
+    u = Orbital.make(u_label, coords)
+    v = Orbital.make(v_label, coords)
 
     def seed(atom: sp.Symbol):
         d = _atom_derivative(atom, func, u, v)

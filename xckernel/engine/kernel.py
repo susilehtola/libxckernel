@@ -48,7 +48,8 @@ def kernel_integrand(family: str,
     fi: FockIntegrand = fock_integrand(family, *index_pairs[0], coords=coords)
     expr = fi.expr
     for (u_label, v_label) in index_pairs[1:]:
-        expr = directional_derivative(expr, func, u_label, v_label)
+        expr = directional_derivative(expr, func, u_label, v_label,
+                                      coords)
 
     return KernelIntegrand(functional=func, index_pairs=list(index_pairs),
                            expr=expr)

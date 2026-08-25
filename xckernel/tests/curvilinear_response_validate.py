@@ -486,6 +486,26 @@ def check_spin_fxc(family, name, coords, factors, tol=5e-5):
     return (f"{name:14s} {family:9s} fxc_spin vs FD(vxc)", worst < tol, worst)
 
 
+def check_no_cartesian_leak(coords, name):
+    """A curvilinear kernel must not mix coordinate systems.
+
+    ``kernel_integrand`` seeds the first derivative through
+    ``fock_integrand``, which is coordinate-aware, but every further
+    derivative goes through ``directional_derivative``.  When that built
+    its orbitals in the default (Cartesian) system, the second pair of an
+    order-2 kernel came out carrying dchi_t_x against the first pair's
+    dchi_u_r -- a silently mixed expression, not an error.
+    """
+    from ..engine.kernel import kernel_integrand
+    axes = tuple(coords.axes)
+    ki = kernel_integrand("gga", [("u", "v"), ("t", "s")], coords=coords)
+    bad = sorted(sym.name for sym in ki.expr.free_symbols
+                 if sym.name.startswith("dchi_")
+                 and sym.name.rsplit("_", 1)[1] not in axes)
+    return (f"{name:14s} {'gga':9s} no Cartesian leak at order 2",
+            not bad, 0.0 if not bad else float(len(bad)))
+
+
 def main():
     checks = []
     for name, (coords, factors) in SYSTEMS.items():
@@ -494,6 +514,7 @@ def main():
             checks.append(check_fxc(family, name, coords, factors))
             checks.append(check_spin_fock(family, name, coords, factors))
             checks.append(check_spin_fxc(family, name, coords, factors))
+        checks.append(check_no_cartesian_leak(coords, name))
     bad = [c for c in checks if not c[1]]
     for label, ok, err in checks:
         print(f"  {'ok  ' if ok else 'FAIL'} {label}  rel={err:.2e}")
