@@ -572,6 +572,69 @@ def _surface(coords):
     return items
 
 
+def _rename_cartesian(e, coords):
+    """Rewrite a Cartesian expression in the coordinate system's axes.
+
+    Cartesian axis i maps to the system's axis i; a component the system
+    does not carry is set to zero, which is exactly the reduction a host
+    with fewer components performs by hand.
+    """
+    m = {}
+    for i, ax in enumerate(("x", "y", "z")):
+        m[ax] = coords.axes[i] if i < len(coords.axes) else None
+    sub = {}
+    for t in e.free_symbols:
+        head, _, tail = t.name.rpartition("_")
+        if tail in m:
+            sub[t] = (sp.Symbol(f"{head}_{m[tail]}", real=True)
+                      if m[tail] else sp.Integer(0))
+    return sp.expand(e.subs(sub))
+
+
+def check_cartesian_isomorphism(coords, name):
+    """The channels must be the CARTESIAN ones with the axes renamed.
+
+    This is the claim the whole design rests on: written in physical
+    (orthonormal) components the chain rule is unchanged, so the metric
+    enters only through the ingredient seeds and never through the
+    channels.  If it holds, a curvilinear channel is the Cartesian one
+    under a relabelling of axes -- and any term quietly lost on the way
+    shows up here even though it leaves no Cartesian symbol behind, as
+    when a Cartesian-only primitive table matched no curvilinear
+    gradient and the GGA bilinear silently collapsed to its LDA part.
+    """
+    axmap = {"x": 0, "y": 1, "z": 2}
+    bad = []
+    for family in FAMILY_FUNCTIONAL:
+        pairs = [(vxc_channels(family), vxc_channels(family, coords), ""),
+                 (fxc_channels(family), fxc_channels(family, coords=coords),
+                  ""),
+                 (vxc_channels_spin(family), vxc_channels_spin(family, coords),
+                  "spin"),
+                 (fxc_channels_spin(family),
+                  fxc_channels_spin(family, coords=coords), "spin")]
+        for cart, curv, tag in pairs:
+            for key, e in cart.items():
+                head, _, tail = key.rpartition("_")
+                if tail in axmap:
+                    i = axmap[tail]
+                    if i >= len(coords.axes):
+                        continue          # a component this system drops
+                    ckey = f"{head}_{coords.axes[i]}"
+                else:
+                    ckey = key
+                got = curv.get(ckey)
+                if got is None:
+                    bad.append(f"{family}{tag}:{key} missing")
+                    continue
+                if sp.simplify(_rename_cartesian(e, coords) - got) != 0:
+                    bad.append(f"{family}{tag}:{key} differs")
+    if bad:
+        print("      " + "; ".join(bad[:4]))
+    return (f"{name:14s} {'(all)':9s} channels are Cartesian, axes renamed",
+            not bad, float(len(bad)))
+
+
 def check_axis_purity(coords, name):
     """No Cartesian axis may survive anywhere in the coords-aware API.
 
@@ -604,6 +667,7 @@ def main():
             checks.append(check_spin_fock(family, name, coords, factors))
             checks.append(check_spin_fxc(family, name, coords, factors))
         checks.append(check_axis_purity(coords, name))
+        checks.append(check_cartesian_isomorphism(coords, name))
     bad = [c for c in checks if not c[1]]
     for label, ok, err in checks:
         print(f"  {'ok  ' if ok else 'FAIL'} {label}  rel={err:.2e}")
