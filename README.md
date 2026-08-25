@@ -73,7 +73,7 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **156 kernels** named
+`catalog.py` enumerates, generates, and manifests **169 kernels** named
 `xck_<family>_<case>_o<order>[_<parities>]`, spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
@@ -81,7 +81,8 @@ gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
 local-hybrid calibration functions) — in the restricted, unrestricted, and
 closed-shell spin-adapted cases (singlet/triplet parity per perturbation)
 through fourth derivative order (third for the spin-resolved `cmgga_tau` and
-for `hmgga`, whose higher orders remain generatable on demand). Fifteen `xck_<family>_{r,ua,ub}_giao` kernels provide the explicit magnetic-field
+for `hmgga`, whose higher orders remain generatable on demand). Of these,
+fifteen `xck_<family>_{r,ua,ub}_giao` kernels provide the explicit magnetic-field
 derivatives of the Fock matrix with London (GIAO) orbitals, as the real
 factor of dF/dB_s = (i/2c) K_s at a real reference. Every kernel
 ships with a machine-readable manifest declaring its operands and shapes,
@@ -142,6 +143,8 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | two-sided (matrix-free) σ | LDA–mGGA | R | AO-route kernels | machine ε |
 | current-density (τ̃, jp seeds) | cmgga_tau | R + U + s/t | FD in general M | ~1e-12 |
 | density-Hessian (η) | hmgga | R + U + s/t | FD in general M | ~1e-11 |
+| curvilinear metric (spherical/prolate, l/m reductions) | all | n/a | Cartesian gradient norm | ~1e-6 |
+| curvilinear vxc + fxc (blocked DM) | LDA/GGA/mGGA(τ) | R + U | FD of Exc; FD of vxc | ~1e-8 |
 | C backend | all | R | NumPy backend | ~1e-16 |
 
 Conventions (the κ exponential sign, occupation/factor placement,
@@ -176,6 +179,7 @@ ground-state and perturbed fields, and the named Libxc derivative arrays that
 xckernel/
   inputs/          what goes in: the symbolic input definitions
     basis.py         symbolic basis-function fields (chi, grad, lapl, hess chi)
+                     + the orthogonal curvilinear coordinate systems
     ingredients.py   rho, grad rho, lapl rho, tau, jp, hess rho, eta + seeds
     functional.py    families as ingredient sets
     fields.py        numerical collocation helpers (incl. complex P)
@@ -202,9 +206,11 @@ xckernel/
     psi4backend.py   Psi4 host-idiom emitter (xcgen include files)
     vlxwriter.py     VeloxChem writer plugin
     gpawwriter.py    GPAW pair-coefficient/stress-field emitter
+    helfemwriter.py  HelFEM emitter: potential + kernel channels,
+                     curvilinear (radial/spherical/prolate) coordinates
     ncwriter.py      noncollinear (relativistic) kernel emitter
     release.py       self-contained C source package assembly
-  catalog.py       the 156-kernel catalog + machine-readable manifests
+  catalog.py       the 169-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/
