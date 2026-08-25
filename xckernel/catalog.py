@@ -417,11 +417,35 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
     return manifest
 
 
+def main(argv=None):
+    """Build the catalog into a directory.
+
+    The arguments are positional for backwards compatibility, but they
+    go through argparse so that ``--help`` prints usage: read straight
+    off sys.argv, it was taken as the output directory, and the catalog
+    was cheerfully generated into a folder named ``--help``.
+    """
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m xckernel.catalog",
+        description="Generate the kernel catalog and its manifests.")
+    p.add_argument("outdir", nargs="?", default="catalog",
+                   help="output directory (default: catalog)")
+    p.add_argument("families", nargs="?", default=None,
+                   help="comma-separated family names "
+                        f"(default: all of {','.join(FAMILIES)})")
+    p.add_argument("max_order", nargs="?", type=int, default=4,
+                   help="highest derivative order to generate (default: 4)")
+    p.add_argument("backend", nargs="?", default="numpy",
+                   help="emission backend (default: numpy)")
+    a = p.parse_args(argv)
+    families = a.families.split(",") if a.families else FAMILIES
+    unknown = [f for f in families if f not in FAMILIES]
+    if unknown:
+        p.error(f"unknown families {unknown}; known: {', '.join(FAMILIES)}")
+    m = build_catalog(a.outdir, families, a.max_order, backend=a.backend)
+    print(f"{len(m['kernels'])} kernels -> {a.outdir}/ [{a.backend}]")
+
+
 if __name__ == "__main__":
-    import sys
-    outdir = sys.argv[1] if len(sys.argv) > 1 else "catalog"
-    families = sys.argv[2].split(",") if len(sys.argv) > 2 else FAMILIES
-    max_order = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-    backend = sys.argv[4] if len(sys.argv) > 4 else "numpy"
-    m = build_catalog(outdir, families, max_order, backend=backend)
-    print(f"{len(m['kernels'])} kernels -> {outdir}/ [{backend}]")
+    main()
