@@ -253,9 +253,174 @@ def main(argv=None) -> None:
                    help="response mode (default: QRF)")
     p.add_argument("family", nargs="?", default="gga",
                    help="functional family (default: gga)")
+    p.add_argument("--emit-dir", metavar="DIR",
+                   help="write the generated regions as .inc files here "
+                        "instead of printing a branch body")
     a = p.parse_args(argv)
+    if a.emit_dir:
+        for fname in write_include_files(a.emit_dir):
+            print(fname)
+        return
     print(emit_branch(a.mode, a.family))
 
+
+
+# --- open-shell response contractions -------------------------------------
+#
+# VeloxChem has no open-shell kxc or lxc on any rung, and no open-shell
+# fxc for meta-GGAs: XCIntegrator throws "Not implemented for open-shell".
+# The missing piece is not the driver scaffolding, which their existing
+# open-shell fxc already demonstrates, but the spin-resolved chain rule --
+# 130,566 terms for the meta-GGA fourth-order case alone, which is why it
+# was never hand-derived. Here it is generated instead.
+
+#: Libxc flat component names per derivative array, in libxc's own
+#: packing order, spelled the way VeloxChem spells them.
+SPIN_COMPONENTS = {
+    "vrho": ("a", "b"),
+    "v2rho2": ("aa", "ab", "bb"),
+    "v3rho3": ("aaa", "aab", "abb", "bbb"),
+    "v4rho4": ("aaaa", "aaab", "aabb", "abbb", "bbbb"),
+}
+
+
+def _vlx_deriv_name(sym: str) -> str:
+    """xckernel's flat index -> VeloxChem's spelled component."""
+    base, _, idx = sym.rpartition("_")
+    comps = SPIN_COMPONENTS.get(base)
+    if comps is None or not idx.isdigit():
+        return sym
+    return f"{base}_{comps[int(idx)]}"
+
+
+#: perturbation label -> the density it names in the emitted source
+PERT_DENSITY = {"p1": "rhoB", "p2": "rhoC", "p3": "rhoD"}
+
+
+def _density_symbol(spins, labels):
+    """The perturbed-density product a monomial carries, written out.
+
+    The factors are kept EXPLICIT rather than folded into a symmetrized
+    grid component.  Folding rhoB_a*rhoC_b and rhoB_b*rhoC_a into one
+    "gam_ab" with a factor of two is only valid when the two
+    perturbations are the same density, and it silently disagrees with a
+    convention that also doubles the diagonal component.  Writing the
+    products out costs nothing and cannot be misread.
+    """
+    return " * ".join(f"{PERT_DENSITY[l]}_{s}"
+                      for s, l in sorted(zip(spins, labels),
+                                         key=lambda t: (t[1], t[0])))
+
+
+def openshell_contraction(family: str, order: int, indent: int = 24):
+    """Loop-body lines assigning G_a_val / G_b_val for one order.
+
+    Returns VeloxChem-idiom source: the same shape as the hand-written
+    closed-shell bodies, but with the spin sums carried explicitly
+    instead of folded into binomial combinations that only hold when
+    rho_a == rho_b.
+    """
+    import sympy as sp
+    from ..engine.spin_kernel import response_fock_spin
+
+    ind = " " * indent
+    out = []
+    for spin in ("a", "b"):
+        ri = response_fock_spin(family, spin, order)
+        cu = sp.Symbol("chi_u", real=True)
+        cv = sp.Symbol("chi_v", real=True)
+        w = sp.Symbol("w", real=True, positive=True)
+        expr = sp.expand(ri.expr / (cu * cv * w))
+
+        groups = {}
+        for mono in sp.Add.make_args(expr):
+            deriv, spins, labels, coeff = None, [], [], sp.Integer(1)
+            for fac in mono.as_ordered_factors():
+                base = fac.as_base_exp()[0]
+                name = getattr(base, "name", None)
+                if name is None:
+                    coeff *= fac
+                    continue
+                exp = int(fac.as_base_exp()[1])
+                if name.startswith("rho_"):
+                    _, s, lab = name.split("_")
+                    spins += [s] * exp
+                    labels += [lab] * exp
+                elif name.startswith(("v2", "v3", "v4", "vrho")):
+                    deriv = name
+                else:
+                    coeff *= fac
+            key = (_vlx_deriv_name(deriv), _density_symbol(spins, labels))
+            groups[key] = groups.get(key, sp.Integer(0)) + coeff
+
+        terms = []
+        for (d, rho), c in sorted(groups.items()):
+            c = sp.nsimplify(c)
+            pre = "" if c == 1 else f"{float(c)} * "
+            terms.append(f"{pre}{d} * {rho}")
+        body = "\n".join(f"{ind}    {'  ' if i else ''}{'+ ' if i else ''}{t}"
+                         for i, t in enumerate(terms))
+        out.append(f"{ind}G_{spin}_val[nu_offset + g] += weights[g] *\n"
+                   f"{body}\n{ind}    ;")
+    return "\n".join(out)
+
+
+# --- include-file emission -------------------------------------------------
+#
+# The generated regions go into standalone .inc files that the VeloxChem
+# sources #include, rather than being spliced between markers. Splicing
+# makes regeneration a merge problem; an include makes it a file
+# overwrite. This mirrors the psi4backend --emit-dir convention, and it
+# also matches VeloxChem's own practice of committing generated sources
+# (src/onee_ints carries 15 of them) -- with the improvement that these
+# name a public generator they can re-run.
+
+INCLUDE_FILE_NOTICE = (
+    "// This file is machine-generated by xckernel in its entirety;\n"
+    "// do not edit.  Reproduce with:\n"
+    "//     python -m xckernel.emitters.vlxwriter --emit-dir <this directory>\n"
+    "// Copyright (c) 2026 Susi Lehtola.\n")
+
+#: Open-shell response contractions VeloxChem lacks entirely.  The
+#: closed-shell counterparts exist and are trusted; these are the spin
+#: sums they fold away, restored.
+OPENSHELL_REGIONS = (
+    ("lda", 3, "vlx_openshell_lda_kxc"),
+    ("lda", 4, "vlx_openshell_lda_lxc"),
+)
+
+
+def emit_openshell_regions() -> "dict[str, str]":
+    """Every open-shell contraction region, keyed by include-file stem."""
+    out = {}
+    for family, order, stem in OPENSHELL_REGIONS:
+        nm = {2: "fxc", 3: "kxc", 4: "lxc"}[order]
+        head = (f"// Open-shell {family.upper()} {nm} contraction "
+                f"(order {order}).\n"
+                f"// Included inside the (nu, g) loop; assigns G_a_val and\n"
+                f"// G_b_val.  Operands: weights, the perturbed densities\n"
+                f"// rhoB_a/rhoB_b/... per spin, and the Libxc arrays with\n"
+                f"// their components spelled out.  Setting rho_a = rho_b\n"
+                f"// reproduces VeloxChem's hand-folded closed-shell\n"
+                f"// coefficients exactly (see xckernel.tests."
+                f"vlx_openshell_validate).\n")
+        out[stem] = head + openshell_contraction(family, order, indent=16)
+    return out
+
+
+def write_include_files(directory: str) -> "list[str]":
+    """Write each region to <directory>/<stem>.inc; return the file names."""
+    import os
+    os.makedirs(directory, exist_ok=True)
+    written = []
+    for stem, text in sorted(emit_openshell_regions().items()):
+        fname = f"{stem}.inc"
+        with open(os.path.join(directory, fname), "w") as f:
+            f.write(INCLUDE_FILE_NOTICE)
+            f.write(text)
+            f.write("\n")
+        written.append(fname)
+    return written
 
 if __name__ == "__main__":
     main()
