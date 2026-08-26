@@ -546,10 +546,11 @@ def openshell_fxc_mgga(indent: int = 24) -> str:
         fused = " + ".join(
             f"({_render(ch[f'grad_{s}_{ax}'])}) * chi_{ax}_val[nu_offset + g]"
             for ax in ("x", "y", "z"))
-        out.append(f"{ind}G_gga_{s}_val[nu_offset + g] = w * ({fused});")
+        # VeloxChem names these G_<spin>_gga..., spin BEFORE gga
+        out.append(f"{ind}G_{s}_gga_val[nu_offset + g] = w * ({fused});")
         tau = _render(ch[f"tau_{s}"])
         for ax in ("x", "y", "z"):
-            out.append(f"{ind}G_gga_{s}_{ax}_val[nu_offset + g] = "
+            out.append(f"{ind}G_{s}_gga_{ax}_val[nu_offset + g] = "
                        f"w * ({tau}) * chi_{ax}_val[nu_offset + g];")
     return "\n".join(out)
 
