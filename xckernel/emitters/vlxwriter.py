@@ -293,23 +293,25 @@ def _vlx_deriv_name(sym: str) -> str:
     return f"{base}_{comps[int(idx)]}"
 
 
-#: perturbation label -> the density it names in the emitted source
-PERT_DENSITY = {"p1": "rhoB", "p2": "rhoC", "p3": "rhoD"}
-
-
 def _density_symbol(spins, labels):
-    """The perturbed-density product a monomial carries, written out.
+    """The density-grid component a monomial's perturbed densities name.
 
-    The factors are kept EXPLICIT rather than folded into a symmetrized
-    grid component.  Folding rhoB_a*rhoC_b and rhoB_b*rhoC_a into one
-    "gam_ab" with a factor of two is only valid when the two
-    perturbations are the same density, and it silently disagrees with a
-    convention that also doubles the diagonal component.  Writing the
-    products out costs nothing and cannot be misread.
+    The perturbed densities are complex, and their products are already
+    formed by the density-product layer -- VeloxChem's gam arrays, built
+    with prod2_r/prod2_i.  The contraction therefore consumes gam
+    components rather than re-deriving the products, which keeps the
+    complex expansion in the one place that already owns it.
+
+    The spin pair is kept ORDERED: gam_ab is rhoB_a * rhoC_b and gam_ba
+    is rhoB_b * rhoC_a, as separate components.  Folding them into a
+    single symmetrized "gam_ab" with a multiplicity of two would be
+    valid only when the two perturbations carry the same density, and it
+    disagrees with a convention that also doubles the diagonal.  Kept
+    ordered, every coefficient maps one-to-one with no factor at all,
+    and the ambiguity cannot arise.
     """
-    return " * ".join(f"{PERT_DENSITY[l]}_{s}"
-                      for s, l in sorted(zip(spins, labels),
-                                         key=lambda t: (t[1], t[0])))
+    ordered = [s for _, s in sorted(zip(labels, spins))]
+    return "gam_" + "".join(ordered)
 
 
 def openshell_contraction(family: str, order: int, indent: int = 24):
