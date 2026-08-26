@@ -395,6 +395,20 @@ OPENSHELL_REGIONS = (
 def emit_openshell_regions() -> "dict[str, str]":
     """Every open-shell contraction region, keyed by include-file stem."""
     out = {}
+    # The meta-GGA fxc is the one region reachable from Python today:
+    # the unrestricted linear-response solvers call integrate_fxc_fock,
+    # which currently throws for a meta-GGA.
+    out["vlx_openshell_mgga_fxc"] = (
+        "// Open-shell tau-meta-GGA fxc contraction (order 2).\n"
+        "// Included inside the (nu, g) loop of the generated driver,\n"
+        "// which declares the operands this uses.  Assigns the value\n"
+        "// channel, the FUSED gradient channel (the three Cartesian\n"
+        "// components pre-contracted, as VeloxChem already does), and\n"
+        "// the tau channel per component.\n"
+        "// Tau-only, matching VeloxChem's own convention: their\n"
+        "// closed-shell meta-GGA fxc allocates the Laplacian arrays but\n"
+        "// has every Laplacian contribution commented out.\n"
+        + openshell_fxc_mgga(indent=24))
     for family, order, stem in OPENSHELL_REGIONS:
         nm = {2: "fxc", 3: "kxc", 4: "lxc"}[order]
         head = (f"// Open-shell {family.upper()} {nm} contraction "
@@ -423,6 +437,102 @@ def write_include_files(directory: str) -> "list[str]":
             f.write("\n")
         written.append(fname)
     return written
+
+
+# --- open-shell meta-GGA fxc ----------------------------------------------
+#
+# This is the one missing piece that is reachable from Python today: the
+# unrestricted linear-response solvers exist (lreigensolverunrest,
+# lrsolverunrest, tdaeigensolverunrest, cppsolverunrest) and reach
+# integrate_fxc_fock, which throws "Only implemented for open-shell
+# LDA/GGA" for a meta-GGA. An unrestricted TD-DFT run with a
+# meta-GGA therefore fails outright.
+#
+# VeloxChem's meta-GGA XC is tau-only IN PRACTICE: their closed-shell
+# fxc allocates the Laplacian arrays and asks Libxc for them, but every
+# Laplacian contribution is commented out. The generated open-shell
+# counterpart matches that convention rather than Libxc's full mGGA, so
+# the spin-compensated limit is comparable against their own routine.
+
+#: xckernel operand -> the name our generated driver declares for it.
+#: Ground-state gradients, the perturbed density/gradient/tau, and the
+#: quadrature weight. Libxc derivative components are emitted as flat
+#: indexed reads instead, which cannot be misspelled.
+VLX_OPERANDS = {
+    "w": "w",
+    "rho_a_p1": "rwa", "rho_b_p1": "rwb",
+    "tau_a_p1": "tauwa", "tau_b_p1": "tauwb",
+}
+for _s in ("a", "b"):
+    for _ax in ("x", "y", "z"):
+        VLX_OPERANDS[f"grad_rho_{_s}_{_ax}"] = f"grad{_s}_{_ax}"
+        VLX_OPERANDS[f"grad_rho_{_s}_p1_{_ax}"] = f"rw{_s}_{_ax}"
+
+#: Libxc polarized component spellings, in Libxc's packing order.
+VLX_COMPONENTS = {
+    "vrho": ("a", "b"),
+    "vsigma": ("aa", "ab", "bb"),
+    "vtau": ("a", "b"),
+    "v2rho2": ("aa", "ab", "bb"),
+    "v2rhosigma": ("a_aa", "a_ab", "a_bb", "b_aa", "b_ab", "b_bb"),
+    "v2rhotau": ("aa", "ab", "ba", "bb"),
+    "v2sigma2": ("aa_aa", "aa_ab", "aa_bb", "ab_ab", "ab_bb", "bb_bb"),
+    "v2sigmatau": ("aa_a", "aa_b", "ab_a", "ab_b", "bb_a", "bb_b"),
+    "v2tau2": ("aa", "ab", "bb"),
+}
+
+
+def _vlx_operand(name: str) -> str:
+    """Render one xckernel operand in the generated driver's vocabulary."""
+    if name in VLX_OPERANDS:
+        return VLX_OPERANDS[name]
+    base, _, idx = name.rpartition("_")
+    comps = VLX_COMPONENTS.get(base)
+    if comps is not None and idx.isdigit():
+        return f"{base}_{comps[int(idx)]}"
+    return name
+
+
+def _render(expr) -> str:
+    """C++ expression for one channel, in the driver's operand names.
+
+    Integer powers are written out as products: sympy's default ccode
+    emits pow(x, 2), and this sits in the innermost loop over grid
+    points, where a libm call per term would be a real cost. VeloxChem's
+    own hand-written kernels write the products out for the same reason.
+    """
+    import sympy as sp
+    from .fieldkernel import CxxPrinter
+    sub = {t: sp.Symbol(_vlx_operand(t.name), real=True)
+           for t in expr.free_symbols}
+    return CxxPrinter().doprint(sp.expand(expr.subs(sub)))
+
+
+def openshell_fxc_mgga(indent: int = 24) -> str:
+    """Loop body for the open-shell tau-meta-GGA fxc.
+
+    Assigns the value channel (G), the FUSED gradient channel (G_gga,
+    the three Cartesian components pre-contracted against the basis
+    gradients as VeloxChem already does for its closed-shell routines),
+    and the tau channel per component (G_gga_x/y/z).
+    """
+    from ..engine.spin_kernel import fxc_channels_spin
+
+    ch = fxc_channels_spin("mgga_tau")
+    ind = " " * indent
+    out = []
+    for s in ("a", "b"):
+        out.append(f"{ind}G_{s}_val[nu_offset + g] = w * ("
+                   f"{_render(ch[f'rho_{s}'])}) * chi_val[nu_offset + g];")
+        fused = " + ".join(
+            f"({_render(ch[f'grad_{s}_{ax}'])}) * chi_{ax}_val[nu_offset + g]"
+            for ax in ("x", "y", "z"))
+        out.append(f"{ind}G_gga_{s}_val[nu_offset + g] = w * ({fused});")
+        tau = _render(ch[f"tau_{s}"])
+        for ax in ("x", "y", "z"):
+            out.append(f"{ind}G_gga_{s}_{ax}_val[nu_offset + g] = "
+                       f"w * ({tau}) * chi_{ax}_val[nu_offset + g];")
+    return "\n".join(out)
 
 if __name__ == "__main__":
     main()
