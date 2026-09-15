@@ -312,7 +312,19 @@ def emit_cxx(spec: FieldKernel, cse: bool = True, drop_zero: bool = False,
     the NumPy path, so the two emissions cannot drift apart.
     """
     printer = printer or CxxPrinter()
+    # An explicit ``params`` fixes the positional order; without it the
+    # discovered (alphabetical) one is used, as every spec that predates
+    # the option relies on. Checking the two agree as SETS is what makes
+    # an explicit order safe: a typo drops or invents a parameter, and a
+    # kernel whose arguments are all doubles would otherwise bind the
+    # mistake silently.
     operands = spec.operands()
+    if spec.params is not None:
+        if sorted(spec.params) != operands:
+            raise ValueError(
+                f"{spec.name}: params {sorted(spec.params)} do not match "
+                f"the operands {operands} the expressions reference")
+        operands = list(spec.params)
 
     # The layout already names every channel (u, v_x, w_tau, u_a, ...);
     # those names ARE the output references, so the C++ signature cannot

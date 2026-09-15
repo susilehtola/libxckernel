@@ -17,10 +17,12 @@ loop it already has:
                        v2rho2, v2rhosigma, v2sigma2, vsigma,
                        u, v_r);
 
-HelFEM's atomic worker carries a single radial gradient component, so the
-radial kernels are emitted over one axis; the three-dimensional workers
-use the ``_3d`` variants.  Both come from the same expressions, so the
-two cannot drift apart.
+HelFEM's spherically averaged atomic worker carries a single radial
+gradient component, so the radial kernels are emitted over one axis; the
+diatomic pure-m worker carries two and uses the ``_2d`` variants; the
+three-dimensional atomic and diatomic workers carry three and use the
+``_3d`` ones.  All three come from the same expressions, so they cannot
+drift apart.
 
 Reproduce with: python -m xckernel.emitters.helfemwriter --emit <file>
 """
@@ -33,7 +35,7 @@ from .fieldkernel import (ChannelLayout, FieldKernel, GradientLayout,
 from ..engine.fock import vxc_channels
 from ..engine.response import fxc_channels
 from ..engine.spin_kernel import vxc_channels_spin
-from ..inputs.basis import RADIAL
+from ..inputs.basis import PROLATE_PUREM, RADIAL
 
 #: families HelFEM can assemble today: it has no laplacian response, so
 #: the mgga_lapl and full mgga families are deliberately absent.
@@ -46,6 +48,47 @@ FAMILIES = ("lda", "gga", "mgga_tau")
 #: distinguishes the two lives in inputs/basis.py rather than here.
 RADIAL_AXES = RADIAL.axes
 CARTESIAN_AXES = ("x", "y", "z")
+
+#: HelFEM's diatomic pure-m worker keeps two: the density of an
+#: exp(i m phi) orbital is phi-independent, so the azimuthal gradient
+#: component vanishes identically and quadrature runs over the (mu, nu)
+#: plane.  The channels are written in PHYSICAL components, so the two
+#: surviving ones obey the same chain rule as any other pair -- what the
+#: reduction removes is a component, not a metric.
+PUREM_AXES = PROLATE_PUREM.axes
+
+
+def _channel_params(spec_exprs, axes, spins=None) -> list:
+    """Positional parameter order for a channel kernel.
+
+    The operands a :class:`FieldKernel` discovers come back sorted by
+    name, which for a single axis (``_r``) or the Cartesian ones
+    (``_x``) happens to put the perturbed gradient before the reference
+    one -- ``p1`` sorts before ``r``, ``x``, ``y``, ``z``.  For the
+    pure-m axes it does not: ``mu`` sorts before ``p1``, so the same
+    spec would emit the two blocks in the opposite order and a call site
+    written from one signature would silently mis-bind the other.
+
+    Pin the order instead: perturbed gradient components, reference
+    gradient components, the perturbed density and tau, then the Libxc
+    arrays.  Every kernel here then has the same shape of signature
+    whatever its axes are called.
+    """
+    ops = sorted({sym.name for e in spec_exprs.values()
+                  for sym in e.free_symbols})
+    head = []
+    for sp_ in (spins or (None,)):
+        tag = "" if sp_ is None else f"_{sp_}"
+        head += [f"grad_rho{tag}_p1_{ax}" for ax in axes]
+        head += [f"grad_rho{tag}_{ax}" for ax in axes]
+    for sp_ in (spins or (None,)):
+        tag = "" if sp_ is None else f"_{sp_}"
+        head.append(f"rho{tag}_p1")
+    for sp_ in (spins or (None,)):
+        tag = "" if sp_ is None else f"_{sp_}"
+        head.append(f"tau{tag}_p1")
+    head = [n for n in head if n in ops]
+    return head + [n for n in ops if n not in head]
 
 
 def spec_radial(family: str) -> FieldKernel:
@@ -91,6 +134,61 @@ def spec_radial_spin(family: str) -> FieldKernel:
              "u_s multiplies the basis-function pair of spin s, v_s_r its "
              "radial derivative,",
              "w_s (tau families) the pair's kinetic-energy density.",
+             "Polarized Libxc arrays keep their flat packing "
+             "(v2rho2_0 = uu, _1 = ud, _2 = dd, ...).")
+    )
+
+
+def spec_cartesian_spin(family: str) -> FieldKernel:
+    """Spin-resolved channel kernel, three gradient components.
+
+    The spin-resolved gradient channel mixes the two spins' gradients --
+    sigma_ab = grad rho_a . grad rho_b is not a sum of squares -- so
+    unlike the ground-state potential this cannot be applied one
+    component at a time from a single-component kernel.  The three
+    components have to be emitted together.
+    """
+    from ..engine.spin_kernel import fxc_channels_spin
+    return FieldKernel(
+        name=f"xck_helfem_fxc_{family}_3d_spin",
+        exprs=fxc_channels_spin(family),
+        layout=SpinChannelLayout(axes=CARTESIAN_AXES),
+        doc=(f"Spin-resolved {family} fxc channels, three gradient "
+             "components.",
+             "Polarized Libxc arrays keep their flat packing "
+             "(v2rho2_0 = uu, _1 = ud, _2 = dd, ...).")
+    )
+
+
+def spec_purem(family: str) -> FieldKernel:
+    """Channel kernel for the diatomic pure-m worker's two components."""
+    exprs = fxc_channels(family, coords=PROLATE_PUREM)
+    return FieldKernel(
+        name=f"xck_helfem_fxc_{family}_2d",
+        exprs=exprs,
+        params=_channel_params(exprs, PUREM_AXES),
+        binding="positional",
+        layout=ChannelLayout(axes=PUREM_AXES),
+        doc=(f"{family} fxc coefficient channels, two gradient components "
+             "(mu, nu).",
+             "The pure-m density is phi-independent, so the azimuthal "
+             "component is absent",
+             "rather than zero: it is never formed.")
+    )
+
+
+def spec_purem_spin(family: str) -> FieldKernel:
+    """Spin-resolved pure-m channel kernel, two gradient components."""
+    from ..engine.spin_kernel import fxc_channels_spin
+    exprs = fxc_channels_spin(family, coords=PROLATE_PUREM)
+    return FieldKernel(
+        name=f"xck_helfem_fxc_{family}_2d_spin",
+        exprs=exprs,
+        params=_channel_params(exprs, PUREM_AXES, spins=("a", "b")),
+        binding="positional",
+        layout=SpinChannelLayout(axes=PUREM_AXES),
+        doc=(f"Spin-resolved {family} fxc channels, two gradient "
+             "components (mu, nu).",
              "Polarized Libxc arrays keep their flat packing "
              "(v2rho2_0 = uu, _1 = ud, _2 = dd, ...).")
     )
@@ -170,7 +268,10 @@ def specs():
         out.append(spec_radial(fam))
         out.append(spec_radial_spin(fam))
         if fam != "lda":
+            out.append(spec_purem(fam))
+            out.append(spec_purem_spin(fam))
             out.append(spec_cartesian(fam))
+            out.append(spec_cartesian_spin(fam))
     return out
 
 
