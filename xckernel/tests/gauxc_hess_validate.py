@@ -192,6 +192,27 @@ def run() -> int:
 
         recipe = float((env["w"] * outer).sum()) + pulay
 
+        # the Pulay term the way the host now contracts it: as matrix
+        # products through the emitted point weights W_ab
+        from ..emitters.gauxcwriter import pulay_weights, _pulay_rows
+        W = pulay_weights(family)
+        al = [np.broadcast_to(env[r.name], (NBF, NG)) if r.name in env
+              else np.zeros((NBF, NG)) for r in _pulay_rows("A")]
+        be = [np.broadcast_to(env[r.name], (NBF, NG)) if r.name in env
+              else np.zeros((NBF, NG)) for r in _pulay_rows("B")]
+        M = np.zeros((NBF, NBF))
+        for a_ in range(4):
+            for b_ in range(4):
+                if W[a_][b_] != 0:
+                    wg = np.broadcast_to(_direct_block(W[a_][b_], env, "g"), (NG,))
+                    M += (al[a_] * wg) @ be[b_].T
+        pulay_gemm = float((env["D_u_v"] * M).sum())
+        relp = abs(pulay_gemm - pulay) / max(1e-30, abs(pulay))
+        okp = relp < 1e-12
+        failures += 0 if okp else 1
+        print(f"  [{'OK' if okp else '!!'}] {family:9s} Pulay as GEMMs vs per "
+              f"pair: {pulay_gemm:+.10e} vs {pulay:+.10e} rel {relp:.2e}")
+
         rel = abs(direct - recipe) / max(1e-30, abs(direct))
         ok = rel < 1e-12
         failures += 0 if ok else 1
@@ -200,8 +221,10 @@ def run() -> int:
               f"rel {rel:.2e}")
 
         # --- route 3: the EMITTED C++, on one sampled (function, point) -
-        from ..emitters.gauxcwriter import spec_rows, spec_pair, _seed_specs
-        specs = [spec_rows(family), spec_pair(family)] + _seed_specs(family)
+        from ..emitters.gauxcwriter import (spec_rows, spec_pair, _seed_specs,
+                                            spec_pulay_weights)
+        specs = ([spec_rows(family), spec_pair(family)] + _seed_specs(family)
+                 + [spec_pulay_weights(family)])
         iu, iv, ig = 0, NBF - 1, NG // 2
         scal = dict(penv)
 
@@ -233,7 +256,7 @@ def run() -> int:
 
     shutil.rmtree(tmp, ignore_errors=True)
     tag = "OK " if not failures else "FAIL"
-    print(f"[{tag}] gauxc_hess_validate: {2*len(FAMILIES)} checks, "
+    print(f"[{tag}] gauxc_hess_validate: {3*len(FAMILIES)} checks, "
           f"{failures} failures")
     return failures
 

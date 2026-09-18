@@ -323,6 +323,10 @@ def _bindings(kind: str, family: str) -> dict:
             b[f"ddchi_gA_u_{a}"] = f"ddA[{c}]"
             b[f"ddchi_gB_v_{a}"] = f"ddB[{c}]"
         b["s"] = "sv"
+    elif kind == "pulayW":
+        for a in range(4):
+            for c in range(4):
+                b[f"W{a}{c}"] = f"W[{4*a+c}]"
     elif kind == "same":
         b.update({"U0_u": "xmat[k]", "U1_u": "xmat_x[k]",
                   "U2_u": "xmat_y[k]", "U3_u": "xmat_z[k]",
@@ -338,6 +342,8 @@ def _spec_for(kind: str, family: str) -> FieldKernel:
         return spec_rows(family)
     if kind == "pair":
         return spec_pair(family)
+    if kind == "pulayW":
+        return spec_pulay_weights(family)
     for s in _seed_specs(family):
         if s.name == f"xck_gauxc_hess_{kind}_{family}":
             return s
@@ -396,7 +402,7 @@ def emit_call_sites() -> dict:
 
     out["gauxc_hess_call_rows"] = rows_body
     out["gauxc_hess_call_pair"] = lambda fam: [_bound_call("pair", fam)]
-    out["gauxc_hess_call_pulay"] = lambda fam: [_bound_call("pulay", fam)]
+    out["gauxc_hess_call_pulayW"] = lambda fam: [_bound_call("pulayW", fam)]
     out["gauxc_hess_call_same"] = lambda fam: [_bound_call("same", fam)]
 
     texts = {}
@@ -421,6 +427,70 @@ def write_include_files(directory: str) -> list:
     return written
 
 
+#: The row basis of the Pulay term on each side: the displaced function
+#: itself (slot 0) and its three displaced gradient components (slots 1-3).
+def _pulay_rows(side: str):
+    lab, oth = ("u", "A") if side == "A" else ("v", "B")
+    S = lambda n: sp.Symbol(n, real=True)
+    return [S(f"dchi_g{oth}_{lab}")] + [S(f"ddchi_g{oth}_{lab}_{a}") for a in AXES]
+
+
+def pulay_weights(family: str):
+    """The Pulay term as a 4 x 4 POINT-WEIGHT matrix W_ab(g).
+
+    Every Pulay monomial is exactly one u-row times one v-row times a
+    per-point factor, so the term is bilinear in the two row sets:
+
+        pulay_uv(g) = sum_ab alpha_a(u,g) W_ab(g) beta_b(v,g),
+
+    with alpha = (dchi_gA, ddchi_gA_x, ddchi_gA_y, ddchi_gA_z) and beta the
+    same on the v side. A host can then form
+    T_uv = sum_a alpha_a diag(W_a.) beta^T as matrix products instead of
+    calling a kernel for every function pair at every point -- the
+    difference between BLAS-3 and nbe^2 npts scalar calls. Bilinearity
+    makes the extraction exact: W_ab = d^2 pulay / d alpha_a d beta_b.
+    """
+    spec = [s for s in _seed_specs(family) if s.name.endswith(f"pulay_{family}")][0]
+    e = sp.expand(spec.exprs["s"])
+    pool = {sym.name: sym for sym in e.free_symbols}
+    al = [pool.get(r.name, r) for r in _pulay_rows("A")]
+    be = [pool.get(r.name, r) for r in _pulay_rows("B")]
+    W = [[sp.expand(sp.diff(e, al[a], be[b])) for b in range(4)] for a in range(4)]
+
+    # Prove it: the weights must rebuild the term exactly, and must not
+    # still depend on either row set (bilinearity).
+    rebuilt = sum(al[a] * W[a][b] * be[b] for a in range(4) for b in range(4))
+    if sp.expand(rebuilt - e) != 0:
+        raise AssertionError(f"{family}: Pulay term is not bilinear in the rows")
+    rows = set(al) | set(be)
+    for a in range(4):
+        for b in range(4):
+            if W[a][b].free_symbols & rows:
+                raise AssertionError(f"{family}: W_{a}{b} still depends on a row")
+    return W
+
+
+def spec_pulay_weights(family: str) -> FieldKernel:
+    """Emit the NONZERO W_ab(g) only; the host zero-fills a 4 x 4 array
+    per point, so the rung decides which entries get written."""
+    W = pulay_weights(family)
+    exprs, targets = {}, []
+    for a in range(4):
+        for b in range(4):
+            if W[a][b] != 0:
+                exprs[f"W{a}{b}"] = W[a][b]
+                targets.append(f"W{a}{b}")
+    return FieldKernel(
+        name=f"xck_gauxc_hess_pulayW_{family}",
+        exprs=exprs,
+        layout=ExplicitLayout(targets=targets, ret="None"),
+        doc=(f"{family}: Pulay point-weight matrix W_ab, weight included.",
+             "Slots: 0 = displaced function, 1-3 = its displaced gradient.",
+             "pulay_uv = sum_ab alpha_a(u) W_ab beta_b(v): contract the rows",
+             "as matrix products rather than per function pair.")
+    )
+
+
 def specs():
     out = []
     for fam in FAMILIES:
@@ -428,6 +498,7 @@ def specs():
         out.append(spec_rows(fam))
         out.append(spec_pair(fam))
         out.extend(_seed_specs(fam))
+        out.append(spec_pulay_weights(fam))
     return out
 
 
