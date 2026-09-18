@@ -291,9 +291,13 @@ class CxxPrinter(C99CodePrinter):
     """
 
     def _print_Pow(self, expr):
+        # The product is PARENTHESIZED: the enclosing Mul printer still
+        # ranks this node as a Pow, which binds tighter than '*' and '/',
+        # so it never adds parentheses itself. A bare 'b*b' as a
+        # denominator reads a/b*b = a -- wrong, and silently so.
         if expr.exp.is_Integer and 1 < int(expr.exp) <= 4:
             b = self.parenthesize(expr.base, 100)
-            return "*".join([b] * int(expr.exp))
+            return "(" + "*".join([b] * int(expr.exp)) + ")"
         return super()._print_Pow(expr)
 
 
