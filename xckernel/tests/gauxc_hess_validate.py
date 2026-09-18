@@ -222,9 +222,9 @@ def run() -> int:
 
         # --- route 3: the EMITTED C++, on one sampled (function, point) -
         from ..emitters.gauxcwriter import (spec_rows, spec_pair, _seed_specs,
-                                            spec_pulay_weights)
+                                            spec_pulay_weights, spec_egrad)
         specs = ([spec_rows(family), spec_pair(family)] + _seed_specs(family)
-                 + [spec_pulay_weights(family)])
+                 + [spec_pulay_weights(family), spec_egrad(family)])
         iu, iv, ig = 0, NBF - 1, NG // 2
         scal = dict(penv)
 
@@ -254,9 +254,43 @@ def run() -> int:
         print(f"  [{'OK' if ok2 else '!!'}] {family:9s} emitted C++ vs SymPy: "
               f"{len(got)} channels, worst rel {dev:.2e}")
 
+    # --- the weight-class kernels: emitted C++ vs SymPy at 30 digits, on
+    # sampled geometries and across each cell function's switching range
+    # (Becke right up to mu -> 1, where t and u diverge)
+    from ..emitters.gauxcwriter import spec_mu_derivs, spec_cell
+    mu_spec = spec_mu_derivs()
+    wspecs, values, expect = [], [], []
+
+    def sample(spec, env):
+        wspecs.append(spec)
+        values.extend(env[n] for n in spec.operands())
+        sub = {z: sp.Float(env[z.name], 30) for e in spec.exprs.values()
+               for z in e.free_symbols}
+        for t, e in spec.layout.assignments(spec.exprs):
+            expect.append(float(sp.N(e.subs(sub), 30)))
+
+    for _ in range(4):
+        c = RNG.normal(size=9)
+        sample(mu_spec, {f"{p}_{a}": float(c[3 * i + j])
+                         for i, p in enumerate(("R_D", "R_E", "r"))
+                         for j, a in enumerate(AXES)})
+    for m in (-0.95, -0.4, 0.0, 0.3, 0.8, 0.999):
+        sample(spec_cell("becke"), {"mu": m})
+    for m in (-0.6, -0.2, 0.0, 0.25, 0.5, 0.639):
+        sample(spec_cell("ssf"), {"mu": m})
+    got = _drive(tmp, "weights", wspecs, values)
+    # mixed criterion: t -> 0 as mu -> -1 is a sum of O(1) log-derivative
+    # terms, so it is accurate to 1e-16 ABSOLUTELY but not relatively --
+    # and the weight derivatives only ever see t * dmu
+    dev = max(abs(a - b) / max(1.0, abs(b)) for a, b in zip(got, expect))
+    okw = dev < 1e-12
+    failures += 0 if okw else 1
+    print(f"  [{'OK' if okw else '!!'}] weights   emitted C++ vs SymPy: "
+          f"{len(got)} channels, worst mixed {dev:.2e}")
+
     shutil.rmtree(tmp, ignore_errors=True)
     tag = "OK " if not failures else "FAIL"
-    print(f"[{tag}] gauxc_hess_validate: {3*len(FAMILIES)} checks, "
+    print(f"[{tag}] gauxc_hess_validate: {3*len(FAMILIES) + 1} checks, "
           f"{failures} failures")
     return failures
 

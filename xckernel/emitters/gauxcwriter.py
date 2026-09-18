@@ -52,6 +52,8 @@ Reproduce with: python -m xckernel.emitters.gauxcwriter --emit <file>
 
 from __future__ import annotations
 
+import functools
+
 import sympy as sp
 
 from . import fieldkernel
@@ -327,6 +329,24 @@ def _bindings(kind: str, family: str) -> dict:
         for a in range(4):
             for c in range(4):
                 b[f"W{a}{c}"] = f"W[{4*a+c}]"
+    elif kind == "egrad":
+        lay = row_layout(family)
+        for k in _ingredients(family):
+            b[f"F_{k}_A"] = f"ROW(a,d,{lay[f'F_{k}']},ip)"
+        b["de"] = "de"
+    elif kind == "mu":
+        b = {}
+        for c, a in enumerate(AXES):
+            b[f"R_D_{a}"] = f"RD[{c}]"
+            b[f"R_E_{a}"] = f"RE[{c}]"
+            b[f"r_{a}"] = f"rg[{c}]"
+        b["mu"] = "mu"
+        for i in range(6):
+            b[f"dmu_{i}"] = f"dmu[{i}]"
+            for j in range(6):
+                b[f"d2mu_{i}_{j}"] = f"d2mu[{6 * i + j}]"
+    elif kind.startswith("cell_"):
+        b = {"mu": "mu", "s": "s", "t": "t", "u": "u"}
     elif kind == "same":
         b.update({"U0_u": "xmat[k]", "U1_u": "xmat_x[k]",
                   "U2_u": "xmat_y[k]", "U3_u": "xmat_z[k]",
@@ -344,6 +364,12 @@ def _spec_for(kind: str, family: str) -> FieldKernel:
         return spec_pair(family)
     if kind == "pulayW":
         return spec_pulay_weights(family)
+    if kind == "egrad":
+        return spec_egrad(family)
+    if kind == "mu":
+        return spec_mu_derivs()
+    if kind.startswith("cell_"):
+        return spec_cell(kind[5:])
     for s in _seed_specs(family):
         if s.name == f"xck_gauxc_hess_{kind}_{family}":
             return s
@@ -405,11 +431,21 @@ def emit_call_sites() -> dict:
     out["gauxc_hess_call_pulayW"] = lambda fam: [_bound_call("pulayW", fam)]
     out["gauxc_hess_call_same"] = lambda fam: [_bound_call("same", fam)]
 
+    out["gauxc_hess_call_egrad"] = lambda fam: [_bound_call("egrad", fam)]
+
     texts = {}
     for stem, fn in out.items():
         what = stem.replace("gauxc_hess_call_", "") + " call site"
         texts[stem] = "\n".join([_BEGIN.format(what=what)] + _dispatch(fn)
                                  + [_END]) + "\n"
+
+    # weight class: no functional rung, the partition scheme decides
+    texts["gauxc_hess_call_mu"] = "\n".join(
+        [_BEGIN.format(what="mu call site"), _bound_call("mu", None), _END]) + "\n"
+    texts["gauxc_hess_call_cell"] = "\n".join(
+        [_BEGIN.format(what="cell-function call site"),
+         "if( is_becke ) {", "  " + _bound_call("cell_becke", None),
+         "} else {", "  " + _bound_call("cell_ssf", None), "}", _END]) + "\n"
     return texts
 
 
@@ -435,6 +471,7 @@ def _pulay_rows(side: str):
     return [S(f"dchi_g{oth}_{lab}")] + [S(f"ddchi_g{oth}_{lab}_{a}") for a in AXES]
 
 
+@functools.lru_cache(maxsize=None)
 def pulay_weights(family: str):
     """The Pulay term as a 4 x 4 POINT-WEIGHT matrix W_ab(g).
 
@@ -491,6 +528,120 @@ def spec_pulay_weights(family: str) -> FieldKernel:
     )
 
 
+# ---------------------------------------------------------------------------
+# WEIGHT class: the pieces of the partition-weight Hessian
+#
+# w = q P_C / Z with P_D = prod_{E /= D} s(mu_DE), mu_DE = (r_D - r_E)/R_DE.
+# The host works with log-derivatives, so what it needs per atom pair is
+# mu and its gradient and Hessian in the six coordinates of D and E (the
+# point held fixed -- the parent atom's coordinates are recovered by
+# translational invariance), and per cell function s together with
+# t = s'/s and u = s''/s. Both are generated here.
+#
+# t and u come from the FACTORED ln s, never from 1 - g: the latter
+# cancels catastrophically as mu -> 1, exactly where t diverges.
+# ---------------------------------------------------------------------------
+
+@functools.lru_cache(maxsize=None)
+def spec_mu_derivs() -> FieldKernel:
+    """mu_DE and its first and second derivatives in (R_D, R_E), the point
+    r held fixed. Coordinates are ordered D_x, D_y, D_z, E_x, E_y, E_z;
+    the Hessian is emitted in full (row-major 6 x 6)."""
+    S = lambda n: sp.Symbol(n, real=True)
+    D = [S(f"R_D_{a}") for a in AXES]
+    E = [S(f"R_E_{a}") for a in AXES]
+    r = [S(f"r_{a}") for a in AXES]
+    dist = lambda u, v: sp.sqrt(sum((ui - vi)**2 for ui, vi in zip(u, v)))
+    mu = (dist(r, D) - dist(r, E)) / dist(D, E)
+    X = D + E
+    exprs = {"mu": mu}
+    targets = ["mu"]
+    for i in range(6):
+        exprs[f"dmu_{i}"] = sp.diff(mu, X[i])
+        targets.append(f"dmu_{i}")
+    for i in range(6):
+        for j in range(6):
+            exprs[f"d2mu_{i}_{j}"] = sp.diff(mu, X[i], X[j])
+            targets.append(f"d2mu_{i}_{j}")
+    return FieldKernel(
+        name="xck_gauxc_weight_mu", exprs=exprs,
+        layout=ExplicitLayout(targets=targets, ret="None"),
+        doc=("Becke/SSF confocal coordinate mu_DE = (|r-R_D| - |r-R_E|)/|R_D-R_E|,",
+             "its gradient and full Hessian in (R_D, R_E) at fixed r.")
+    )
+
+
+def _cell_log(kind: str):
+    """(ln s up to a constant, s) in the variable mu, in factored form."""
+    m = sp.Symbol("mu", real=True)
+    if kind == "becke":
+        h = lambda q: sp.Rational(3, 2) * q - q**3 / 2
+        p1 = h(m)
+        p2 = h(p1)
+        lns = (8 * sp.log(1 - m) + 4 * sp.log(2 + m)
+               + 2 * sp.log(2 + p1) + sp.log(2 + p2))
+        s = (1 - m)**8 * (2 + m)**4 * (2 + p1)**2 * (2 + p2) / 256
+    elif kind == "ssf":
+        a = sp.Rational(64, 100)          # integrator::magic_ssf_factor
+        z = m / a
+        q = 5 * z**3 + 20 * z**2 + 29 * z + 16
+        lns = 4 * sp.log(1 - z) + sp.log(q)
+        s = (1 - z)**4 * q / 32
+    else:
+        raise KeyError(kind)
+    return m, lns, s
+
+
+@functools.lru_cache(maxsize=None)
+def cell_functions(kind: str):
+    """s, t = s'/s, u = s''/s, proven against the textbook definitions."""
+    m, lns, s = _cell_log(kind)
+    t = sp.diff(lns, m)
+    u = sp.diff(lns, m, 2) + t**2
+    # the textbook cell functions, as the weights code evaluates them
+    if kind == "becke":
+        h = lambda q: sp.Rational(3, 2) * q - q**3 / 2
+        ref = (1 - h(h(h(m)))) / 2
+    else:
+        z = m / sp.Rational(64, 100)
+        ref = (1 - (35 * (z - z**3) + 21 * z**5 - 5 * z**7) / 16) / 2
+    if sp.expand(s - ref) != 0:
+        raise AssertionError(f"{kind}: factored s differs from the definition")
+    for num, name in ((sp.diff(ref, m), "t"), (sp.diff(ref, m, 2), "u")):
+        mine = t if name == "t" else u
+        if sp.cancel(mine * ref - num) != 0:
+            raise AssertionError(f"{kind}: {name} is not the {name}-ratio")
+    return s, t, u
+
+
+def spec_cell(kind: str) -> FieldKernel:
+    s, t, u = cell_functions(kind)
+    return FieldKernel(
+        name=f"xck_gauxc_weight_cell_{kind}",
+        exprs={"s": s, "t": t, "u": u},
+        layout=ExplicitLayout(targets=["s", "t", "u"], ret="None"),
+        doc=(f"{kind} cell function s(mu) with t = s'/s and u = s''/s, from",
+             "the factored ln s. Valid strictly inside the switching region",
+             "(|mu| < 1 Becke, |mu| < a SSF); the host handles the outside.")
+    )
+
+
+def spec_egrad(family: str) -> FieldKernel:
+    """Basis-class first derivative of the energy DENSITY at one point,
+    for one atom and direction: the chain rule through the same per-atom
+    rows F_k the Hessian's outer product uses. The weight-class cross
+    term pairs it with the weight gradient."""
+    S = lambda n: sp.Symbol(n, real=True)
+    de = sum(S(f"v{k}") * S(f"F_{k}_A") for k in _ingredients(family))
+    return FieldKernel(
+        name=f"xck_gauxc_hess_egrad_{family}",
+        exprs={"de": de},
+        layout=ExplicitLayout(targets=["de"], ret="None"),
+        doc=(f"{family}: d e(r_g) / d R_A, e = the unweighted energy density,",
+             "basis class only (points fixed). No quadrature weight.")
+    )
+
+
 def specs():
     out = []
     for fam in FAMILIES:
@@ -499,6 +650,9 @@ def specs():
         out.append(spec_pair(fam))
         out.extend(_seed_specs(fam))
         out.append(spec_pulay_weights(fam))
+        out.append(spec_egrad(fam))
+    out.append(spec_mu_derivs())
+    out.extend(spec_cell(k) for k in ("becke", "ssf"))
     return out
 
 
