@@ -205,33 +205,220 @@ def spec_pair(family: str) -> FieldKernel:
 
 
 def _seed_specs(family: str):
-    """The Pulay (D_u_v) and same-atom members, straight from the hints."""
+    """The Pulay (D_u_v) and same-atom members, COMPLETE rather than
+    i-generic.
+
+    ``geometric_hessian``'s hints expose one Cartesian instance of each
+    seed and leave the host to call it per component and sum. Emitting
+    the assembled term instead keeps that bookkeeping on this side of
+    the interface, where it is checked; a host that mis-orders the
+    components would otherwise get a plausible, wrong Hessian. ``D_u_v``
+    appears linearly in every Pulay monomial, so it factors out and the
+    host multiplies by its own density-matrix element.
+    """
     gh = geometric_hessian(family)
-    h = gh.hints
+    D = sp.Symbol("D_u_v", real=True)
+
+    ex = sp.expand(gh.pair)
+    terms = ex.args if ex.is_Add else (ex,)
+    withD = sum(t for t in terms if t.has(D))
+    pulay = sp.simplify(withD / D) if withD != 0 else sp.Integer(0)
+    if pulay.has(D):
+        raise AssertionError(f"{family}: D_u_v is not linear in the Pulay term")
+
     out = []
-    for kind in ("pair", "same"):
-        exprs, targets = {}, []
-        for k in _ingredients(family):
-            key = f"seed_{kind}_{k}" if k == "rho" else f"seed_{kind}_{k}_i"
-            if key not in h:
-                continue
-            exprs[f"s_{k}"] = h[key]
-            targets.append(f"s_{k}")
-        if not exprs:
-            continue
+    if pulay != 0:
         out.append(FieldKernel(
-            name=f"xck_gauxc_hess_seed_{kind}_{family}",
-            exprs=exprs,
-            layout=ExplicitLayout(targets=targets, ret="None"),
-            doc=((f"{family}: Pulay term, per basis-function PAIR (u in A, v in B).",
-                  "Carries the density-matrix pair factor, so it cannot",
-                  "factorise into an outer product.")
-                 if kind == "pair" else
-                 (f"{family}: same-atom (delta_AB) term, per basis function.",
-                  "The sigma/tau members are i-generic: call once per",
-                  "Cartesian component and sum."))
+            name=f"xck_gauxc_hess_pulay_{family}",
+            exprs={"s": pulay},
+            layout=ExplicitLayout(targets=["s"], ret="None"),
+            doc=(f"{family}: Pulay term per basis-function PAIR, with the",
+                 "density-matrix factor D_uv DIVIDED OUT -- multiply by it,",
+                 "and by the quadrature weight, at the call site.",
+                 "Cannot factorise into an outer product; this is the only",
+                 "piece that needs the function pair.")
+        ))
+
+    same = sp.expand(gh.same)
+    if same != 0:
+        out.append(FieldKernel(
+            name=f"xck_gauxc_hess_same_{family}",
+            exprs={"s": same},
+            layout=ExplicitLayout(targets=["s"], ret="None"),
+            doc=(f"{family}: same-atom (delta_AB) term, per basis function.",
+                 "Complete over Cartesian components; multiply by the",
+                 "quadrature weight at the call site.")
         ))
     return out
+
+
+# ---------------------------------------------------------------------------
+# Generated CALL SITES
+#
+# The kernels take positional doubles in the order sympy discovers their
+# operands -- sorted by libxckernel's own names. A host that writes the
+# calls by hand has to reproduce that order from a different vocabulary:
+# GauXC calls sigma "gamma", and "gamma" and "sigma" sort differently. The
+# meta-GGA pair call was written in GauXC's order and mis-bound five of its
+# seven Libxc derivatives, a Hessian wrong by ~1e5 that the compiler could
+# not see (every argument is a double) and only a finite-difference check
+# caught.
+#
+# So the call sites are generated too. The argument ORDER comes from each
+# kernel's own signature; each argument is bound by NAME through the table
+# below. An operand with no binding stops generation rather than being
+# bound to the wrong array. The per-atom row layout -- which slot holds
+# rho, sigma, tau and the gradient rows -- is emitted for the writes and
+# the reads alike, so the two cannot disagree either.
+# ---------------------------------------------------------------------------
+
+#: Per-grid-point quantities, by GauXC's own array names. THE one place
+#: that knows GauXC's vocabulary.
+_POINT = {
+    "vrho": "vrho[ip]", "vsigma": "vgamma[ip]", "vtau": "vtau[ip]",
+    "v2rho2": "v2rho2[ip]", "v2rhosigma": "v2rhogamma[ip]",
+    "v2rhotau": "v2rhotau[ip]", "v2sigma2": "v2gamma2[ip]",
+    "v2sigmatau": "v2gammatau[ip]", "v2tau2": "v2tau2[ip]",
+    "w": "weights[ip]",
+    "grad_rho_x": "dden_x[ip]", "grad_rho_y": "dden_y[ip]",
+    "grad_rho_z": "dden_z[ip]",
+}
+
+
+def row_layout(family: str) -> dict:
+    """Slot of each per-atom row: the fields first, then G_x, G_y, G_z.
+
+    The host allocates ``nfield + 3`` slots with ``nfield`` the number of
+    ingredients; this is the same rule, stated once.
+    """
+    ings = _ingredients(family)
+    lay = {f"F_{k}": i for i, k in enumerate(ings)}
+    for c, a in enumerate(AXES):
+        lay[f"G_{a}"] = len(ings) + c
+    return lay
+
+
+def _bindings(kind: str, family: str) -> dict:
+    """Operand/target -> GauXC expression for one call site."""
+    b = dict(_POINT)
+    if kind == "rows":
+        b.update({"U0_u": "U0", "U1_u": "U1", "U2_u": "U2", "U3_u": "U3",
+                  "dchi_gA_u": "dchi"})
+        for c, a in enumerate(AXES):
+            b[f"ddchi_gA_u_{a}"] = f"ddchi[{c}]"
+        b.update({"F_rho": "F_rho", "F_sigma": "F_sigma", "F_tau": "F_tau",
+                  "G_x": "Gx", "G_y": "Gy", "G_z": "Gz"})
+    elif kind == "pair":
+        lay = row_layout(family)
+        for k in _ingredients(family):
+            b[f"F_{k}_A"] = f"ROW(a,dx,{lay[f'F_{k}']},ip)"
+            b[f"F_{k}_B"] = f"ROW(b,dy,{lay[f'F_{k}']},ip)"
+        for a in AXES:
+            b[f"G_A_{a}"] = f"ROW(a,dx,{lay[f'G_{a}']},ip)"
+            b[f"G_B_{a}"] = f"ROW(b,dy,{lay[f'G_{a}']},ip)"
+        b["h"] = "h"
+    elif kind == "pulay":
+        b.update({"dchi_gA_u": "dAu", "dchi_gB_v": "dBv"})
+        for c, a in enumerate(AXES):
+            b[f"ddchi_gA_u_{a}"] = f"ddA[{c}]"
+            b[f"ddchi_gB_v_{a}"] = f"ddB[{c}]"
+        b["s"] = "sv"
+    elif kind == "same":
+        b.update({"U0_u": "xmat[k]", "U1_u": "xmat_x[k]",
+                  "U2_u": "xmat_y[k]", "U3_u": "xmat_z[k]",
+                  "d2chi_g2_u": "d2c"})
+        for c, a in enumerate(AXES):
+            b[f"d3chi_g2_u_{a}"] = f"d3c[{c}]"
+        b["s"] = "sv"
+    return b
+
+
+def _spec_for(kind: str, family: str) -> FieldKernel:
+    if kind == "rows":
+        return spec_rows(family)
+    if kind == "pair":
+        return spec_pair(family)
+    for s in _seed_specs(family):
+        if s.name == f"xck_gauxc_hess_{kind}_{family}":
+            return s
+    raise KeyError(f"{kind}/{family}")
+
+
+def _bound_call(kind: str, family: str) -> str:
+    """One kernel call, arguments in the kernel's OWN order, bound by name."""
+    spec = _spec_for(kind, family)
+    b = _bindings(kind, family)
+    ins = spec.operands()
+    outs = [t for t, _ in spec.layout.assignments(spec.exprs)]
+    missing = [n for n in ins + outs if n not in b]
+    if missing:
+        raise KeyError(f"{spec.name}: no GauXC binding for {missing}")
+    args = [b[n] for n in ins + outs]
+    # A binding table with a copy-paste slip would bind two operands to
+    # one array. Refuse that too.
+    dup = sorted({a for a in args if args.count(a) > 1})
+    if dup:
+        raise AssertionError(f"{spec.name}: operands share a binding: {dup}")
+    return f"xckernel::{spec.name}( " + ", ".join(args) + " );"
+
+
+def _dispatch(body_for) -> list:
+    """if(mgga) / else if(gga) / else(lda), highest rung first, as the
+    hand-written dispatch it replaces was ordered."""
+    L = []
+    for i, (cond, fam) in enumerate((("is_mgga", "mgga_tau"),
+                                     ("is_gga", "gga"), (None, "lda"))):
+        head = (f"if( {cond} ) {{" if i == 0 else
+                f"}} else if( {cond} ) {{" if cond else "} else {")
+        L.append(head)
+        L.extend("  " + line for line in body_for(fam))
+    L.append("}")
+    return L
+
+
+_BEGIN = ("// ==> BEGIN GENERATED CODE [xckernel gauxcwriter: {what}] <==\n"
+          "// Arguments are bound BY NAME from each kernel's own signature;\n"
+          "// regenerate rather than edit: python -m xckernel.emitters.gauxcwriter --emit-dir <dir>")
+_END = "// ==> END GENERATED CODE <=="
+
+
+def emit_call_sites() -> dict:
+    """Every generated call site, keyed by include-file stem."""
+    out = {}
+
+    def rows_body(fam):
+        lay = row_layout(fam)
+        body = [_bound_call("rows", fam)]
+        for name in sorted(lay, key=lay.get):
+            host = _bindings("rows", fam)[name]
+            body.append(f"ROW(a,d,{lay[name]},ip) += {host};")
+        return body
+
+    out["gauxc_hess_call_rows"] = rows_body
+    out["gauxc_hess_call_pair"] = lambda fam: [_bound_call("pair", fam)]
+    out["gauxc_hess_call_pulay"] = lambda fam: [_bound_call("pulay", fam)]
+    out["gauxc_hess_call_same"] = lambda fam: [_bound_call("same", fam)]
+
+    texts = {}
+    for stem, fn in out.items():
+        what = stem.replace("gauxc_hess_call_", "") + " call site"
+        texts[stem] = "\n".join([_BEGIN.format(what=what)] + _dispatch(fn)
+                                 + [_END]) + "\n"
+    return texts
+
+
+def write_include_files(directory: str) -> list:
+    import os
+    os.makedirs(directory, exist_ok=True)
+    written = []
+    with open(os.path.join(directory, "gauxc_hess_kernel.hpp"), "w") as f:
+        f.write(emit_header())
+    written.append("gauxc_hess_kernel.hpp")
+    for stem, text in sorted(emit_call_sites().items()):
+        with open(os.path.join(directory, f"{stem}.inc"), "w") as f:
+            f.write(text)
+        written.append(f"{stem}.inc")
+    return written
 
 
 def specs():
@@ -264,9 +451,16 @@ def emit_header(cse: bool = True) -> str:
 def main(argv=None):
     import argparse
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--emit", metavar="FILE")
+    p.add_argument("--emit", metavar="FILE",
+                   help="write only the kernel header")
+    p.add_argument("--emit-dir", metavar="DIR",
+                   help="write the kernel header AND the generated call sites")
     p.add_argument("--no-cse", action="store_true")
     a = p.parse_args(argv)
+    if a.emit_dir:
+        for f in write_include_files(a.emit_dir):
+            print(f"wrote {a.emit_dir}/{f}")
+        return
     src = emit_header(cse=not a.no_cse)
     if a.emit:
         with open(a.emit, "w") as f:
