@@ -153,3 +153,79 @@ def nc_fxc_matrix(family: str) -> Tuple[List[sp.Symbol],
                       * sp.diff(U[a], fields[i], fields[j]))
             C[i][j] = C[j][i] = e
     return fields, C
+
+
+def nc_fxc_collinear_limit(family: str) -> Tuple[List[sp.Symbol],
+                                                  List[sp.Symbol],
+                                                  List[sp.Expr]]:
+    """The |m| -> 0 (collinear) limit of the noncollinear kernel,
+    contracted with one trial density.
+
+    At m = 0 the locally collinear map is not twice differentiable: the
+    kernel carries 1/|m| (and, for GGAs, 1/|grad rho_s . grad m|), and
+    the GGA second variation even contains |dm| |ds| sgn(dm . ds), which
+    is bilinear only for parallel perturbations. The limit used here is
+    the one every collinear perturbation agrees with, extended isotropically:
+
+        Q = Q_col(charge) + sum_J Q_col(spin, along J),
+
+    each Cartesian magnetization component responding like the spin
+    channel of a collinear (UKS) perturbation about the spin-symmetric
+    reference, with no charge-spin coupling -- that coupling vanishes by
+    spin symmetry at m = 0. The reference enters through the charge
+    fields and the polarized Libxc derivatives only.
+
+    Returns (reference charge fields, trial fields in nc_fields order,
+    kernel coefficients k_X in nc_fields order).
+    """
+    fields = nc_fields(family)
+    gga = family == "gga"
+    n, mu = sp.symbols("n mu")
+    gn = sp.symbols("gn_x gn_y gn_z") if gga else ()
+    gm = sp.symbols("gmu_x gmu_y gmu_z") if gga else ()
+    U = {"n_p": (n + mu) / 2, "n_m": (n - mu) / 2}
+    if gga:
+        U["g_pp"] = sum(((a + b) / 2)**2 for a, b in zip(gn, gm))
+        U["g_pm"] = sum((a + b) * (a - b) / 4 for a, b in zip(gn, gm))
+        U["g_mm"] = sum(((a - b) / 2)**2 for a, b in zip(gn, gm))
+    xc = [n, *gn]            # charge variables
+    xs = [mu, *gm]           # spin variables
+    X = xc + xs
+
+    def C(i, j):
+        e = sp.Integer(0)
+        for a in U:
+            for b in U:
+                e += (sp.Symbol(LIBXC_SECOND[_pair_key(a, b)])
+                      * sp.diff(U[a], X[i]) * sp.diff(U[b], X[j]))
+            e += sp.Symbol(LIBXC_FIRST[a]) * sp.diff(U[a], X[i], X[j])
+        return e
+
+    # evaluate at the spin-symmetric reference, in the nc field names
+    ref = {mu: 0, n: sp.Symbol("rho_s")}
+    for c, a in enumerate(AXES if gga else ()):
+        ref[gm[c]] = 0
+        ref[gn[c]] = sp.Symbol(f"grad_rho_s_{a}")
+    nx = len(xc)
+    Ccc = [[C(i, j).subs(ref) for j in range(nx)] for i in range(nx)]
+    Css = [[C(nx + i, nx + j).subs(ref) for j in range(nx)] for i in range(nx)]
+
+    trial = [sp.Symbol(f"t{s.name}") for s in fields]
+    tq = {s.name: t for s, t in zip(fields, trial)}
+    tc = [tq["rho_s"]] + ([tq[f"grad_rho_s_{a}"] for a in AXES] if gga else [])
+    out = {}
+    kc = [sp.Add(*[Ccc[i][j] * tc[j] for j in range(nx)]) for i in range(nx)]
+    out["rho_s"] = kc[0]
+    for c, a in enumerate(AXES if gga else ()):
+        out[f"grad_rho_s_{a}"] = kc[1 + c]
+    for J in AXES:
+        ts = [tq[f"rho_{J}"]] + ([tq[f"grad_rho_{J}_{a}"] for a in AXES]
+                                 if gga else [])
+        ks = [sp.Add(*[Css[i][j] * ts[j] for j in range(nx)])
+              for i in range(nx)]
+        out[f"rho_{J}"] = ks[0]
+        for c, a in enumerate(AXES if gga else ()):
+            out[f"grad_rho_{J}_{a}"] = ks[1 + c]
+    refs = [sp.Symbol("rho_s")] + ([sp.Symbol(f"grad_rho_s_{a}")
+                                    for a in AXES] if gga else [])
+    return refs, trial, [out[s.name] for s in fields]

@@ -44,7 +44,7 @@ from . import fieldkernel
 from .fieldkernel import ExplicitLayout, FieldKernel
 
 from ..engine.noncollinear import (libxc_args, nc_fields, nc_fxc_matrix,
-                                   nc_potential)
+                                   nc_fxc_collinear_limit, nc_potential)
 
 _HEADER = '''"""Noncollinear (relativistic) xc potential and response kernels.
 
@@ -201,6 +201,21 @@ def emit_cxx(families=("lda", "gga")) -> str:
             f"Noncollinear {family.upper()} exchange-correlation kernel "
             f"applied to one trial density: k_X = sum_Y f_xc[X,Y] tY, "
             f"delivered in the same field slots as the potential.")
+
+        # the |m| -> 0 limit, for the host's small-magnetization cutoff
+        refs, trial, klim = nc_fxc_collinear_limit(family)
+        assert [t.name for t in trial] == [s.name for s in d1]
+        src += _cxx_function(
+            f"nc_fxc_contract_limit_{family}",
+            [r.name for r in refs] + libxc_args(family, 2)
+            + [t.name for t in trial],
+            klim, [f"k_{q}" for q in fnames],
+            f"Collinear (|m| -> 0) limit of nc_fxc_contract_{family}, for "
+            f"points below the host's magnetization cutoff: each "
+            f"magnetization component responds like the spin channel of a "
+            f"collinear perturbation about the spin-symmetric reference; no "
+            f"charge-spin coupling. Depends on the charge fields and the "
+            f"polarized derivatives only.")
 
         # the full symmetric matrix, for hosts that want it explicitly
         upper = [(i, j) for i in range(n) for j in range(i, n)]
