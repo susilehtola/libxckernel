@@ -25,12 +25,17 @@ GENERATED C++17 SOURCE: kernels are header-only templates over the
 floating-point type (double, long double, __float128, ...), with
 extern "C" double instantiations providing the stable C ABI. Do not
 edit; regenerate with the xckernel Python package.
-Building requires only CMake >= 3.16 and a C++17 compiler
+Building requires CMake >= 3.16, a C++17 compiler and a BLAS library
 (plus a Fortran compiler for the optional xckernel_f03 module):
 
     cmake -B build -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release
     cmake --build build
     cmake --install build
+
+The basis-pair contractions are BLAS GEMMs (dgemm/sgemm). Select the
+library with -DBLA_VENDOR=... (CMake's FindBLAS), pass
+-DXCKERNEL_BLAS_ILP64=ON for a 64-bit-integer BLAS, or
+-DXCKERNEL_BLAS=OFF to build the portable loops without BLAS.
 
 Interface: include/xckernel.h (C; ABI, operand ordering, and the
 linear-mixing contract for user-mixed functional-derivative arrays are

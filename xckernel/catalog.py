@@ -353,7 +353,8 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                       f"{npat:3d} patterns {nprod:3d} products",
                       flush=True)
     elif backend == "c":
-        from .emitters.cbackend import (_EVALUATOR_HPP, emit_cmake, emit_exc_cpp,
+        from .emitters.cbackend import (_CONFIG_H_IN, _EVALUATOR_HPP,
+                               emit_cmake, emit_exc_cpp,
                                emit_exc_hpp, emit_f03, emit_header,
                                emit_kernel_cpp, emit_kernel_hpp)
         from .emitters.codegen import collapse, generate_collapsed
@@ -363,6 +364,8 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
         (out / "fortran").mkdir(exist_ok=True)
         (out / "include" / "xckernel" / "evaluator.hpp").write_text(
             _EVALUATOR_HPP)
+        (out / "include" / "xckernel" / "config.h.in").write_text(
+            _CONFIG_H_IN)
         names: List = []
         for e in entries(families, max_order):
             t0 = time.time()

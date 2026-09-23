@@ -2,7 +2,9 @@
 
 Emits table-driven C kernels, compiles them with the system C compiler
 (-O2 -shared), loads via ctypes, and compares against the pattern-collapsed
-NumPy kernels on random operands.  Covers all families, response orders up to
+NumPy kernels on random operands.  Every kernel is built twice: with the
+BLAS dgemm stage B (-DXCKERNEL_USE_BLAS -lblas) and with the portable
+loops; a small grid block makes both walk several blocks and a remainder.  Covers all families, response orders up to
 4, spin and spin-adapted cases -- including the heavyweight entries whose
 coefficient tables hold tens of thousands of monomials.
 """
@@ -58,7 +60,11 @@ def _numpy_args(gen, ck, chi, dchi, lapl_chi, hess_chi, scal):
     return args
 
 
-def check(name, ki, nbf=4, ng=60, seed=11):
+#: compile variants: label -> extra compiler arguments
+VARIANTS = {"blas": ["-DXCKERNEL_USE_BLAS", "-lblas"], "loops": []}
+
+
+def check(name, ki, variant="blas", nbf=4, ng=60, seed=11):
     ck = collapse(ki)
     gen = generate_collapsed(ki, "npk", batch=False)
     fn_np = compile_function(gen)
@@ -71,8 +77,9 @@ def check(name, ki, nbf=4, ng=60, seed=11):
         src = Path(td) / f"{name}.c"
         lib = Path(td) / f"{name}.so"
         src.write_text(csrc)
-        subprocess.run(["cc", "-O2", "-shared", "-fPIC", "-o", str(lib),
-                        str(src)], check=True)
+        subprocess.run(["cc", "-O2", "-shared", "-fPIC",
+                        "-DXCKERNEL_GRID_BLOCK=16", "-o", str(lib),
+                        str(src)] + VARIANTS[variant], check=True)
         dll = ctypes.CDLL(str(lib))
         f = getattr(dll, name)
         f.restype = ctypes.c_int
@@ -112,6 +119,7 @@ if __name__ == "__main__":
     ]
     print("C backend (table-driven, cc -O2) vs NumPy backend")
     for name, ki in cases:
-        err, rel, nloc = check(name, ki)
-        print(f"  [{'OK ' if rel < 1e-12 else 'FAIL'}] {name:22s} "
-              f"rel={rel:.3e}  ({nloc} LOC)")
+        for variant in VARIANTS:
+            err, rel, nloc = check(name, ki, variant)
+            print(f"  [{'OK ' if rel < 1e-12 else 'FAIL'}] {name:22s} "
+                  f"{variant:5s} rel={rel:.3e}  ({nloc} LOC)")
