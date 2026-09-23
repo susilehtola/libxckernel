@@ -21,7 +21,17 @@ jobs:
       - name: Install BLAS
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - uses: mamba-org/setup-micromamba@v2
+        env:
+          # Solve for x86-64 level 3 (AVX2), which every hosted runner
+          # has. Left to itself the solver picks builds for the CPU it
+          # happens to run on, and a cached environment solved on an
+          # AVX-512 runner (e.g. pyscf's _x86_64-microarch-level >=4
+          # build) dies with SIGILL when restored onto an AMD EPYC 7763.
+          CONDA_OVERRIDE_ARCHSPEC: haswell
         with:
+          # the override is not part of the environment hash: keep it
+          # in the key so a differently solved cache is never restored
+          cache-environment-key: micromamba-environment-archspec-haswell-
           environment-name: ci
           create-args: >-
             python=${{ matrix.python-version }}
