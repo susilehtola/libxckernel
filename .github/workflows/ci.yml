@@ -37,6 +37,10 @@ jobs:
           cache-environment: true
       - name: Install
         run: pip install -e . --no-deps
+      - name: Runner CPU
+        run: |
+          lscpu | grep -E "Model name|Vendor ID"
+          grep -m1 -o -wE "avx512[a-z_0-9]*|amx[a-z_0-9]*|avx2" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
       - name: Run validation suites
         run: |
           fail=0
@@ -44,7 +48,7 @@ jobs:
             m="xckernel.tests.$(basename "${f%.py}")"
             echo "::group::$m"
             rc=0
-            python -m "$m" || rc=$?
+            python -X faulthandler -m "$m" || rc=$?
             if [ "$rc" -ne 0 ]; then
               echo "FAILED: $m (rc=$rc)"
               fail=1
