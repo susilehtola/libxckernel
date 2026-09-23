@@ -81,7 +81,7 @@ jobs:
           - name: reduced
             families: lda,gga,mgga_tau
             order: 2
-          - name: full
+          - name: extensive
             families: lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga
             order: 4
     steps:
