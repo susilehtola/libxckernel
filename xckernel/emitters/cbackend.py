@@ -9,10 +9,13 @@ fixed evaluator**:
     factor ids indexing an ordered list of per-point scalar arrays
     (powers > 1 encoded by factor repetition);
   * stage A: one loop over grid points walking the table -> coefficient c(g);
-  * stage B: plain triple loop  out[u,v] += U[u,g] * c[g] * V[v,g]
-    (BLAS/Einsums variants are drop-in replacements later; the evaluator body
-    is deliberately `restrict`-annotated plain C99 so it can also be wrapped
-    as a __host__ __device__ function for the device backends).
+  * stage B: out[u,v] += sum_g U[u,g] * c[g] * V[v,g] as GEMMs.  Patterns
+    sharing a basis factor on one side are merged first -- W = sum_p c_p o X_p
+    -- so each distinct shared factor costs one GEMM (GGA: 7 patterns -> 4
+    GEMMs, meta-GGA: 12 -> 5).  The grid is processed in blocks, bounding
+    the scratch to nbf x block.  With XCKERNEL_USE_BLAS the GEMM is the
+    Fortran BLAS dgemm_/sgemm_; otherwise (and for precisions BLAS lacks) a
+    portable loop nest is used.
 
 ABI (v1, one perturbation-batch entry per call; hosts loop the batch):
 
@@ -82,6 +85,122 @@ def _scal_index(ck: CollapsedKernel) -> dict:
     return {name: i for i, name in enumerate(scal_order(ck))}
 
 
+def _gemm_plan(patterns) -> Tuple[str, list]:
+    """Group patterns into GEMMs sharing one basis factor.
+
+    Returns (side, groups): side "u" merges patterns with a common U factor
+    (out += U . W^T, W = sum_p c_p o V_p), side "v" those with a common V
+    factor (out += W . V^T, W = sum_p c_p o U_p) -- whichever side has fewer
+    distinct factors.  groups is an ordered list of
+    (shared_factor, [(pattern_index, other_factor), ...]).
+    """
+    us = {u for u, _, _ in patterns}
+    vs = {v for _, v, _ in patterns}
+    side = "u" if len(us) <= len(vs) else "v"
+    groups: dict = {}
+    for ip, (u, v, _) in enumerate(patterns):
+        key, other = (u, v) if side == "u" else (v, u)
+        groups.setdefault(key, []).append((ip, other))
+    return side, list(groups.items())
+
+
+def _stage_b_calls(ck: CollapsedKernel, bexpr, stage_a_call, indent="        ",
+                   gemm="gemm_nt", acc="accumulate", cast=lambda x: x):
+    """The per-block body: stage A per pattern, merge, one GEMM per group."""
+    side, groups = _gemm_plan(ck.patterns)
+    lines: List[str] = []
+    for shared, members in groups:
+        for k, (ip, other) in enumerate(members):
+            lines.append(indent + stage_a_call(ip))
+            lines.append(f"{indent}{acc}(bk, nbf, c, {bexpr[other]} + g0, "
+                         f"npts, W, {int(k == 0)});")
+        sh = f"{bexpr[shared]} + g0"
+        if side == "u":
+            lines.append(f"{indent}{gemm}(nbf, bk, {sh}, npts, {cast('W')}, "
+                         f"bk, out);")
+        else:
+            lines.append(f"{indent}{gemm}(nbf, bk, {cast('W')}, bk, {sh}, "
+                         f"npts, out);")
+    return lines
+
+
+#: the fixed C99 evaluator shared by every emit_c translation unit
+_C99_EVALUATOR = r"""#ifndef XCKERNEL_GRID_BLOCK
+#define XCKERNEL_GRID_BLOCK 1024
+#endif
+#ifdef XCKERNEL_USE_BLAS
+#ifndef XCKERNEL_BLAS_INT
+#define XCKERNEL_BLAS_INT int
+#endif
+void dgemm_(const char* ta, const char* tb, const XCKERNEL_BLAS_INT* m,
+            const XCKERNEL_BLAS_INT* n, const XCKERNEL_BLAS_INT* k,
+            const double* alpha, const double* a, const XCKERNEL_BLAS_INT* lda,
+            const double* b, const XCKERNEL_BLAS_INT* ldb,
+            const double* beta, double* c, const XCKERNEL_BLAS_INT* ldc);
+#endif
+
+/* stage A on grid points g0 .. g0+bk-1: c[g] = sum_m cf[m] prod_f scal[..] */
+static void stage_a(int64_t g0, int64_t bk, int64_t nm,
+                    const double* restrict cf,
+                    const int32_t* restrict off,
+                    const uint16_t* restrict fid,
+                    const double* const* restrict scal,
+                    double* restrict c) {
+    for (int64_t g = 0; g < bk; ++g) {
+        double acc = 0.0;
+        for (int64_t m = 0; m < nm; ++m) {
+            double t = cf[m];
+            for (int32_t f = off[m]; f < off[m+1]; ++f)
+                t *= scal[fid[f]][g0 + g];
+            acc += t;
+        }
+        c[g] = acc;
+    }
+}
+
+/* merge one pattern: W(i,g) (=|+=) c(g) X(i,g), X row stride ldx */
+static void accumulate(int64_t bk, int64_t n, const double* restrict c,
+                       const double* restrict X, int64_t ldx,
+                       double* restrict W, int first) {
+    for (int64_t i = 0; i < n; ++i) {
+        const double* Xi = X + i*ldx;
+        double* Wi = W + i*bk;
+        if (first)
+            for (int64_t g = 0; g < bk; ++g) Wi[g] = c[g] * Xi[g];
+        else
+            for (int64_t g = 0; g < bk; ++g) Wi[g] += c[g] * Xi[g];
+    }
+}
+
+/* out(i,j) += sum_g A(i,g) B(j,g); A, B row-major with strides lda, ldb */
+static void gemm_nt(int64_t n, int64_t k, const double* A, int64_t lda,
+                    const double* B, int64_t ldb, double* out) {
+    if (n == 0 || k == 0) return;
+#ifdef XCKERNEL_USE_BLAS
+    const int64_t imax = sizeof(XCKERNEL_BLAS_INT) >= 8 ? INT64_MAX : INT32_MAX;
+    if (n <= imax && k <= imax && lda <= imax && ldb <= imax) {
+        /* row-major out = A B^T is column-major out^T = B^T A */
+        const XCKERNEL_BLAS_INT bn = (XCKERNEL_BLAS_INT)n,
+            bk = (XCKERNEL_BLAS_INT)k, ba = (XCKERNEL_BLAS_INT)lda,
+            bb = (XCKERNEL_BLAS_INT)ldb;
+        const double one = 1.0;
+        dgemm_("T", "N", &bn, &bn, &bk, &one, B, &bb, A, &ba, &one, out, &bn);
+        return;
+    }
+#endif
+    for (int64_t i = 0; i < n; ++i) {
+        const double* Ai = A + i*lda;
+        for (int64_t j = 0; j < n; ++j) {
+            const double* Bj = B + j*ldb;
+            double s = 0.0;
+            for (int64_t g = 0; g < k; ++g) s += Ai[g] * Bj[g];
+            out[i*n + j] += s;
+        }
+    }
+}
+"""
+
+
 def emit_c(ck: CollapsedKernel, name: str) -> str:
     """Emit a self-contained C99 translation unit for one kernel."""
     sidx = _scal_index(ck)
@@ -119,58 +238,28 @@ def emit_c(ck: CollapsedKernel, name: str) -> str:
         pat_meta.append((ip, ufac, vfac, len(monos)))
     lines.append("")
 
-    # the fixed evaluator (stage A) + distributor (stage B)
+    # the fixed evaluator (stage A) + merge + GEMM distributor (stage B)
+    lines += _C99_EVALUATOR.splitlines()
     lines += [
-        "static void stage_a(int64_t npts, int64_t nm,",
-        "                    const double* restrict cf,",
-        "                    const int32_t* restrict off,",
-        "                    const uint16_t* restrict fid,",
-        "                    const double* const* restrict scal,",
-        "                    double* restrict c) {",
-        "    for (int64_t g = 0; g < npts; ++g) {",
-        "        double acc = 0.0;",
-        "        for (int64_t m = 0; m < nm; ++m) {",
-        "            double t = cf[m];",
-        "            for (int32_t f = off[m]; f < off[m+1]; ++f)",
-        "                t *= scal[fid[f]][g];",
-        "            acc += t;",
-        "        }",
-        "        c[g] = acc;",
-        "    }",
-        "}",
-        "",
-        "static void stage_b(int64_t npts, int64_t nbf,",
-        "                    const double* restrict U,",
-        "                    const double* restrict c,",
-        "                    const double* restrict V,",
-        "                    double* restrict out) {",
-        "    for (int64_t u = 0; u < nbf; ++u) {",
-        "        for (int64_t v = 0; v < nbf; ++v) {",
-        "            double s = 0.0;",
-        "            const double* Ug = U + u*npts;",
-        "            const double* Vg = V + v*npts;",
-        "            for (int64_t g = 0; g < npts; ++g)",
-        "                s += Ug[g] * c[g] * Vg[g];",
-        "            out[u*nbf + v] += s;",
-        "        }",
-        "    }",
-        "}",
-        "",
         f"int {name}(int64_t npts, int64_t nbf,",
         "           const double* chi, const double* dchi,",
         "           const double* lapl_chi, const double* hess_chi,",
         "           const double* const* scal, double* out) {",
-        "    double* c = (double*)malloc((size_t)npts * sizeof(double));",
+        "    const int64_t blk = npts < XCKERNEL_GRID_BLOCK ? npts"
+        " : XCKERNEL_GRID_BLOCK;",
+        "    double* c = (double*)malloc((size_t)(blk * (1 + nbf) + 1)"
+        " * sizeof(double));",
         "    if (!c) return 1;",
+        "    double* W = c + blk;",
+        "    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+        "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;",
     ]
-    for ip, ufac, vfac, nm in pat_meta:
-        uexpr = _BASIS[ufac][0]
-        vexpr = _BASIS[vfac][0]
-        lines += [
-            f"    stage_a(npts, {nm}, {name}_c{ip}, {name}_o{ip}, "
-            f"{name}_f{ip}, scal, c);",
-            f"    stage_b(npts, nbf, {uexpr}, c, {vexpr}, out);",
-        ]
+    nms = {ip: nm for ip, _, _, nm in pat_meta}
+    lines += _stage_b_calls(
+        ck, {k: v[0] for k, v in _BASIS.items()},
+        lambda ip: (f"stage_a(g0, bk, {nms[ip]}, {name}_c{ip}, {name}_o{ip}, "
+                    f"{name}_f{ip}, scal, c);"))
+    lines.append("    }")
     lines += ["    free(c);", "    return 0;", "}", ""]
     return "\n".join(lines)
 
@@ -182,6 +271,13 @@ _EVALUATOR_HPP = """\
  * edit. Copyright (c) 2026 Susi Lehtola. */
 #pragma once
 #include <cstdint>
+#include <limits>
+
+/* Build configuration (BLAS on/off, BLAS integer width), written by CMake.
+ * Header-only use without it falls back to the portable loops. */
+#if __has_include("xckernel/config.h")
+#include "xckernel/config.h"
+#endif
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define XCK_HD __host__ __device__
@@ -189,9 +285,42 @@ _EVALUATOR_HPP = """\
 #define XCK_HD
 #endif
 
+/* Grid points per stage-B block: the scratch is (1 + nbf) * block. */
+#ifndef XCKERNEL_GRID_BLOCK
+#define XCKERNEL_GRID_BLOCK 1024
+#endif
+
+#ifdef XCKERNEL_USE_BLAS
+#ifndef XCKERNEL_BLAS_INT
+#define XCKERNEL_BLAS_INT int
+#endif
+extern "C" {
+void dgemm_(const char* ta, const char* tb, const XCKERNEL_BLAS_INT* m,
+            const XCKERNEL_BLAS_INT* n, const XCKERNEL_BLAS_INT* k,
+            const double* alpha, const double* a, const XCKERNEL_BLAS_INT* lda,
+            const double* b, const XCKERNEL_BLAS_INT* ldb, const double* beta,
+            double* c, const XCKERNEL_BLAS_INT* ldc);
+void sgemm_(const char* ta, const char* tb, const XCKERNEL_BLAS_INT* m,
+            const XCKERNEL_BLAS_INT* n, const XCKERNEL_BLAS_INT* k,
+            const float* alpha, const float* a, const XCKERNEL_BLAS_INT* lda,
+            const float* b, const XCKERNEL_BLAS_INT* ldb, const float* beta,
+            float* c, const XCKERNEL_BLAS_INT* ldc);
+}
+#endif
+
 namespace xckernel {
 
-/* Stage A: walk a monomial table, producing the per-point coefficient.
+constexpr int64_t grid_block = XCKERNEL_GRID_BLOCK;
+
+/* Scratch (in elements of T) a kernel entry point needs for npts points
+ * and nbf basis functions: pass a buffer this large as `work`. */
+XCK_HD inline int64_t work_size(int64_t npts, int64_t nbf) {
+    const int64_t blk = npts < grid_block ? npts : grid_block;
+    return blk * (1 + nbf) + 1;
+}
+
+/* Stage A: walk a monomial table, producing the per-point coefficient on
+ * grid points g0 .. g0+bk-1.
  * Templated on the floating-point type T: instantiate with float, double,
  * long double, __float128, or any type with T*T and T+T. Table
  * coefficients are dyadic rationals, exactly representable in binary
@@ -202,18 +331,19 @@ namespace xckernel {
  * precision; Txc -> T conversion happens per access, exact when widening).
  * Factor ids < nfld index `fields`; the rest index `xc`. */
 template <typename T, typename Txc = T>
-XCK_HD inline void stage_a(int64_t npts, int64_t nm,
+XCK_HD inline void stage_a(int64_t g0, int64_t bk, int64_t nm,
                            const double* cf, const int32_t* off,
                            const uint16_t* fid, int64_t nfld,
                            const T* const* fields, const Txc* const* xc,
                            T* c) {
-    for (int64_t g = 0; g < npts; ++g) {
+    for (int64_t g = 0; g < bk; ++g) {
+        const int64_t gg = g0 + g;
         T acc = T(0);
         for (int64_t m = 0; m < nm; ++m) {
             T t = T(cf[m]);
             for (int32_t f = off[m]; f < off[m + 1]; ++f) {
                 const uint16_t id = fid[f];
-                t *= (id < nfld) ? fields[id][g] : T(xc[id - nfld][g]);
+                t *= (id < nfld) ? fields[id][gg] : T(xc[id - nfld][gg]);
             }
             acc += t;
         }
@@ -221,23 +351,79 @@ XCK_HD inline void stage_a(int64_t npts, int64_t nm,
     }
 }
 
-/* Stage B: out(u,v) += sum_g U(u,g) c(g) V(v,g). The generic loops work at
- * any precision; a BLAS specialization for T=double may substitute a GEMM. */
+/* Merge one pattern into the GEMM operand: W(i,g) = c(g) X(i,g) for the
+ * first pattern of a group, += for the rest. X has row stride ldx, W bk. */
 template <typename T>
-XCK_HD inline void stage_b(int64_t npts, int64_t nbf,
-                           const T* U, const T* c, const T* V, T* out) {
-    for (int64_t u = 0; u < nbf; ++u) {
-        for (int64_t v = 0; v < nbf; ++v) {
+XCK_HD inline void accumulate(int64_t bk, int64_t n, const T* c, const T* X,
+                              int64_t ldx, T* W, int first) {
+    for (int64_t i = 0; i < n; ++i) {
+        const T* Xi = X + i * ldx;
+        T* Wi = W + i * bk;
+        if (first)
+            for (int64_t g = 0; g < bk; ++g) Wi[g] = c[g] * Xi[g];
+        else
+            for (int64_t g = 0; g < bk; ++g) Wi[g] += c[g] * Xi[g];
+    }
+}
+
+/* Stage B: out(i,j) += sum_g A(i,g) B(j,g), A and B row-major with row
+ * strides lda and ldb. The generic loops work at any precision; float and
+ * double go to BLAS when the library is built with it. */
+template <typename T>
+XCK_HD inline void gemm_nt(int64_t n, int64_t k, const T* A, int64_t lda,
+                           const T* B, int64_t ldb, T* out) {
+    for (int64_t i = 0; i < n; ++i) {
+        const T* Ai = A + i * lda;
+        for (int64_t j = 0; j < n; ++j) {
+            const T* Bj = B + j * ldb;
             T s = T(0);
-            const T* Ug = U + u * npts;
-            const T* Vg = V + v * npts;
-            for (int64_t g = 0; g < npts; ++g) s += Ug[g] * c[g] * Vg[g];
-            out[u * nbf + v] += s;
+            for (int64_t g = 0; g < k; ++g) s += Ai[g] * Bj[g];
+            out[i * n + j] += s;
         }
     }
 }
 
+#ifdef XCKERNEL_USE_BLAS
+namespace detail {
+inline bool blas_fits(int64_t n, int64_t k, int64_t lda, int64_t ldb) {
+    constexpr int64_t imax = std::numeric_limits<XCKERNEL_BLAS_INT>::max();
+    return n <= imax && k <= imax && lda <= imax && ldb <= imax;
+}
+} // namespace detail
+
+/* Row-major out = A B^T is column-major out^T = B^T A. */
+inline void gemm_nt(int64_t n, int64_t k, const double* A, int64_t lda,
+                    const double* B, int64_t ldb, double* out) {
+    if (n == 0 || k == 0) return;
+    if (!detail::blas_fits(n, k, lda, ldb))
+        return gemm_nt<double>(n, k, A, lda, B, ldb, out);
+    const XCKERNEL_BLAS_INT bn = n, bk = k, ba = lda, bb = ldb;
+    const double one = 1.0;
+    dgemm_("T", "N", &bn, &bn, &bk, &one, B, &bb, A, &ba, &one, out, &bn);
+}
+
+inline void gemm_nt(int64_t n, int64_t k, const float* A, int64_t lda,
+                    const float* B, int64_t ldb, float* out) {
+    if (n == 0 || k == 0) return;
+    if (!detail::blas_fits(n, k, lda, ldb))
+        return gemm_nt<float>(n, k, A, lda, B, ldb, out);
+    const XCKERNEL_BLAS_INT bn = n, bk = k, ba = lda, bb = ldb;
+    const float one = 1.0f;
+    sgemm_("T", "N", &bn, &bn, &bk, &one, B, &bb, A, &ba, &one, out, &bn);
+}
+#endif
+
 } // namespace xckernel
+"""
+
+
+#: build configuration consumed by evaluator.hpp; filled in by CMake.
+_CONFIG_H_IN = """\
+/* libxckernel build configuration. Generated by CMake; do not edit. */
+#pragma once
+#cmakedefine XCKERNEL_USE_BLAS 1
+#define XCKERNEL_BLAS_INT @XCKERNEL_BLAS_INT_TYPE@
+#define XCKERNEL_GRID_BLOCK @XCKERNEL_GRID_BLOCK@
 """
 
 
@@ -280,19 +466,27 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
     lines += [
         "/* fields: host-computed per-point operands (type T); xc: the",
         " * functional-derivative arrays (type Txc; Libxc computes in double",
-        " * regardless of T). work: caller scratch of npts elements or",
-        " * nullptr (heap-allocated internally; pass a buffer in device",
-        " * code). */",
+        " * regardless of T). work: caller scratch of",
+        " * xckernel::work_size(npts, nbf) elements or nullptr",
+        " * (heap-allocated internally; pass a buffer in device code). */",
         "template <typename T, typename Txc = T>",
         f"int {name}_t(int64_t npts, int64_t nbf,",
         "             const T* chi, const T* dchi, const T* lapl_chi,",
         "             const T* hess_chi,",
         "             const T* const* fields, const Txc* const* xc,",
         "             T* out, T* work = nullptr) {",
+        "    const int64_t blk = npts < grid_block ? npts : grid_block;",
         "    T* c = work;",
         "    bool own = false;",
-        "    if (!c) { c = new (std::nothrow) T[npts]; own = true; }",
+        "    if (!c) {",
+        "        c = new (std::nothrow) T[work_size(npts, nbf)];",
+        "        own = true;",
+        "    }",
         "    if (!c) return 1;",
+        "    T* W = c + blk;",
+        "    const T* Wc = W;",
+        "    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+        "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;",
     ]
     _bexpr = {"chi": "chi", "lapl_chi": "lapl_chi",
               "dchi[0]": "dchi + (int64_t)0*nbf*npts",
@@ -300,14 +494,13 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
               "dchi[2]": "dchi + (int64_t)2*nbf*npts",
               **{f"hess_chi[{k}]": f"hess_chi + (int64_t){k}*nbf*npts"
                  for k in range(6)}}
-    for ip, ufac, vfac, nm in pat_meta:
-        uexpr = _bexpr[ufac]
-        vexpr = _bexpr[vfac]
-        lines += [
-            f"    stage_a<T, Txc>(npts, {nm}, {ns}::c{ip}, {ns}::o{ip}, "
-            f"{ns}::f{ip}, {ns}::NFLD, fields, xc, c);",
-            f"    stage_b<T>(npts, nbf, {uexpr}, c, {vexpr}, out);",
-        ]
+    nms = {ip: nm for ip, _, _, nm in pat_meta}
+    lines += _stage_b_calls(
+        ck, _bexpr,
+        lambda ip: (f"stage_a<T, Txc>(g0, bk, {nms[ip]}, {ns}::c{ip}, "
+                    f"{ns}::o{ip}, {ns}::f{ip}, {ns}::NFLD, fields, xc, c);"),
+        acc="accumulate<T>", cast=lambda w: "Wc")
+    lines.append("    }")
     lines += ["    if (own) delete[] c;", "    return 0;", "}",
               "", "} // namespace xckernel", ""]
     # <new> for std::nothrow
@@ -499,11 +692,32 @@ option(XCKERNEL_FORTRAN "Build the Fortran interface module" ON)
 # declared in the header but not compiled).
 set(XCKERNEL_MAX_ORDER 4 CACHE STRING
     "Highest derivative order to compile (0-4)")
+# Stage B (the basis-pair contraction) is a GEMM; OFF selects portable
+# loops, for builds without a BLAS library.
+option(XCKERNEL_BLAS "Contract with BLAS dgemm/sgemm" ON)
+option(XCKERNEL_BLAS_ILP64 "The BLAS library uses 64-bit integers" OFF)
+set(XCKERNEL_GRID_BLOCK 1024 CACHE STRING
+    "Grid points per GEMM block (scratch is nbf x block)")
 
 add_library(xckernel)
 {grouped}
 target_compile_definitions(xckernel PUBLIC
     XCKERNEL_MAX_ORDER=${{XCKERNEL_MAX_ORDER}})
+set(XCKERNEL_BLAS_INT_TYPE int)
+if(XCKERNEL_BLAS)
+    if(XCKERNEL_BLAS_ILP64)
+        set(BLA_SIZEOF_INTEGER 8)
+        set(XCKERNEL_BLAS_INT_TYPE int64_t)
+    endif()
+    find_package(BLAS REQUIRED)
+    set(XCKERNEL_USE_BLAS 1)
+    target_link_libraries(xckernel PUBLIC ${{BLAS_LIBRARIES}})
+    if(BLAS_LINKER_FLAGS)
+        target_link_options(xckernel PUBLIC ${{BLAS_LINKER_FLAGS}})
+    endif()
+endif()
+configure_file(include/xckernel/config.h.in
+    ${{CMAKE_CURRENT_BINARY_DIR}}/include/xckernel/config.h)
 set_target_properties(xckernel PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
@@ -512,6 +726,7 @@ set_target_properties(xckernel PROPERTIES
     SOVERSION ${{PROJECT_VERSION_MAJOR}})
 target_include_directories(xckernel PUBLIC
     $<BUILD_INTERFACE:${{CMAKE_CURRENT_SOURCE_DIR}}/include>
+    $<BUILD_INTERFACE:${{CMAKE_CURRENT_BINARY_DIR}}/include>
     $<INSTALL_INTERFACE:include>)
 
 if(XCKERNEL_FORTRAN)
@@ -525,7 +740,10 @@ install(TARGETS xckernel EXPORT xckernelTargets
     LIBRARY DESTINATION ${{CMAKE_INSTALL_LIBDIR}}
     ARCHIVE DESTINATION ${{CMAKE_INSTALL_LIBDIR}})
 install(FILES include/xckernel.h DESTINATION ${{CMAKE_INSTALL_INCLUDEDIR}})
-install(DIRECTORY include/xckernel DESTINATION ${{CMAKE_INSTALL_INCLUDEDIR}})
+install(DIRECTORY include/xckernel DESTINATION ${{CMAKE_INSTALL_INCLUDEDIR}}
+    PATTERN "config.h.in" EXCLUDE)
+install(FILES ${{CMAKE_CURRENT_BINARY_DIR}}/include/xckernel/config.h
+    DESTINATION ${{CMAKE_INSTALL_INCLUDEDIR}}/xckernel)
 install(FILES manifest.json
     DESTINATION ${{CMAKE_INSTALL_DATADIR}}/xckernel)
 if(XCKERNEL_FORTRAN)

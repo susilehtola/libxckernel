@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import json
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -31,8 +32,13 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                       backend="c")
         bld = pkg / "build"
         bld.mkdir()
+        # a small grid block exercises the blocked GEMM path (several
+        # blocks and a remainder) at the test's grid size; the prefix
+        # lets FindBLAS see an environment's BLAS (conda, venv)
         subprocess.run(["cmake", "..", "-DBUILD_SHARED_LIBS=ON",
-                        "-DCMAKE_BUILD_TYPE=Release"],
+                        "-DCMAKE_BUILD_TYPE=Release",
+                        "-DXCKERNEL_GRID_BLOCK=16",
+                        f"-DCMAKE_PREFIX_PATH={sys.prefix}"],
                        cwd=bld, check=True, capture_output=True)
         subprocess.run(["make", "-j8"], cwd=bld, check=True,
                        capture_output=True)

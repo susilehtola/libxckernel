@@ -22,12 +22,19 @@ set(XCKERNEL_FAMILIES "lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga"
     CACHE STRING "Comma-separated functional families to generate")
 set(XCKERNEL_MAX_ORDER "4"
     CACHE STRING "Highest derivative order to generate (0-4)")
+option(XCKERNEL_INCLUDE_HEAVY
+    "Also generate the heaviest kernels (order-4 open-shell hmgga; see catalog.HEAVY)"
+    OFF)
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 set(_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/libxckernel")
 set(_stamp "${_gen_dir}/.generated-for")
-set(_want "${XCKERNEL_FAMILIES};${XCKERNEL_MAX_ORDER}")
+set(_want "${XCKERNEL_FAMILIES};${XCKERNEL_MAX_ORDER};${XCKERNEL_INCLUDE_HEAVY}")
+set(_heavy_arg "")
+if(XCKERNEL_INCLUDE_HEAVY)
+    set(_heavy_arg "--include-heavy")
+endif()
 
 set(_have "")
 if(EXISTS "${_stamp}")
@@ -41,7 +48,7 @@ if(NOT _have STREQUAL _want)
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" -m xckernel.catalog
                 "${_gen_dir}" "${XCKERNEL_FAMILIES}"
-                "${XCKERNEL_MAX_ORDER}" c
+                "${XCKERNEL_MAX_ORDER}" c ${_heavy_arg}
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
         RESULT_VARIABLE _rc)
     if(NOT _rc EQUAL 0)

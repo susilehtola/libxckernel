@@ -83,8 +83,11 @@ families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
 local-hybrid calibration functions) — in the restricted, unrestricted, and
 closed-shell spin-adapted cases (singlet/triplet parity per perturbation)
-through fourth derivative order (third for the spin-resolved `cmgga_tau` and
-for `hmgga`, whose higher orders remain generatable on demand). Of these,
+through fourth derivative order. The six heaviest, the order-4 open-shell
+`hmgga` kernels `xck_hmgga_{ua,ub}_o4` and `xck_hmgga_st_o4_*` (up to
+~45 min and ~16 GB each to generate), are left out of default builds and
+generated on request (`--include-heavy`, `-DXCKERNEL_INCLUDE_HEAVY=ON`).
+Of these,
 fifteen `xck_<family>_{r,ua,ub}_giao` kernels provide the explicit magnetic-field
 derivatives of the Fock matrix with London (GIAO) orbitals, as the real
 factor of dF/dB_s = (i/2c) K_s at a real reference. Every kernel

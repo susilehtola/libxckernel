@@ -18,8 +18,20 @@ jobs:
         shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
+      - name: Install BLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - uses: mamba-org/setup-micromamba@v2
+        env:
+          # Solve for x86-64 level 3 (AVX2), which every hosted runner
+          # has. Left to itself the solver picks builds for the CPU it
+          # happens to run on, and a cached environment solved on an
+          # AVX-512 runner (e.g. pyscf's _x86_64-microarch-level >=4
+          # build) dies with SIGILL when restored onto an AMD EPYC 7763.
+          CONDA_OVERRIDE_ARCHSPEC: haswell
         with:
+          # the override is not part of the environment hash: keep it
+          # in the key so a differently solved cache is never restored
+          cache-environment-key: micromamba-environment-archspec-haswell-
           environment-name: ci
           create-args: >-
             python=${{ matrix.python-version }}
@@ -35,6 +47,10 @@ jobs:
           cache-environment: true
       - name: Install
         run: pip install -e . --no-deps
+      - name: Runner CPU
+        run: |
+          lscpu | grep -E "Model name|Vendor ID"
+          grep -m1 -o -wE "avx512[a-z_0-9]*|amx[a-z_0-9]*|avx2" /proc/cpuinfo | sort -u | tr '\n' ' '; echo
       - name: Run validation suites
         run: |
           fail=0
@@ -42,7 +58,7 @@ jobs:
             m="xckernel.tests.$(basename "${f%.py}")"
             echo "::group::$m"
             rc=0
-            python -m "$m" || rc=$?
+            python -X faulthandler -m "$m" || rc=$?
             if [ "$rc" -ne 0 ]; then
               echo "FAILED: $m (rc=$rc)"
               fail=1
@@ -65,7 +81,7 @@ jobs:
           - name: reduced
             families: lda,gga,mgga_tau
             order: 2
-          - name: full
+          - name: extensive
             families: lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga
             order: 4
     steps:
@@ -73,6 +89,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Install BLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
       - name: Install generator dependencies
         run: pip install sympy numpy
       - name: Configure (generates the kernel tree)
