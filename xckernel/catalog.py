@@ -74,6 +74,17 @@ GIAO_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga")
 #: additional cap for the SPIN-RESOLVED cases.  None at present.
 FAMILY_SPIN_MAX_ORDER: Dict[str, int] = {}
 
+#: entries left out of a default build, generated only on request
+#: (include_heavy=True, --include-heavy, -DXCKERNEL_INCLUDE_HEAVY=ON).
+#: The order-4 open-shell hmgga contractions dwarf everything else:
+#: xck_hmgga_ua_o4 takes ~45 min and ~16 GB to generate -- more memory
+#: than a standard CI runner has -- and the spin-adapted st_o4 entries
+#: rebuild that same polynomial before substituting the parities (~10 min
+#: each before collapse, 3.5e6 monomials). None has a known consumer.
+HEAVY = frozenset({"xck_hmgga_ua_o4", "xck_hmgga_ub_o4",
+                   "xck_hmgga_st_o4_ppp", "xck_hmgga_st_o4_ppm",
+                   "xck_hmgga_st_o4_pmm", "xck_hmgga_st_o4_mmm"})
+
 
 @dataclass
 class CatalogEntry:
@@ -116,8 +127,15 @@ class CatalogEntry:
         return f"{q}, {self.family}, {s}{p}"
 
 
-def entries(families=FAMILIES, max_order: int = 4) -> Iterator[CatalogEntry]:
-    """Enumerate the catalog."""
+def entries(families=FAMILIES, max_order: int = 4,
+            include_heavy: bool = False) -> Iterator[CatalogEntry]:
+    """Enumerate the catalog; HEAVY entries only with include_heavy."""
+    for e in _all_entries(families, max_order):
+        if include_heavy or e.name not in HEAVY:
+            yield e
+
+
+def _all_entries(families, max_order: int) -> Iterator[CatalogEntry]:
     for fam in families:
         fmax = min(max_order, FAMILY_MAX_ORDER.get(fam, max_order))
         yield CatalogEntry(fam, "r", 0)                      # exc
@@ -322,7 +340,8 @@ VERSION = "0.1.0"
 
 
 def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
-                  verbose: bool = True, backend: str = "numpy") -> Dict:
+                  verbose: bool = True, backend: str = "numpy",
+                  include_heavy: bool = False) -> Dict:
     """Generate the full catalog.
 
     backend='numpy': outdir/kernels/*.py + manifest.json (batched kernels).
@@ -340,7 +359,7 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
 
     if backend == "numpy":
         (out / "kernels").mkdir(parents=True, exist_ok=True)
-        for e in entries(families, max_order):
+        for e in entries(families, max_order, include_heavy):
             t0 = time.time()
             source, gen = build_entry(e)
             (out / "kernels" / f"{e.name}.py").write_text(
@@ -367,7 +386,7 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
         (out / "include" / "xckernel" / "config.h.in").write_text(
             _CONFIG_H_IN)
         names: List = []
-        for e in entries(families, max_order):
+        for e in entries(families, max_order, include_heavy):
             t0 = time.time()
             if e.giao:
                 # the C ABI does not yet carry the center-scaled
@@ -441,12 +460,16 @@ def main(argv=None):
                    help="highest derivative order to generate (default: 4)")
     p.add_argument("backend", nargs="?", default="numpy",
                    help="emission backend (default: numpy)")
+    p.add_argument("--include-heavy", action="store_true",
+                   help="also generate the HEAVY entries "
+                        f"({', '.join(sorted(HEAVY))})")
     a = p.parse_args(argv)
     families = a.families.split(",") if a.families else FAMILIES
     unknown = [f for f in families if f not in FAMILIES]
     if unknown:
         p.error(f"unknown families {unknown}; known: {', '.join(FAMILIES)}")
-    m = build_catalog(a.outdir, families, a.max_order, backend=a.backend)
+    m = build_catalog(a.outdir, families, a.max_order, backend=a.backend,
+                      include_heavy=a.include_heavy)
     print(f"{len(m['kernels'])} kernels -> {a.outdir}/ [{a.backend}]")
 
 

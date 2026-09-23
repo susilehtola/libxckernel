@@ -133,7 +133,8 @@ class _NumpyKernel:
 
     def __init__(self, name: str):
         from .catalog import CatalogEntry, _integrand_for, entries
-        entry = next((e for e in entries() if e.name == name), None)
+        entry = next((e for e in entries(include_heavy=True)
+                      if e.name == name), None)
         if entry is None or entry.order == 0:
             raise KeyError(f"unknown kernel {name!r}")
         from .emitters.cbackend import scal_order
