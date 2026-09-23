@@ -7,11 +7,13 @@
 > (as `pylibxc` is to `libxc`).
 
 **An automatic-differentiation backend for [Libxc](https://libxc.gitlab.io/):
-generate arbitrary exchange–correlation kernel elements in LCAO basis sets.**
+generate arbitrary exchange–correlation kernel elements for any
+discretization — Gaussian LCAO, plane waves, real-space grids, finite
+elements, in Cartesian or curvilinear coordinates.**
 
 Density-functional response properties all reduce to derivatives of the XC
 energy with respect to the density matrix, contracted with grid data and the
-functional derivatives that Libxc provides. Every quantum chemistry code
+functional derivatives that Libxc provides. Every electronic structure code
 hand-derives and hand-writes these contractions — the XC Fock matrix, the
 TDDFT kernel, the quadratic-response prefactors — separately, per functional
 family, per spin case, per response order. xckernel replaces that hand
@@ -32,7 +34,8 @@ even a 130,566-term kernel lowers to a few GEMMs. Three emitter families
 consume the collapsed form: ready-to-run NumPy (`einsum`), a low-level C
 library with static coefficient tables, and host-idiom plugins that write a
 program's own contraction style (demonstrated on Psi4:
-[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458)).
+[psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458), and on GPAW:
+[gpaw!3425](https://gitlab.com/gpaw/gpaw/-/merge_requests/3425)).
 
 ## The derivative tower
 
@@ -96,6 +99,77 @@ time), a matrix-free two-sided mode that emits σ-vector contractions
 from MO-pair collocation, and nuclear derivatives of the XC contribution
 including the full quadrature-grid response (`geometric.py`).
 
+## Discretizations: molecular, periodic, curvilinear
+
+Nothing in the derivative tower assumes Gaussians, or even an atom-centered
+expansion. The generated kernels consume collocation data — basis-function
+values and their derivatives on whatever grid the host uses — together with
+the host's density matrices, and return matrices in the same representation.
+Everything specific to the discretization stays on the host side of that
+interface.
+
+* **Plane waves and Bloch states.** Expressions are emitted for complex
+  basis functions and complex coefficients (sesquilinear emission), so they
+  apply as-is to periodic calculations. Demonstrated in GPAW
+  ([gpaw!3425](https://gitlab.com/gpaw/gpaw/-/merge_requests/3425)):
+  gradient-corrected kernels for the periodic dielectric function,
+  represented exactly in the plane-wave basis as
+  `K_GG' = Σ_ab fac_a(q+G)* FT[c_ab](G−G') fac_b(q+G')`, which lifts the
+  `fxc(G−G')` locality restriction that leaves gradient-corrected kernels
+  unrepresentable in the usual local form. Real-space grids and PAW use the
+  same kernels through the same emitter; augmentation-sphere corrections
+  are host-side.
+* **Cell deformation (strain).** `strain.py` carries the master
+  transformation law for every ingredient, yielding the XC stress tensor and
+  its higher strain derivatives — the periodic counterpart of the nuclear
+  derivatives in `geometric.py`, which include the full quadrature-grid
+  response.
+* **Curvilinear coordinates.** `inputs/basis.py` declares orthogonal
+  coordinate systems through their Lamé scale factors `h_i`. Written in
+  physical (orthonormal) components `g_i = h_i⁻¹ ∂_i n`, every generated
+  expression carries over unchanged: the metric enters *only* through how an
+  ingredient is built from the basis functions, so supporting a new
+  coordinate system amounts to declaring its scale factors. Spherical and
+  prolate spheroidal coordinates are supported, as are the two reductions in
+  which an angular coordinate is integrated out analytically, leaving a
+  residual operator on a block index of the density matrix
+  (`l(l+1)·n_l/r²` for the spherically averaged atom, `m²·n_m/h_φ²` for the
+  cylindrically symmetric diatomic) — the four geometries of HelFEM. The
+  density Laplacian is the sole ingredient that does not survive the change
+  of coordinates: it becomes the Laplace–Beltrami operator, bringing in
+  derivatives of the scale factors, and is therefore refused in curvilinear
+  coordinates.
+
+## Adding a new ingredient or a new property
+
+Both axes of extension are declarations, not derivations.
+
+**A new ingredient** is defined *once*, through its value and its
+density-matrix seed (`inputs/ingredients.py`). The entire tower of matrix
+elements and response contractions for every functional built on it then
+follows mechanically, to any order. This is how the current density `j_p`,
+the gauge-corrected `τ̃ = τ − j_p²/2ρ` (which converts any standard mGGA in
+Libxc into a current-corrected functional), and the density-Hessian
+calibration variable `η = ∇n·(∇∇ᵀn)·∇n` of local-hybrid functionals were
+added — the last is *cubic* in the density matrix, and to our knowledge its
+Fock contribution has exactly one published account, stated without
+derivation.
+
+**A new property** is a new seed for the same `D` operator:
+
+| property | seed | module |
+|---|---|---|
+| response to any order | perturbed field `k^X(r)` | `response.py` |
+| nuclear derivatives (+ grid response) | displaced basis functions | `geometric.py` |
+| cell deformation / XC stress | `r → A r` master law | `strain.py` |
+| magnetic field, London (GIAO) orbitals | London phase factor | `london.py` |
+| noncollinear / 4-component relativistic | locally collinear map | `noncollinear.py` |
+
+Adding a **host program** is likewise a plugin: an emitter in `emitters/`
+writes that program's own contraction idiom, so an integration is generated
+files plus `#include`, rather than a merge into hand-written kernel code.
+Regenerating is then an overwrite, not a re-derivation.
+
 ## The compiled library
 
 The repository ships only the generator and its tests; the compiled
@@ -137,6 +211,10 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | cubic-response σ (E[4]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-5 |
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
+| GauXC Hessian assembly recipe | LDA/GGA/mGGA(tau) | R | contracted `geometric_hessian` | ~1e-16 |
+| GauXC Hessian emitted C++ | LDA/GGA/mGGA(tau) | R | SymPy, same operands | exact |
+| XC stress (cell strain), 9 components | LDA–mGGA + η | R | Richardson FD of E(A) | ~1e-9 |
+| XC stress vs a production implementation | LDA/GGA/mGGA(τ) | R | GPAW's own `_stress` on its arrays | ~1e-15 |
 | complex orbitals/basis (sesquilinear) | LDA–mGGA | R | FD in complex P | machine ε |
 | split-storage Re/Im parts | LDA–mGGA | R | complex path | machine ε |
 | noncollinear/relativistic (4C) vxc + fxc | LDA/GGA | locally collinear | FD in 4C spinor DM | ~1e-8 |
@@ -145,7 +223,9 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | density-Hessian (η) | hmgga | R + U + s/t | FD in general M | ~1e-11 |
 | curvilinear metric (spherical/prolate, l/m reductions) | all | n/a | Cartesian gradient norm | ~1e-6 |
 | curvilinear vxc + fxc (blocked DM) | LDA/GGA/mGGA(τ) | R + U | FD of Exc; FD of vxc | ~1e-8 |
+| kxc energy trilinear (grid form) | LDA/GGA | R + U | Richardson triple-cross FD of Exc | ~1e-8 |
 | C backend | all | R | NumPy backend | ~1e-16 |
+| Fortran backend | LDA/GGA | R + U, real + complex | SymPy reference, through gfortran | ~1e-16 |
 
 Conventions (the κ exponential sign, occupation/factor placement,
 singlet/triplet parities, Libxc component packing) are explicit parameters or
@@ -207,8 +287,11 @@ xckernel/
     vlxwriter.py     VeloxChem writer plugin
     gpawwriter.py    GPAW pair-coefficient/stress-field emitter
     helfemwriter.py  HelFEM emitter: potential + kernel channels,
-                     curvilinear (radial/spherical/prolate) coordinates
+                     curvilinear (radial/spherical/prolate) coordinates,
+                     one/two/three gradient components, spin-resolved
     ncwriter.py      noncollinear (relativistic) kernel emitter
+    gauxcwriter.py   GauXC emitter: fixed-grid nuclear-Hessian kernels
+    octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
   catalog.py       the 169-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
@@ -239,6 +322,11 @@ Hessians, grid response) is available as
 [psi4/psi4#3458](https://github.com/psi4/psi4/pull/3458); its generated
 regions are standalone include files, regenerated wholesale with
 `python -m xckernel.emitters.psi4backend --emit-dir <psi4>/psi4/src/psi4/libfock/xcgen`.
+The GPAW integration (meta-GGA and triplet Casida couplings,
+gradient-corrected kernels for the periodic dielectric function, and the XC
+stress) is available as
+[gpaw!3425](https://gitlab.com/gpaw/gpaw/-/merge_requests/3425), regenerated
+with `python -m xckernel.emitters.gpawwriter --emit <gpaw>/gpaw/xckernel_fxc.py`.
 A manuscript describing the library is in preparation.
 
 Not yet done: the exact-exchange energy density e_x(r) as a primitive
