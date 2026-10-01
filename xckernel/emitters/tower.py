@@ -79,6 +79,12 @@ def basis_operand(code: str) -> Tuple[str, Combo]:
         return "chi", _lapl(AXES[int(m.group(2))])
     if code == "lapl_chi":
         return "chi", _lapl()
+    m = re.fullmatch(r"tchi\[([xyz]{3})\]", code)
+    if m:
+        return "chi", [(m.group(1), 1)]
+    m = re.fullmatch(r"Uh\[([xyz]{2})\]", code)
+    if m:
+        return "Dchi", [(m.group(1), 1)]
     if code == "U0":
         return "Dchi", [("", 1)]
     m = re.fullmatch(r"U([123])", code)
@@ -123,6 +129,9 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     if m:
         return [(_name("rho", m.group(1), m.group(2), ax), wt)
                 for ax, wt in _lapl()]
+    m = re.fullmatch(r"d3rho" + _SP + r"_([xyz]{3})", name)
+    if m:
+        return [(_name("rho", m.group(1), None, m.group(2)), 1)]
     m = re.fullmatch(r"grad_tau" + _SP + r"_([xyz])", name)
     if m:
         return [(_name("tau", m.group(1), None, m.group(2)), 1)]

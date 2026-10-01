@@ -148,14 +148,27 @@ class CatalogEntry:
         return f"{q}, {self.family}, {s}{p}"
 
 
+#: families whose nuclear-gradient entries are generated from another
+#: family's integrands. cmgga_tau at a real reference: the paramagnetic
+#: current vanishes for every real density matrix, so tau~ = tau along any
+#: displacement and the gradient is the tau-meta-GGA one, evaluated with
+#: the cmgga_tau derivative arrays (vrho, vsigma, vtau).
+GRADIENT_ALIASES = {"cmgga_tau": "mgga_tau"}
+
+
+def gradient_families() -> Tuple[str, ...]:
+    from .engine.gradient import GRADIENT_FAMILIES
+    return tuple(f for f in FAMILIES
+                 if f in GRADIENT_FAMILIES or f in GRADIENT_ALIASES)
+
+
 def _one_index_entries(fam: str) -> Iterator[CatalogEntry]:
     """The C-backend Fock-diagonal and nuclear-gradient entries."""
-    from .engine.gradient import GRADIENT_FAMILIES
     polarized = fam not in UNPOLARIZED_ONLY
     spins = ("r", "ua", "ub") if polarized else ("r",)
     for spin in spins:
         yield CatalogEntry(fam, spin, 1, kind="diag")
-    if fam in GRADIENT_FAMILIES:
+    if fam in gradient_families():
         for spin in spins:
             yield CatalogEntry(fam, spin, 1, kind="g1")
         for spin in (("r", "u") if polarized else ("r",)):
@@ -386,17 +399,18 @@ def _kind_kernels(e: CatalogEntry):
     if e.kind == "diag":
         ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 1)))
         return [ck], ck
+    src = GRADIENT_ALIASES.get(e.family, e.family)
     if e.kind == "g1":
         from .engine.gradient import energy_gradient_rows
-        kis = [energy_gradient_rows(e.family, e.spin, d) for d in range(3)]
+        kis = [energy_gradient_rows(src, e.spin, d) for d in range(3)]
         whole = KernelIntegrand(functional=kis[0].functional,
                                 index_pairs=[("u", "v")],
                                 expr=sp.Add(*[k.expr for k in kis]))
         return [collapse(k) for k in kis], collapse(whole)
     from .engine.gradient import energy_grid_gradient
     from .inputs.functional import Functional
-    func = Functional.of_family(e.family)
-    exprs = [energy_grid_gradient(e.family, e.spin, d) for d in range(3)]
+    func = Functional.of_family(src)
+    exprs = [energy_grid_gradient(src, e.spin, d) for d in range(3)]
     return ([collapse_pointwise(x, func) for x in exprs],
             collapse_pointwise(sp.Add(*exprs), func))
 
@@ -478,6 +492,12 @@ def _emit_kind(e: CatalogEntry):
             "volume; the grid class of dE/dX_{A,d} is the sum over the points "
             "whose parent atom is A (call with the plain weights; no atom "
             "masking in the kernel).")
+    if e.kind in ("g1", "gg") and e.family in GRADIENT_ALIASES:
+        m["validity"] = (
+            f"real density matrices only: generated from the "
+            f"{GRADIENT_ALIASES[e.family]} gradient, exact for "
+            f"{e.family} when the paramagnetic current vanishes (no jp "
+            "operands); a complex-orbital gradient is not covered")
     m["gradient_classes"] = _GRADIENT_CLASSES
     return hpp, cpp, m
 
@@ -495,7 +515,7 @@ _GRADIENT_CLASSES = {
 }
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,

@@ -76,8 +76,8 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **215 kernels**: 169
-named `xck_<family>_<case>_o<order>[_<parities>]` and 46 Fock-diagonal
+`catalog.py` enumerates, generates, and manifests **225 kernels**: 169
+named `xck_<family>_<case>_o<order>[_<parities>]` and 56 Fock-diagonal
 and nuclear-gradient kernels (below), spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
@@ -113,20 +113,22 @@ The C package also carries kernels with one free basis index, or none:
 | `xck_<family>_{r,ua,ub}_g1` | `(3, nbf)` | nuclear gradient, basis class, as per-function rows |
 | `xck_<family>_{r,u}_gg` | `(3, ng)` | nuclear gradient, grid class, per grid point |
 
-The gradient entries cover `lda`, `gga`, `mgga_tau`, `mgga_lapl` and
-`mgga`. Every class is returned as **+dE/dX**, and the three classes
-add up to the full gradient with grid response:
+The gradient entries cover all seven families. Every class is returned
+as **+dE/dX**, and the three classes add up to the full gradient with
+grid response:
 
 | class | what moves | how to evaluate dE/dX_{A,d} |
 |---|---|---|
-| basis | atom A's basis functions | `g1`: sum `out[d, u]` over the functions u on atom A. Inputs: the plain collocation tower `chi` (to third order for the Laplacian families) and its density contraction `Dchi = D chi`. Unrestricted: call `ua` with Dᵅ and `ub` with Dᵝ, and add. |
-| grid | atom A's grid points | `gg`: sum `out[d, g]` over the points g whose parent atom is A. Inputs: the density tower to second order (third for the Laplacian families) and `tau_x`, `tau_y`, `tau_z` (per channel for `u`). |
+| basis | atom A's basis functions | `g1`: sum `out[d, u]` over the functions u on atom A. Inputs: the plain collocation tower `chi` (to third order for the Laplacian and density-Hessian families) and its density contraction `Dchi = D chi`. Unrestricted: call `ua` with Dᵅ and `ub` with Dᵝ, and add. |
+| grid | atom A's grid points | `gg`: sum `out[d, g]` over the points g whose parent atom is A. Inputs: the density tower to second order (third for the Laplacian and density-Hessian families) and `tau_x`, `tau_y`, `tau_z` (per channel for `u`). |
 | weight | the partition weights | no new kernel: `Σ_g (∂w_g/∂X_{A,d}) e(r_g)`, e.g. `xck_<family>_r_o0` with `w := dw/dX` (total density, Libxc `zk`). The host owns the weight derivative. |
 
 Summed over atoms, the three classes cancel for each direction. The
-density matrices must be symmetric. For `cmgga_tau` at a real reference
-the paramagnetic current vanishes along any real displacement, so its
-gradient is that of `mgga_tau` with the same derivative arrays.
+density matrices must be symmetric. The `cmgga_tau` gradient entries
+hold for real density matrices: the paramagnetic current then vanishes
+along any displacement, so they are generated from the `mgga_tau`
+gradient and take no current operands. A complex-orbital gradient, e.g.
+in a magnetic field, is not covered.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -265,8 +267,8 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | quadratic-response σ (E[3]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-6 |
 | cubic-response σ (E[4]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-5 |
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
-| C kernels on the tower interface: `o1`, `o2` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | FD of Exc in D; FD of `o1` along D¹ | ~1e-13 |
-| C gradient kernels `g1` + `gg` + weight class | LDA/GGA/mGGA(τ,∇²ρ) | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
+| C kernels on the tower interface: `o1`, `o2` | LDA/GGA/mGGA(τ,∇²ρ)/η | R + U | FD of Exc in D; FD of `o1` along D¹ | ~1e-12 |
+| C gradient kernels `g1` + `gg` + weight class | all seven | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | GauXC Hessian assembly recipe | LDA/GGA/mGGA(tau) | R | contracted `geometric_hessian` | ~1e-16 |
@@ -353,7 +355,7 @@ xckernel/
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
     tower.py         the derivative-tower interface of the C kernels
-  catalog.py       the 215-kernel catalog + machine-readable manifests
+  catalog.py       the 225-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/

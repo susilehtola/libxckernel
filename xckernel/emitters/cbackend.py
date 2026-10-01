@@ -72,6 +72,11 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
+        elif p.startswith("d3rho"):
+            # the ten third derivatives of the density
+            from .tower import components
+            for comp in components(3)[10:]:
+                order.append(f"{p}_{comp}")
         elif p.startswith(("grad_rho", "jp", "dgrad_rho", "grad_tau",
                            "grad_lapl_rho")):
             for ax in ("x", "y", "z"):

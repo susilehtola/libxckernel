@@ -29,7 +29,8 @@ from pathlib import Path
 import numpy as np
 import sympy as sp
 
-from ..catalog import FAMILIES, CatalogEntry, _emit_kind, _integrand_for
+from ..catalog import (FAMILIES, CatalogEntry, _emit_kind, _integrand_for,
+                       _one_index_entries, gradient_families)
 from ..emitters.cbackend import (_EVALUATOR_HPP, emit_exc_cpp, emit_exc_hpp,
                                  emit_kernel_cpp, emit_kernel_hpp)
 from ..emitters.codegen import collapse
@@ -58,14 +59,10 @@ def build_library(td: Path) -> Library:
         (src / f"{name}.cpp").write_text(cpp)
 
     for fam in FAMILIES:
-        kinds = [(s, "diag") for s in ("r", "ua", "ub")]
         matrix = [(s, 1) for s in ("r", "ua", "ub")]
         if fam in GRADIENT_FAMILIES:
-            kinds += [(s, "g1") for s in ("r", "ua", "ub")] \
-                + [("r", "gg"), ("u", "gg")]
             matrix += [("r", 2), ("ua", 2)]
-        for spin, kind in kinds:
-            e = CatalogEntry(fam, spin, 1, kind=kind)
+        for e in _one_index_entries(fam):
             hpp, cpp, _ = _emit_kind(e)
             write(e.name, hpp, cpp)
         for spin, order in matrix:
@@ -164,9 +161,10 @@ _FAM_VARS = {"lda": ("rho",), "gga": ("rho", "sigma"),
              "mgga_lapl": ("rho", "sigma", "lapl"),
              "mgga": ("rho", "sigma", "lapl", "tau"),
              "cmgga_tau": ("rho", "sigma", "tau"),
-             "hmgga": ("rho", "sigma", "lapl", "tau")}
+             "hmgga": ("rho", "sigma", "lapl", "tau", "eta")}
 
-_RV = {v: sp.Symbol(v, real=True) for v in ("rho", "sigma", "tau", "lapl")}
+_RV = {v: sp.Symbol(v, real=True)
+       for v in ("rho", "sigma", "tau", "lapl", "eta")}
 _FR = (_RV["rho"]**3 / 3 + sp.Rational(3, 10) * _RV["sigma"] * _RV["rho"]
        + sp.Rational(1, 5) * _RV["tau"]**2
        + sp.Rational(1, 10) * _RV["rho"]**2 * _RV["tau"]
@@ -174,11 +172,15 @@ _FR = (_RV["rho"]**3 / 3 + sp.Rational(3, 10) * _RV["sigma"] * _RV["rho"]
        + sp.Rational(3, 20) * _RV["lapl"] * _RV["rho"]**2
        + sp.Rational(1, 15) * _RV["lapl"]**2
        + sp.Rational(1, 25) * _RV["lapl"] * _RV["sigma"]
-       + sp.Rational(1, 30) * _RV["sigma"]**2)
+       + sp.Rational(1, 30) * _RV["sigma"]**2
+       + sp.Rational(1, 12) * _RV["eta"] * _RV["rho"]
+       + sp.Rational(1, 40) * _RV["eta"]**2
+       + sp.Rational(1, 35) * _RV["eta"] * _RV["tau"])
 
 _UV = {(g, c): sp.Symbol(f"{g}_{c}", real=True)
        for g, cs in (("rho", "ab"), ("sigma", ("aa", "ab", "bb")),
-                     ("lapl", "ab"), ("tau", "ab")) for c in cs}
+                     ("lapl", "ab"), ("tau", "ab"), ("eta", "ab"))
+       for c in cs}
 _U = lambda g, c: _UV[(g, c)]
 _FU = (_U("rho", "a")**3 / 3 + sp.Rational(2, 5) * _U("rho", "b")**3
        + sp.Rational(3, 10) * _U("rho", "a") * _U("rho", "b")**2
@@ -192,7 +194,17 @@ _FU = (_U("rho", "a")**3 / 3 + sp.Rational(2, 5) * _U("rho", "b")**3
        + sp.Rational(3, 25) * _U("lapl", "a") * _U("rho", "b")
        + sp.Rational(1, 11) * _U("lapl", "b") * _U("rho", "a")**2
        + sp.Rational(1, 20) * _U("lapl", "a") * _U("lapl", "b")
-       + sp.Rational(1, 30) * _U("sigma", "aa") * _U("tau", "b"))
+       + sp.Rational(1, 30) * _U("sigma", "aa") * _U("tau", "b")
+       + sp.Rational(1, 12) * _U("eta", "a") * _U("rho", "b")
+       + sp.Rational(1, 16) * _U("eta", "b") * _U("rho", "a")
+       + sp.Rational(1, 40) * _U("eta", "a") * _U("eta", "b"))
+
+
+def _eta(rho):
+    """grad rho . (grad grad rho) . grad rho from a density tower."""
+    g = rho[1:4]
+    H = np.array([[rho[comp_index(a + b)] for b in _AX] for a in _AX])
+    return np.einsum("ig,ijg,jg->g", g, H, g)
 
 
 def _variables_r(f):
@@ -200,7 +212,8 @@ def _variables_r(f):
     grad = rho[1:4]
     return {_RV["rho"]: rho[0], _RV["sigma"]: (grad * grad).sum(0),
             _RV["tau"]: f["tau"][0],
-            _RV["lapl"]: sum(rho[comp_index(a + a)] for a in _AX)}
+            _RV["lapl"]: sum(rho[comp_index(a + a)] for a in _AX),
+            _RV["eta"]: _eta(rho)}
 
 
 def _variables_u(fa, fb):
@@ -209,6 +222,7 @@ def _variables_u(fa, fb):
         out[_U("rho", s)] = f["rho"][0]
         out[_U("tau", s)] = f["tau"][0]
         out[_U("lapl", s)] = sum(f["rho"][comp_index(a + a)] for a in _AX)
+        out[_U("eta", s)] = _eta(f["rho"])
     for c, (f1, f2) in (("aa", (fa, fa)), ("ab", (fa, fb)), ("bb", (fb, fb))):
         out[_U("sigma", c)] = (f1["rho"][1:4] * f2["rho"][1:4]).sum(0)
     return out
@@ -309,7 +323,7 @@ class System:
         return float(np.dot(w, e))
 
 
-def richardson(f, h=1e-3):
+def richardson(f, h=5e-4):
     return (8 * (f(h) - f(-h)) - (f(2 * h) - f(-2 * h))) / (12 * h)
 
 
@@ -503,7 +517,7 @@ def main():
         for fam in GRADIENT_FAMILIES:
             print(f"Fock matrix and linear response: {fam}")
             check_matrix(lib, rep, fam, sysm)
-        for fam in GRADIENT_FAMILIES:
+        for fam in gradient_families():
             print(f"nuclear gradient: {fam}")
             for spin in ("r", "u"):
                 check_gradient(lib, rep, fam, spin, sysm)
