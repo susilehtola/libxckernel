@@ -485,6 +485,12 @@ def check_fock_derivative(lib, rep, fam, spin, sysm):
     towers = ({"Dchi": np.einsum("uv,kvg->kug", Ma + Mb, T)} if spin == "r"
               else {"Dchi_a": np.einsum("uv,kvg->kug", Ma, T),
                     "Dchi_b": np.einsum("uv,kvg->kug", Mb, T)})
+    if fam in GENERAL_DM:
+        # the M^T-contracted towers of a general density matrix
+        towers.update({"DTchi": np.einsum("vu,kvg->kug", Ma + Mb, T)}
+                      if spin == "r" else
+                      {"DTchi_a": np.einsum("vu,kvg->kug", Ma, T),
+                       "DTchi_b": np.einsum("vu,kvg->kug", Mb, T)})
     ops_b = _matrix_ops(lib, f1, fam, spin, sysm, w0, T, Ma, Mb)
     ops_g = _matrix_ops(lib, fg, fam, spin, sysm, w0, T, Ma, Mb)
     ops_w = _matrix_ops(lib, o1, fam, spin, sysm, w0, T, Ma, Mb)

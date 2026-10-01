@@ -103,7 +103,8 @@ class Library:
             return False
 
     def __call__(self, name: str, *, w, chi=None, Dchi=None, DTchi=None,
-                 Dchi_a=None, Dchi_b=None, atom_mask=None, out=None,
+                 Dchi_a=None, Dchi_b=None, DTchi_a=None, DTchi_b=None,
+                 atom_mask=None, out=None,
                  **operands) -> np.ndarray:
         """Call a kernel with named operands; returns ``out`` (accumulated
         into when given): (nbf, nbf), (nbf,) for *_o1_diag, (3, nbf) for
@@ -130,10 +131,12 @@ class Library:
             if self._has(f"{name}_DTchi_order"):
                 towers.append("DTchi")
         if kind == "f1":
-            towers += (["Dchi_a", "Dchi_b"]
-                       if self._has(f"{name}_Dchi_a_order") else ["Dchi"])
+            for t in ("Dchi", "Dchi_a", "Dchi_b", "DTchi", "DTchi_a",
+                      "DTchi_b"):
+                if self._has(f"{name}_{t}_order"):
+                    towers.append(t)
         given = {"chi": chi, "Dchi": Dchi, "DTchi": DTchi, "Dchi_a": Dchi_a,
-                 "Dchi_b": Dchi_b}
+                 "Dchi_b": Dchi_b, "DTchi_a": DTchi_a, "DTchi_b": DTchi_b}
         for arr in towers:
             val = given[arr]
             val = np.ascontiguousarray(val, dtype=np.float64)

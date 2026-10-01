@@ -531,12 +531,16 @@ ABI_KINDS = {
     "f1": (True, ("chi", "Dchi"), "(3, nbf, nbf)"),
     "f1u": (True, ("chi", "Dchi_a", "Dchi_b"), "(3, nbf, nbf)"),
     "fg": (True, ("chi",), "(3, nbf, nbf)"),
+    # ... for a general density matrix M (complex orbitals): the M^T towers
+    "f1c": (True, ("chi", "Dchi", "DTchi"), "(3, nbf, nbf)"),
+    "f1cu": (True, ("chi", "Dchi_a", "Dchi_b", "DTchi_a", "DTchi_b"),
+             "(3, nbf, nbf)"),
 }
 
 #: kinds taking the atom mask (const int8_t* atom_mask, after the towers)
-MASKED_KINDS = ("f1", "f1u")
+MASKED_KINDS = ("f1", "f1u", "f1c", "f1cu")
 #: kinds whose output is one nbf x nbf matrix per row block
-MATRIX_KINDS = ("matrix", "f1", "f1u", "fg")
+MATRIX_KINDS = ("matrix", "f1", "f1u", "f1c", "f1cu", "fg")
 
 
 def collapse_pointwise(expr, functional) -> CollapsedKernel:
@@ -571,9 +575,17 @@ def kernel_layout(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     for n in L.computed:
         for ch, terms in computed[n]:
             for _, a, b in terms:
+                arr, b = _row_tower(ch, b)
                 L.require("chi", len(a))
-                L.require(f"Dchi_{ch}" if ch else "Dchi", len(b))
+                L.require(arr, len(b))
     return L
+
+
+def _row_tower(ch: str, b: str) -> Tuple[str, str]:
+    """(tower array, axes) of a perturbed-field term's contracted factor:
+    a 'T' prefix selects the M^T tower of a general density matrix."""
+    base = "DTchi" if b.startswith("T") else "Dchi"
+    return (f"{base}_{ch}" if ch else base), b.lstrip("T")
 
 
 def _tables(ck: CollapsedKernel, sidx: dict, tag: str) -> Tuple[list, dict]:
@@ -741,14 +753,15 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         for r in range(len(blocks)):
             for j, n in enumerate(cfld):
                 ch, terms = computed[n][r]
-                rows = f"Dchi_{ch}" if ch else "Dchi"
                 lines += [
                     "    {",
                     "        const T* A_[] = {" + ", ".join(
                         f"chi + (int64_t){comp_index(a)}*nbf*npts"
                         for _, a, _ in terms) + "};",
                     "        const T* B_[] = {" + ", ".join(
-                        f"{rows} + (int64_t){comp_index(b)}*nbf*npts"
+                        "{} + (int64_t){}*nbf*npts".format(
+                            _row_tower(ch, b)[0],
+                            comp_index(_row_tower(ch, b)[1]))
                         for _, _, b in terms) + "};",
                     "        static constexpr double c_[] = {" + ", ".join(
                         f"{float(c)!r}" for c, _, _ in terms) + "};",
@@ -842,6 +855,10 @@ _KIND_NOTE = {
             "whose functions atom_mask flags. Dchi_a/b = D^a/b chi"),
     "fg": ("out (3, nbf, nbf): dF/dX_{A,d}, grid class: call with the "
            "weights of atom A's points (w M^A), one call per atom"),
+    "f1c": ("out (3, nbf, nbf): dF/dX_{A,d}, basis class, general density "
+            "matrix M: Dchi = M chi, DTchi = M^T chi; one call per atom"),
+    "f1cu": ("out (3, nbf, nbf): dF^s/dX_{A,d}, basis class, general "
+             "density matrices: Dchi_s = M^s chi, DTchi_s = M^s^T chi"),
 }
 
 

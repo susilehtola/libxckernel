@@ -411,7 +411,9 @@ def _kind_kernels(e: CatalogEntry):
             expr=sp.Add(*[k.expr for k in kis])))
         computed = None
         if e.kind == "f1":
-            computed = {n: [geofock.perturbed_field_terms(n, d)
+            from .engine.gradient import GENERAL_DM_FAMILIES
+            general = e.family in GENERAL_DM_FAMILIES
+            computed = {n: [geofock.perturbed_field_terms(n, d, general)
                             for d in range(3)]
                         for n in scal_order(whole) if "_p1" in n}
         return [collapse(k) for k in kis], whole, computed
@@ -444,7 +446,8 @@ def _tower_params(layout, kind: str) -> List[Dict]:
         if a.startswith(("Dchi", "DTchi")):
             meta["kind"] = "dm_contracted_collocation_tower"
             mat = {"Dchi": "D", "DTchi": "D^T", "Dchi_a": "D^a",
-                   "Dchi_b": "D^b"}[a]
+                   "Dchi_b": "D^b", "DTchi_a": "(D^a)^T",
+                   "DTchi_b": "(D^b)^T"}[a]
             meta["definition"] = f"{a}[k,u,g] = sum_v ({mat})[u,v] chi[k,v,g]"
         params.append(meta)
     for f in layout.fields:
@@ -483,7 +486,8 @@ def abi_kind(e: CatalogEntry) -> str:
     if e.kind == "g1" and e.family in GENERAL_DM_FAMILIES:
         return "g1c"
     if e.kind == "f1":
-        return "f1" if e.spin == "r" else "f1u"
+        c = "c" if e.family in GENERAL_DM_FAMILIES else ""
+        return f"f1{c}" if e.spin == "r" else f"f1{c}u"
     return e.kind or "matrix"
 
 
@@ -537,7 +541,10 @@ def _emit_kind(e: CatalogEntry):
             "per atom. chi is the plain collocation tower (the -d/dr of "
             "d chi/dX is folded in); the kernel forms the perturbed fields "
             "of the displacement from chi, the D chi towers and the mask. "
-            "D symmetric." + ("" if e.spin == "r" else
+            + ("D symmetric." if abi in ("f1", "f1u") else
+               "The density matrix M is general (complex orbitals in a real "
+               "basis): Dchi = M chi and DTchi = M^T chi.")
+            + ("" if e.spin == "r" else
                               " Unrestricted: dF^s/dX responds to both "
                               "channels, so both Dchi_a and Dchi_b are "
                               "passed."))

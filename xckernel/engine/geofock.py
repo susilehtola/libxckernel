@@ -23,7 +23,10 @@ classes are those of geometric.py:
 
 * **weight class** -- the order-1 kernel with w := dw/dX.
 
-Density matrices are symmetric (real orbitals).
+Density matrices are symmetric, except for the complex-orbital
+cmgga_tau family (gradient.GENERAL_DM_FAMILIES), whose general M makes
+the two index slots contract differently: the perturbed fields then read
+the M^T-contracted tower DTchi next to Dchi.
 """
 
 from __future__ import annotations
@@ -39,9 +42,9 @@ from .gradient import (_d3, _deta, _dtau_tilde, _grad_scalar, _hess,
                        _hess_comp)
 from .kernel import KernelIntegrand
 
-#: families with dF/dX entries (symmetric density matrices)
+#: families with dF/dX entries
 FOCK_DERIV_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga",
-                       "hmgga")
+                       "hmgga", "cmgga_tau")
 
 _SORT = lambda s: "".join(sorted(s))
 _BASIS = re.compile(r"^(chi|dchi|lapl_chi|hess_chi)_(u|v)(?:_([xyz]{1,2}))?$")
@@ -84,14 +87,17 @@ def _primitive_for(name: str):
     return PRIMITIVES[f"{base}_{ax}" if ax else base], ch or ""
 
 
-def perturbed_field_terms(name: str, d: int):
+def perturbed_field_terms(name: str, d: int, general: bool = False):
     """The perturbed field ``name`` of the displacement of atom A along d,
     as a masked reduction over A's functions:
 
-        field^X(g) = sum_u mask_u sum_t c_t chi_{a_t}(u,g) Dchi_{b_t}(u,g),
+        field^X(g) = sum_u mask_u sum_t c_t chi_{a_t}(u,g) R_t(u,g),
 
     returned as (channel, [(c_t, a_t, b_t)]) with a_t, b_t tower axis
-    strings (Dchi of that channel's density matrix)."""
+    strings and R the D-contracted tower Dchi of that channel's density
+    matrix. With ``general`` (non-symmetric M), displacing the second
+    index slot contracts the first with M^T: those terms read DTchi and
+    are flagged by a 'T' prefix on b_t."""
     prim, ch = _primitive_for(name)
     expr = sp.expand(prim.kernel(Orbital.make("u"), Orbital.make("v")))
     acc: Counter = Counter()
@@ -105,11 +111,14 @@ def perturbed_field_terms(name: str, d: int):
             parts[info[0]] = info[1:]
         (ku, au), (kv, av) = parts["u"], parts["v"]
         dd = AXES[d]
-        # displace either slot (d chi/dX = -d_d chi), contract the other
-        for (ks, as_), (kr, ar) in (((ku, au), (kv, av)), ((kv, av), (ku, au))):
+        # displace either slot (d chi/dX = -d_d chi), contract the other:
+        # the first slot's partner with M (Dchi), the second's with M^T
+        for (ks, as_), (kr, ar), t in (((ku, au), (kv, av), ""),
+                                       ((kv, av), (ku, au),
+                                        "T" if general else "")):
             for sa, wa in _tower(ks, as_, dd):
                 for sb, wb in _tower(kr, ar):
-                    acc[(sa, sb)] += -coeff * wa * wb
+                    acc[(sa, t + sb)] += -coeff * wa * wb
     return ch, [(c, a, b) for (a, b), c in acc.items() if c != 0]
 
 
