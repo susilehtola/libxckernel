@@ -47,9 +47,7 @@ import sympy as sp
 from ..inputs.basis import AXES, HESS_COMPS
 from .kernel import KernelIntegrand
 
-#: families with nuclear-gradient integrands (cmgga_tau is served by the
-#: mgga_tau ones at a real reference, where the paramagnetic current
-#: vanishes; see catalog.GRADIENT_ALIASES)
+#: families with nuclear-gradient integrands
 GRADIENT_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga", "hmgga")
 
 _BASIS_SYM = re.compile(
