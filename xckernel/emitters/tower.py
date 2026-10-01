@@ -66,8 +66,20 @@ def _lapl(prefix: str = "") -> Combo:
 
 # --- basis operands -------------------------------------------------------------
 
+def is_masked(code: str) -> bool:
+    """Atom-masked operand (rows of functions off the atom are zero)."""
+    return code.startswith("M")
+
+
 def basis_operand(code: str) -> Tuple[str, Combo]:
-    """(tower array, combination of components) of an engine basis code."""
+    """(tower array, combination of components) of an engine basis code;
+    atom-masked codes (is_masked) map like their unmasked counterparts."""
+    m = re.fullmatch(r"M(dchi|hess_chi|tchi|dlapl_chi)\[([xyz]{1,3})\]", code)
+    if m:
+        kind, ax = m.groups()
+        if kind == "dlapl_chi":
+            return "chi", _lapl(ax)
+        return "chi", [("".join(sorted(ax)), 1)]
     m = re.fullmatch(r"(dchi|hess_chi|dlapl_chi)\[(\d)\]", code)
     if code == "chi":
         return "chi", [("", 1)]
@@ -79,6 +91,22 @@ def basis_operand(code: str) -> Tuple[str, Combo]:
         return "chi", _lapl(AXES[int(m.group(2))])
     if code == "lapl_chi":
         return "chi", _lapl()
+    m = re.fullmatch(r"tchi\[([xyz]{3})\]", code)
+    if m:
+        return "chi", [(m.group(1), 1)]
+    m = re.fullmatch(r"Uh\[([xyz]{2})\]", code)
+    if m:
+        return "Dchi", [(m.group(1), 1)]
+    if code == "UT0":
+        return "DTchi", [("", 1)]
+    m = re.fullmatch(r"UT([123])", code)
+    if m:
+        return "DTchi", [(AXES[int(m.group(1)) - 1], 1)]
+    if code == "UTL":
+        return "DTchi", _lapl()
+    m = re.fullmatch(r"UTh\[([xyz]{2})\]", code)
+    if m:
+        return "DTchi", [(m.group(1), 1)]
     if code == "U0":
         return "Dchi", [("", 1)]
     m = re.fullmatch(r"U([123])", code)
@@ -123,6 +151,9 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     if m:
         return [(_name("rho", m.group(1), m.group(2), ax), wt)
                 for ax, wt in _lapl()]
+    m = re.fullmatch(r"d3rho" + _SP + r"_([xyz]{3})", name)
+    if m:
+        return [(_name("rho", m.group(1), None, m.group(2)), 1)]
     m = re.fullmatch(r"grad_tau" + _SP + r"_([xyz])", name)
     if m:
         return [(_name("tau", m.group(1), None, m.group(2)), 1)]
@@ -130,6 +161,9 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     if m:
         return [(_name("rho", m.group(1), None, ax), wt)
                 for ax, wt in _lapl(m.group(2))]
+    m = re.fullmatch(r"jpgrad" + _SP + r"_([xyz])_([xyz])", name)
+    if m:
+        return [(_name(f"jp{m.group(2)}", m.group(1), None, m.group(3)), 1)]
     m = re.fullmatch(r"jp" + _SP + _PT + r"_([xyz])", name)
     if m:
         return [(_name(f"jp{m.group(3)}", m.group(1), m.group(2), ""), 1)]
@@ -145,7 +179,10 @@ class Layout:
     (fields first, as in scal_order); libxc: the derivative arrays."""
 
     def __init__(self, internal_fields: List[str], libxc: List[str],
-                 basis_codes):
+                 basis_codes, computed=()):
+        #: per-point operands the kernel computes itself (not passed)
+        self.computed = [n for n in internal_fields if n in set(computed)]
+        internal_fields = [n for n in internal_fields if n not in self.computed]
         self.internal_fields = list(internal_fields)
         self.libxc = list(libxc)
         self.field_map: Dict[str, List[Tuple[int, int]]] = {}
@@ -176,7 +213,10 @@ class Layout:
 
     def derived_basis(self) -> List[str]:
         return [c for c, (_, combo) in self.basis.items()
-                if not is_component(combo)]
+                if not is_component(combo) or is_masked(c)]
+
+    def require(self, array: str, order: int):
+        self.orders[array] = max(self.orders.get(array, 0), order)
 
     def definitions(self) -> Dict[str, str]:
         """Human-readable definitions of the combinations formed inside."""
@@ -189,6 +229,11 @@ class Layout:
             arr, combo = self.basis[c]
             out[c] = " + ".join((f"{wt}*" if wt != 1 else "")
                                 + f"{arr}_{ax}" for ax, wt in combo)
+            if is_masked(c):
+                out[c] = f"atom_mask * ({out[c]})"
+        for n in self.computed:
+            out[n] = "perturbed field of the displacement (from chi, Dchi, " \
+                     "atom_mask)"
         return out
 
 

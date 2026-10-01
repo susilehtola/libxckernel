@@ -47,12 +47,20 @@ import sympy as sp
 from ..inputs.basis import AXES, HESS_COMPS
 from .kernel import KernelIntegrand
 
-#: families with nuclear-gradient entries (the ingredients rho, sigma, tau
-#: and lapl; the current-density and density-Hessian families are not
-#: covered).
-GRADIENT_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga")
+#: families with nuclear-gradient integrands
+GRADIENT_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga", "hmgga",
+                     "cmgga_tau")
 
-_BASIS_SYM = re.compile(r"^(chi|dchi|lapl_chi)_(\w+?)(?:_([xyz]))?$")
+#: families with a GENERAL density matrix M (complex orbitals in a real
+#: basis: the symmetric part is Re P, the antisymmetric part Im P carries
+#: the paramagnetic current). The displaced function then enters through
+#: both index slots differently: the first contracts with M chi, the
+#: second with M^T chi (the DTchi tower).
+GENERAL_DM_FAMILIES = ("cmgga_tau",)
+
+_BASIS_SYM = re.compile(
+    r"^(chi|dchi|lapl_chi|hess_chi)_(\w+?)(?:_([xyz]{1,2}))?$")
+_NAXES = {"chi": 0, "dchi": 1, "lapl_chi": 0, "hess_chi": 2}
 
 
 def _hess_comp(i: int, j: int) -> str:
@@ -69,29 +77,36 @@ def _split_basis(sym: sp.Symbol, labels: Tuple[str, str]):
     if m is None:
         return None
     kind, lbl, ax = m.groups()
-    if kind == "dchi" and ax is None:
+    if len(ax or "") != _NAXES[kind] or lbl not in labels:
         return None
-    if lbl not in labels:
-        return None
-    return labels.index(lbl), kind, (AXES.index(ax) if ax else None)
+    return labels.index(lbl), kind, ax
 
 
-def _seeded(kind: str, axis, d: int) -> sp.Symbol:
+def _seeded(kind: str, axes, d: int) -> sp.Symbol:
     """d_d of a basis factor, as a symbol on the displaced (u) side."""
     if kind == "chi":
         return sp.Symbol(f"dchi_u_{AXES[d]}", real=True)
     if kind == "dchi":
-        return sp.Symbol(f"hess_chi_u_{_hess_comp(d, axis)}", real=True)
+        return sp.Symbol(f"hess_chi_u_{_hess_comp(d, AXES.index(axes))}",
+                         real=True)
+    if kind == "hess_chi":
+        # third-derivative collocation (a chi-tower component)
+        return sp.Symbol(f"tchi_u_{''.join(sorted(AXES[d] + axes))}",
+                         real=True)
     return sp.Symbol(f"dlapl_chi_u_{AXES[d]}", real=True)
 
 
-def _row(kind: str, axis) -> sp.Symbol:
-    """The D-contracted collocation row of a basis factor (v side)."""
+def _row(kind: str, axes, transposed: bool = False) -> sp.Symbol:
+    """The D-contracted collocation row of a basis factor (v side); with
+    ``transposed``, the D^T-contracted one (general density matrices)."""
+    t = "T" if transposed else ""
     if kind == "chi":
-        return sp.Symbol("U0_v", real=True)
+        return sp.Symbol(f"U{t}0_v", real=True)
     if kind == "dchi":
-        return sp.Symbol(f"U{axis + 1}_v", real=True)
-    return sp.Symbol("UL_v", real=True)
+        return sp.Symbol(f"U{t}{AXES.index(axes) + 1}_v", real=True)
+    if kind == "hess_chi":
+        return sp.Symbol(f"U{t}h_v_{axes}", real=True)
+    return sp.Symbol(f"U{t}L_v", real=True)
 
 
 def _fock_expr(family: str, spin: str):
@@ -114,6 +129,7 @@ def energy_gradient_rows(family: str, spin: str, d: int) -> KernelIntegrand:
     if family not in GRADIENT_FAMILIES:
         raise ValueError(f"no gradient rows for family {family!r}")
     func, expr = _fock_expr(family, spin)
+    general = family in GENERAL_DM_FAMILIES
     labels = ("u", "v")
     total = sp.Integer(0)
     for term in sp.Add.make_args(sp.expand(expr)):
@@ -130,9 +146,11 @@ def energy_gradient_rows(family: str, spin: str, d: int) -> KernelIntegrand:
         if parts[0] is None or parts[1] is None:
             raise ValueError(f"Fock term without both basis factors: {term}")
         (ku, au), (kv, av) = parts
-        # displace the first slot, contract the second -- and vice versa
+        # displace the first slot and contract the second with D -- and
+        # displace the second, contracting the first with D^T (= D for a
+        # symmetric density matrix)
         total += rest * (_seeded(ku, au, d) * _row(kv, av)
-                         + _row(ku, au) * _seeded(kv, av, d))
+                         + _row(ku, au, general) * _seeded(kv, av, d))
     # d chi/dX_{A,d} = -d_d chi
     return KernelIntegrand(functional=func, index_pairs=[("u", "v")],
                            expr=sp.expand(-total))
@@ -146,6 +164,33 @@ def _grad_scalar(name: str, d: int) -> sp.Symbol:
 
 def _hess(prefix: str, i: int, j: int) -> sp.Symbol:
     return sp.Symbol(f"{prefix}_{_hess_comp(i, j)}", real=True)
+
+
+def _d3(prefix: str, i: int, j: int, k: int) -> sp.Symbol:
+    """Third derivative of the density, d_i d_j d_k rho."""
+    return sp.Symbol(f"{prefix}_{''.join(sorted(AXES[i] + AXES[j] + AXES[k]))}",
+                     real=True)
+
+
+def _dtau_tilde(s: str, d: int) -> sp.Expr:
+    """d_d of the gauge-corrected tau~ = tau - jp^2/(2 rho), channel suffix
+    s: d_d tau - (jp . d_d jp)/rho + jp^2 d_d rho / (2 rho^2)."""
+    jp = [sp.Symbol(f"jp{s}_{a}", real=True) for a in AXES]
+    djp = [sp.Symbol(f"jpgrad{s}_{a}_{AXES[d]}", real=True) for a in AXES]
+    inv = sp.Symbol(f"inv_rho{s}", real=True)
+    return (_grad_scalar(f"grad_tau{s}", d)
+            - inv * sum(j * dj for j, dj in zip(jp, djp))
+            + sp.Rational(1, 2) * inv**2 * sum(j * j for j in jp)
+            * _grad_scalar(f"grad_rho{s}", d))
+
+
+def _deta(s: str, d: int) -> sp.Expr:
+    """d_d eta, eta = grad rho . (grad grad rho) . grad rho, channel suffix
+    s ('' or '_a'/'_b'): 2 rho_id rho_ij rho_j + rho_i rho_ijd rho_j."""
+    g = [_grad_scalar(f"grad_rho{s}", i) for i in range(3)]
+    return sum(2 * _hess(f"hess_rho{s}", i, d) * _hess(f"hess_rho{s}", i, j)
+               * g[j] + g[i] * _d3(f"d3rho{s}", i, j, d) * g[j]
+               for i in range(3) for j in range(3))
 
 
 def energy_grid_gradient(family: str, spin: str, d: int) -> sp.Expr:
@@ -165,8 +210,10 @@ def energy_grid_gradient(family: str, spin: str, d: int) -> sp.Expr:
             "rho": grad[d],
             "sigma": 2 * sum(grad[i] * _hess("hess_rho", i, d)
                              for i in range(3)),
-            "tau": _grad_scalar("grad_tau", d),
+            "tau": (_dtau_tilde("", d) if family in GENERAL_DM_FAMILIES
+                    else _grad_scalar("grad_tau", d)),
             "lapl": _grad_scalar("grad_lapl_rho", d),
+            "eta": _deta("", d),
         }
         total = sum(func.vsymbol(ing) * dfield[ing.name]
                     for ing in func.ingredients)
@@ -187,9 +234,13 @@ def energy_grid_gradient(family: str, spin: str, d: int) -> sp.Expr:
                      + grad[s2][i] * _hess(f"hess_rho_{s1}", i, d)
                      for i in range(3))
         elif K.group == "tau":
-            df = _grad_scalar(f"grad_tau_{K.comp}", d)
+            df = (_dtau_tilde(f"_{K.comp}", d)
+                  if family in GENERAL_DM_FAMILIES
+                  else _grad_scalar(f"grad_tau_{K.comp}", d))
         elif K.group == "lapl":
             df = _grad_scalar(f"grad_lapl_rho_{K.comp}", d)
+        elif K.group == "eta":
+            df = _deta(f"_{K.comp}", d)
         else:
             raise ValueError(f"no spatial gradient for {K.group!r}")
         total += _register((K,)) * df

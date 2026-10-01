@@ -107,6 +107,18 @@ _UROW = re.compile(r"^U(0|[123]|L)_(\w+)$")
 # nuclear-gradient operands: the displaced Laplacian collocation
 # d_d lapl chi, and the spatial gradients of tau and of lapl rho
 _DLAPL_CHI = re.compile(r"^dlapl_chi_(\w+?)_([xyz])$")
+# third-derivative collocation, second-derivative D-contracted rows and
+# third derivatives of the density (the density-Hessian gradient)
+_TCHI = re.compile(r"^tchi_(\w+?)_([xyz]{3})$")
+_UHROW = re.compile(r"^Uh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
+# D^T-contracted rows (general density matrices) and the spatial gradient
+# of the paramagnetic current, jpgrad_<i>_<d> = d_d jp_i
+_UTROW = re.compile(r"^UT(0|[123]|L)_(\w+)$")
+_UTHROW = re.compile(r"^UTh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
+_JPGRAD = re.compile(r"^jpgrad_(?:([ab])_)?([xyz])_([xyz])$")
+# atom-masked displaced collocation of the dF/dX basis class
+_MASKED = re.compile(r"^M(dchi|hess_chi|tchi|dlapl_chi)_(\w+?)_([xyz]{1,3})$")
+_D3RHO = re.compile(r"^d3rho_(?:([ab])_)?([xyz]{3})$")
 _GTAU = re.compile(r"^grad_tau_(?:([ab])_)?([xyz])$")
 _GLAPL = re.compile(r"^grad_lapl_rho_(?:([ab])_)?([xyz])$")
 # the local density-matrix pair factor (two free labels)
@@ -176,6 +188,31 @@ def _classify(name: str) -> Tuple[Operand, str]:
     if m:
         return Operand(f"dlapl_chi[{_AX_ANY[m.group(2)]}]",
                        f"{m.group(1)}g"), "basis"
+    m = _TCHI.match(name)
+    if m:
+        return Operand(f"tchi[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _UHROW.match(name)
+    if m:
+        return Operand(f"Uh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _MASKED.match(name)
+    if m:
+        return Operand(f"M{m.group(1)}[{m.group(3)}]", f"{m.group(2)}g"), \
+            "basis"
+    m = _UTROW.match(name)
+    if m:
+        return Operand(f"UT{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _UTHROW.match(name)
+    if m:
+        return Operand(f"UTh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _JPGRAD.match(name)
+    if m:
+        sfx = f"_{m.group(1)}" if m.group(1) else ""
+        return Operand(f"jpgrad{sfx}[{_AX_ANY[m.group(2)]}][{_AX_ANY[m.group(3)]}]",
+                       "g"), f"jpgrad{sfx}"
+    m = _D3RHO.match(name)
+    if m:
+        sfx = f"_{m.group(1)}" if m.group(1) else ""
+        return Operand(f"d3rho{sfx}[{m.group(2)}]", "g"), f"d3rho{sfx}"
     for rx, base, kind in ((_GTAU, "grad_tau", "gtau"),
                            (_GLAPL, "grad_lapl_rho", "glapl")):
         m = rx.match(name)
@@ -416,7 +453,8 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
             params.append(f"hess_rho_{sk[-1]}")
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
-    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl")):
+    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl"),
+                       ("d3rho", "d3rho"), ("jpgrad", "jpgrad")):
         for sfx in ("", "_a", "_b"):
             if f"{kind}{sfx}" in uses:
                 params.append(f"{base}{sfx}")
@@ -523,7 +561,9 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                 elif kind in ("grad_a", "grad_b", "jp", "jp_a", "jp_b",
                       "hrho", "hrho_a", "hrho_b", "dgrad_g",
                       "gtau", "gtau_a", "gtau_b",
-                      "glapl", "glapl_a", "glapl_b"):
+                      "glapl", "glapl_a", "glapl_b",
+                      "d3rho", "d3rho_a", "d3rho_b",
+                      "jpgrad", "jpgrad_a", "jpgrad_b"):
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                                       "gscalar:", "geometry:")):
@@ -586,7 +626,8 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
             params.append(f"hess_rho_{sk[-1]}")
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
-    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl")):
+    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl"),
+                       ("d3rho", "d3rho"), ("jpgrad", "jpgrad")):
         for sfx in ("", "_a", "_b"):
             if f"{kind}{sfx}" in uses:
                 params.append(f"{base}{sfx}")

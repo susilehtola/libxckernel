@@ -57,6 +57,10 @@ def _operands(operands: Dict, ng: int) -> Dict[str, np.ndarray]:
 def _kind(name: str) -> str:
     if name.endswith("_o1_diag"):
         return "diag"
+    if name.endswith("_f1"):
+        return "f1"
+    if name.endswith("_fg"):
+        return "fg"
     if name.endswith("_g1"):
         return "g1"
     if name.endswith("_gg"):
@@ -91,11 +95,23 @@ class Library:
         """Derivative order the kernel reads of a collocation tower."""
         return ctypes.c_int.in_dll(self._dll, f"{name}_{array}_order").value
 
-    def __call__(self, name: str, *, w, chi=None, Dchi=None, out=None,
+    def _has(self, symbol: str) -> bool:
+        try:
+            ctypes.c_int.in_dll(self._dll, symbol)
+            return True
+        except ValueError:
+            return False
+
+    def __call__(self, name: str, *, w, chi=None, Dchi=None, DTchi=None,
+                 Dchi_a=None, Dchi_b=None, DTchi_a=None, DTchi_b=None,
+                 atom_mask=None, out=None,
                  **operands) -> np.ndarray:
         """Call a kernel with named operands; returns ``out`` (accumulated
         into when given): (nbf, nbf), (nbf,) for *_o1_diag, (3, nbf) for
-        *_g1, (3, ng) for *_gg."""
+        *_g1, (3, ng) for *_gg, (3, nbf, nbf) for *_f1 and *_fg. Gradient
+        rows of a general density matrix M take Dchi = M chi and
+        DTchi = M^T chi; the dF/dX basis class takes Dchi (or Dchi_a and
+        Dchi_b) and the atom mask (nbf,), one atom per call."""
         kind = _kind(name)
         ng = np.asarray(w).shape[0]
         scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
@@ -109,9 +125,20 @@ class Library:
         args = [ctypes.c_int64(ng)]
         keep = []                       # the converted towers, alive for the call
         nbf = None
-        for arr, val in (("chi", chi), ("Dchi", Dchi)):
-            if kind == "gg" or (arr == "Dchi" and kind != "g1"):
-                continue
+        towers = [] if kind == "gg" else ["chi"]
+        if kind == "g1":
+            towers.append("Dchi")
+            if self._has(f"{name}_DTchi_order"):
+                towers.append("DTchi")
+        if kind == "f1":
+            for t in ("Dchi", "Dchi_a", "Dchi_b", "DTchi", "DTchi_a",
+                      "DTchi_b"):
+                if self._has(f"{name}_{t}_order"):
+                    towers.append(t)
+        given = {"chi": chi, "Dchi": Dchi, "DTchi": DTchi, "Dchi_a": Dchi_a,
+                 "Dchi_b": Dchi_b, "DTchi_a": DTchi_a, "DTchi_b": DTchi_b}
+        for arr in towers:
+            val = given[arr]
             val = np.ascontiguousarray(val, dtype=np.float64)
             if val.ndim == 2:
                 val = val[None]
@@ -124,8 +151,14 @@ class Library:
                 args.append(ctypes.c_int64(nbf))
             keep.append(val)
             args.append(val.ctypes.data_as(_P))
+        if kind == "f1":
+            mask = np.ascontiguousarray(atom_mask, dtype=np.int8)
+            if mask.shape != (nbf,):
+                raise ValueError(f"{name}: atom_mask must be ({nbf},) int8")
+            keep.append(mask)
+            args.append(mask.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
         shape = {"matrix": (nbf, nbf), "diag": (nbf,), "g1": (3, nbf),
-                 "gg": (3, ng)}[kind]
+                 "gg": (3, ng), "f1": (3, nbf, nbf), "fg": (3, nbf, nbf)}[kind]
         out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
         fn = getattr(self._dll, name)
         fn.restype = ctypes.c_int
