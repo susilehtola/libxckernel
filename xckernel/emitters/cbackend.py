@@ -66,12 +66,17 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
     """
     order: List[str] = []
     for p in ck.params:
-        if p in ("chi", "dchi", "lapl_chi", "hess_chi"):
+        if p in ("chi", "dchi", "lapl_chi", "hess_chi", "Rchi", "Rdchi",
+                 "Rlapl_chi"):
             continue
         if p.startswith("hess_rho"):
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
+        elif p == "rg":
+            # grid coordinates (London-orbital kernels)
+            for ax in ("x", "y", "z"):
+                order.append(f"rg_{ax}")
         elif p.startswith("jpgrad"):
             # d_d jp_i, i the current component, d the derivative
             for i in ("x", "y", "z"):
@@ -430,6 +435,16 @@ XCK_HD inline void mask_rows(int64_t bk, int64_t n, const int8_t* mask,
             for (int64_t g = 0; g < bk; ++g) X[i * bk + g] = T(0);
 }
 
+/* Scale each row by its basis function's center coordinate:
+ * X(i,g) *= R[i] (the London-orbital operands R_a chi, R_a d_c chi). */
+template <typename T>
+XCK_HD inline void scale_rows(int64_t bk, int64_t n, const double* R, T* X) {
+    for (int64_t i = 0; i < n; ++i) {
+        const T r = T(R[i]);
+        for (int64_t g = 0; g < bk; ++g) X[i * bk + g] *= r;
+    }
+}
+
 /* A per-point reduction over the functions on an atom:
  * out(g) = sum_{i: mask[i]} sum_t c[t] A[t](i,g) B[t](i,g), rows of
  * stride npts -- the perturbed fields of a nuclear displacement. */
@@ -535,12 +550,20 @@ ABI_KINDS = {
     "f1c": (True, ("chi", "Dchi", "DTchi"), "(3, nbf, nbf)"),
     "f1cu": (True, ("chi", "Dchi_a", "Dchi_b", "DTchi_a", "DTchi_b"),
              "(3, nbf, nbf)"),
+    # explicit London-orbital (GIAO) field derivative of the Fock matrix:
+    # K^s, s = x, y, z, with dF/dB_s = (i/2c) K^s at a real reference; the
+    # kernel forms R_a chi etc. from chi and the basis-function centers
+    "giao": (True, ("chi",), "(3, nbf, nbf)"),
 }
+
+#: kinds taking the basis-function centers (const double* bf_centers,
+#: (3, nbf), after the towers)
+CENTER_KINDS = ("giao",)
 
 #: kinds taking the atom mask (const int8_t* atom_mask, after the towers)
 MASKED_KINDS = ("f1", "f1u", "f1c", "f1cu")
 #: kinds whose output is one nbf x nbf matrix per row block
-MATRIX_KINDS = ("matrix", "f1", "f1u", "f1c", "f1cu", "fg")
+MATRIX_KINDS = ("matrix", "f1", "f1u", "f1c", "f1cu", "fg", "giao")
 
 
 def collapse_pointwise(expr, functional) -> CollapsedKernel:
@@ -626,7 +649,7 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     kind 'matrix': out (nbf, nbf), one GEMM per pattern group; 'diag'
     (one block) and 'g1' (one block per direction): out[r*nbf + u], one
     row-wise dot product per group; 'gg': out[r*npts + g], pointwise."""
-    from .tower import comp_index, is_masked
+    from .tower import center_axis, comp_index, is_masked
     L = kernel_layout(blocks, scal_ck, kind, computed)
     sidx = _scal_index(scal_ck)
     ns = f"detail_{name}"
@@ -659,6 +682,7 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     sig = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
         + [f"const T* {a}" for a in arrays] \
         + (["const int8_t* atom_mask"] if kind in MASKED_KINDS else []) \
+        + (["const double* bf_centers"] if kind in CENTER_KINDS else []) \
         + ["const T* const* fields", "const Txc* const* xc", "T* out",
            "T* work = nullptr"]
     lines += ["/* fields: the per-point tower operands (type T), in the order",
@@ -716,6 +740,10 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
                     "npts", "bk", "nbf", f"X{j}", "        "))
                 if is_masked(code):
                     out.append(f"        mask_rows<T>(bk, nbf, atom_mask, X{j});")
+                a = center_axis(code)
+                if a is not None:
+                    out.append(f"        scale_rows<T>(bk, nbf, bf_centers + "
+                               f"(int64_t){a}*nbf, X{j});")
         for r in rows:
             out.extend(row_body(r))
         out.append("    }")
@@ -786,6 +814,7 @@ def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
     args = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
         + [f"const double* {a}" for a in arrays] \
         + (["const int8_t* atom_mask"] if kind in MASKED_KINDS else []) \
+        + (["const double* bf_centers"] if kind in CENTER_KINDS else []) \
         + ["const double* const* scal", "double* out"]
     return f"int {name}(" + (",\n" + indent).join(args) + ")"
 
@@ -798,7 +827,8 @@ def emit_tower_cpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     has_nbf, arrays, _ = ABI_KINDS[kind]
     nf = len(L.fields)
     call = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays) \
-        + (["atom_mask"] if kind in MASKED_KINDS else [])
+        + (["atom_mask"] if kind in MASKED_KINDS else []) \
+        + (["bf_centers"] if kind in CENTER_KINDS else [])
     lines = ["/* generated by xckernel; do not edit. */",
              f'#include "xckernel/kernels/{name}.hpp"', "",
              'extern "C" {', "",
@@ -855,6 +885,9 @@ _KIND_NOTE = {
             "whose functions atom_mask flags. Dchi_a/b = D^a/b chi"),
     "fg": ("out (3, nbf, nbf): dF/dX_{A,d}, grid class: call with the "
            "weights of atom A's points (w M^A), one call per atom"),
+    "giao": ("out (3, nbf, nbf): K^s with dF/dB_s = (i/2c) K^s, the explicit "
+             "London-orbital field derivative at a real reference; "
+             "bf_centers (3, nbf) holds each basis function's center"),
     "f1c": ("out (3, nbf, nbf): dF/dX_{A,d}, basis class, general density "
             "matrix M: Dchi = M chi, DTchi = M^T chi; one call per atom"),
     "f1cu": ("out (3, nbf, nbf): dF^s/dX_{A,d}, basis class, general "
@@ -965,8 +998,10 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
         if order != 0:
             has_nbf, arrays, _ = ABI_KINDS[kind]
             masked = kind in MASKED_KINDS
+            centered = kind in CENTER_KINDS
             args = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays) \
-                + (["atom_mask"] if masked else []) + ["scal", "out"]
+                + (["atom_mask"] if masked else []) \
+                + (["bf_centers"] if centered else []) + ["scal", "out"]
             lines += [
                 f"    integer(c_int) function {name}({', '.join(args)}) "
                 f"bind(C, name='{name}')",
@@ -980,6 +1015,9 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
             if masked:
                 lines.append("      integer(c_int8_t), intent(in) :: "
                              "atom_mask(*)")
+            if centered:
+                lines.append("      real(c_double), intent(in) :: "
+                             "bf_centers(*)")
             lines += [
                 "      type(c_ptr), intent(in) :: scal(*)",
                 "      real(c_double), intent(inout) :: out(*)",
