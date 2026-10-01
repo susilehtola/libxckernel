@@ -91,7 +91,8 @@ generated on request (`--include-heavy`, `-DXCKERNEL_INCLUDE_HEAVY=ON`).
 Of these,
 fifteen `xck_<family>_{r,ua,ub}_giao` kernels provide the explicit magnetic-field
 derivatives of the Fock matrix with London (GIAO) orbitals, as the real
-factor of dF/dB_s = (i/2c) K_s at a real reference. Every kernel
+factor of dF/dB_s = (i/2c) K_s at a real reference (see "London orbitals"
+below for their C interface). Every kernel
 ships with a machine-readable manifest declaring its operands and shapes,
 the Libxc arrays it consumes by name, and its term ownership. Beyond the
 catalog: complex orbitals and complex basis functions (sesquilinear
@@ -129,6 +130,17 @@ gradient holds for complex orbitals in a real basis. Its density matrix
 M is general (symmetric part Re P, antisymmetric part Im P, which carries
 the paramagnetic current), and its `g1` rows take `DTchi = Mᵀ chi` next
 to `Dchi = M chi`; its `gg` reads the current towers `jpx`, `jpx_y`, ….
+
+### London orbitals
+
+The explicit field derivative of the XC Fock matrix with London (GIAO)
+orbitals, `xck_<family>_{r,ua,ub}_giao` for `lda`, `gga`, `mgga_tau`,
+`mgga_lapl` and `mgga`, takes the collocation tower `chi`, the centers
+of the basis functions `bf_centers (3, nbf)` and the grid coordinates
+`rgx`, `rgy`, `rgz` (same origin). The kernel forms the center-scaled
+operands `R_a chi`, `R_a ∂_c chi` and `R_a ∇²chi` itself. Output
+`(3, nbf, nbf)`: the antisymmetric `K^s` with `dF/dB_s = (i/2c) K^s` at
+a real reference, for s = x, y, z.
 
 ### Nuclear derivative of the Fock matrix
 
@@ -289,6 +301,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | C gradient kernels `g1` + `gg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock derivative `f1` + `fg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
+| C London-orbital kernels `giao` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | NumPy GIAO kernels (FD-validated in `london_validate`); antisymmetry | ~1e-15 |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | GauXC Hessian assembly recipe | LDA/GGA/mGGA(tau) | R | contracted `geometric_hessian` | ~1e-16 |
 | GauXC Hessian emitted C++ | LDA/GGA/mGGA(tau) | R | SymPy, same operands | exact |

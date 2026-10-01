@@ -8,7 +8,10 @@ tower-named fields computed independently here.
   2. Fock matrix: o1 == dExc/dD by FD, r and ua;
   3. linear response: o2 == FD of the o1 kernel along a perturbation D1
      (perturbed-field towers, including the Laplacian the kernel forms);
-  4. nuclear gradient: basis class (g1, per spin channel), grid class (gg)
+  4. London orbitals: the GIAO field-derivative kernels (chi tower and
+     basis-function centers) == the NumPy GIAO kernels fed the explicit
+     center-scaled operands (validated against FD in london_validate);
+  5. nuclear gradient: basis class (g1, per spin channel), grid class (gg)
      and weight class (o0 with w := dw/dX) against FD of Exc with each
      R-dependence isolated, their sum against moving an atom completely,
      and the translational sum rule.
@@ -70,6 +73,12 @@ def build_library(td: Path) -> Library:
             ck = collapse(_integrand_for(e))
             write(e.name, emit_kernel_hpp(ck, e.name),
                   emit_kernel_cpp(ck, e.name))
+        from ..catalog import GIAO_FAMILIES
+        if fam in GIAO_FAMILIES:
+            for spin in ("r", "ua", "ub"):
+                e = CatalogEntry(fam, spin, 1, giao=True)
+                hpp, cpp, _ = _emit_kind(e)
+                write(e.name, hpp, cpp)
         n0 = CatalogEntry(fam, "r", 0).name
         write(n0, emit_exc_hpp(n0), emit_exc_cpp(n0))
     lib = td / "libxckt.so"
@@ -535,6 +544,51 @@ def check_fock_derivative(lib, rep, fam, spin, sysm):
               scale=np.abs(total).max())
 
 
+def check_giao(lib, rep, fam, spin, sysm, seed=7):
+    """The compiled GIAO kernel against the NumPy one on the same data."""
+    from ..emitters.codegen import compile_function, generate_collapsed
+    from ..engine.london import london_fock, london_fock_spin
+    rng = np.random.default_rng(seed)
+    T = colloc(sysm.centers, sysm.pts)
+    nbf, ng = T.shape[1:]
+    R = sysm.centers[BF_ATOM]                         # (nbf, 3)
+    name = CatalogEntry(fam, spin, 1, giao=True).name
+    ops = {n: rng.standard_normal(ng) for n in lib.scal_names(name)}
+    ops["w"] = np.abs(ops["w"]) + 0.1
+    K = lib(name, chi=T, bf_centers=np.ascontiguousarray(R.T), **ops)
+
+    # the NumPy reference, with its own explicit operands
+    chi, dchi = T[0], T[1:4]
+    lapl = sum(T[comp_index(a + a)] for a in _AX)
+    args = {"w": ops["w"], "chi": chi, "dchi": dchi, "lapl_chi": lapl,
+            "Rchi": np.einsum("ua,ug->aug", R, chi),
+            "Rdchi": np.einsum("ua,cug->acug", R, dchi),
+            "Rlapl_chi": np.einsum("ua,ug->aug", R, lapl),
+            "rg": np.stack([ops[f"rg{a}"] for a in _AX]),
+            **{n: v for n, v in ops.items() if n.startswith("v")}}
+    if spin == "r":
+        if "rho_x" in ops:
+            args["grad_rho"] = np.stack([ops[f"rho_{a}"] for a in _AX])
+    else:
+        for c in "ab":
+            if f"rho_{c}_x" in ops:
+                args[f"grad_rho_{c}"] = np.stack([ops[f"rho_{c}_{a}"]
+                                                  for a in _AX])
+    ref = []
+    for s in range(3):
+        ki = (london_fock(fam, s) if spin == "r"
+              else london_fock_spin(fam, spin[1], s))
+        gen = generate_collapsed(ki, "kref", batch=False)
+        sig = gen.source.split("(", 1)[1].split(")", 1)[0]
+        ref.append(compile_function(gen)(*[args[p.strip()]
+                                           for p in sig.split(",")]))
+    rep.check(f"{fam:9s} {spin:2s} giao == NumPy GIAO kernel", K,
+              np.stack(ref), 1e-12)
+    rep.check(f"{fam:9s} {spin:2s} giao K^s antisymmetric", K,
+              -np.transpose(K, (0, 2, 1)), 1e-12,
+              scale=np.abs(K).max())
+
+
 def check_gradient(lib, rep, fam, spin, sysm):
     """spin 'r' or 'u'."""
     c0, p0 = sysm.centers, sysm.pts
@@ -642,6 +696,11 @@ def main():
         for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")
             check_matrix(lib, rep, fam, sysm)
+        from ..catalog import GIAO_FAMILIES
+        for fam in GIAO_FAMILIES:
+            print(f"London orbitals: {fam}")
+            for spin in ("r", "ua", "ub"):
+                check_giao(lib, rep, fam, spin, sysm)
         from ..engine.geofock import FOCK_DERIV_FAMILIES
         for fam in FOCK_DERIV_FAMILIES:
             print(f"nuclear derivative of the Fock matrix: {fam}")
