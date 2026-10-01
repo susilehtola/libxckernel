@@ -60,7 +60,7 @@ def build_library(td: Path) -> Library:
 
     for fam in FAMILIES:
         matrix = [(s, 1) for s in ("r", "ua", "ub")]
-        if fam in GRADIENT_FAMILIES:
+        if fam in GRADIENT_FAMILIES or fam in GENERAL_DM:
             matrix += [("r", 2), ("ua", 2)]
         for e in _one_index_entries(fam):
             hpp, cpp, _ = _emit_kind(e)
@@ -93,6 +93,10 @@ def call_exc(lib: Library, name, w, rho, zk):
 
 _R = sp.symbols("x y z", real=True)
 _C = sp.symbols("cx cy cz", real=True)
+#: families whose density matrix is general (complex orbitals: the
+#: antisymmetric part is Im P and carries the paramagnetic current)
+GENERAL_DM = ("cmgga_tau",)
+
 #: (atom, exponent, prefactor monomial exponents)
 BASIS = [(0, 0.9, (0, 0, 0)), (0, 1.3, (1, 0, 0)), (1, 0.7, (0, 1, 0)),
          (1, 1.1, (0, 0, 1)), (2, 0.8, (1, 1, 0)), (2, 1.2, (0, 0, 0)),
@@ -140,8 +144,11 @@ def _subsets(axes):
 
 
 def fields(D, T, order=3):
-    """The density tower (Leibniz rule; D need not be symmetric) and the
-    tau tower to first order."""
+    """The density tower (Leibniz rule), the tau tower to first order and
+    the paramagnetic-current towers jp[i] to first order. D need not be
+    symmetric: its antisymmetric part (Im P) carries the current, with the
+    engine's convention jp_i = sum_uv D_uv (chi_u d_i chi_v - d_i chi_u
+    chi_v) / 2."""
     t = lambda ax: T[comp_index(ax)]
     rho = np.stack([sum(np.einsum("uv,ug,vg->g", D, t(a), t(b))
                         for a, b in _subsets(ax))
@@ -151,7 +158,24 @@ def fields(D, T, order=3):
         tau.append(0.5 * sum(np.einsum("uv,ug,vg->g", D, t(k + i), t(i))
                              + np.einsum("uv,ug,vg->g", D, t(i), t(k + i))
                              for i in _AX))
-    return {"rho": rho, "tau": np.stack(tau)}
+    jp = []
+    for i in _AX:
+        comp = [0.5 * (np.einsum("uv,ug,vg->g", D, t(""), t(i))
+                       - np.einsum("uv,ug,vg->g", D, t(i), t("")))]
+        for d in _AX:
+            comp.append(0.5 * (np.einsum("uv,ug,vg->g", D, t(d), t(i))
+                               + np.einsum("uv,ug,vg->g", D, t(""), t(d + i))
+                               - np.einsum("uv,ug,vg->g", D, t(d + i), t(""))
+                               - np.einsum("uv,ug,vg->g", D, t(i), t(d))))
+        jp.append(np.stack(comp))
+    return {"rho": rho, "tau": np.stack(tau), "jp": np.stack(jp)}
+
+
+def _tau_tilde(f):
+    """The gauge-corrected tau~ = tau - jp^2 / (2 rho) (tau without
+    current)."""
+    jp2 = (f["jp"][:, 0] ** 2).sum(0)
+    return f["tau"][0] - jp2 / (2 * f["rho"][0])
 
 
 # --- explicit test functionals ---------------------------------------------------
@@ -211,7 +235,7 @@ def _variables_r(f):
     rho = f["rho"]
     grad = rho[1:4]
     return {_RV["rho"]: rho[0], _RV["sigma"]: (grad * grad).sum(0),
-            _RV["tau"]: f["tau"][0],
+            _RV["tau"]: _tau_tilde(f),
             _RV["lapl"]: sum(rho[comp_index(a + a)] for a in _AX),
             _RV["eta"]: _eta(rho)}
 
@@ -220,7 +244,7 @@ def _variables_u(fa, fb):
     out = {}
     for s, f in (("a", fa), ("b", fb)):
         out[_U("rho", s)] = f["rho"][0]
-        out[_U("tau", s)] = f["tau"][0]
+        out[_U("tau", s)] = _tau_tilde(f)
         out[_U("lapl", s)] = sum(f["rho"][comp_index(a + a)] for a in _AX)
         out[_U("eta", s)] = _eta(f["rho"])
     for c, (f1, f2) in (("aa", (fa, fa)), ("ab", (fa, fb)), ("bb", (fb, fb))):
@@ -266,11 +290,18 @@ def libxc_arrays(names, fam, spin, fa, fb=None):
 
 def tower_ops(fa, fb=None, sfx=""):
     """Tower-named per-point operands of the ground (or perturbed, sfx
-    '_p1') fields."""
-    if fb is None:
-        return {f"rho{sfx}": fa["rho"], f"tau{sfx}": fa["tau"]}
-    return {f"rho_a{sfx}": fa["rho"], f"tau_a{sfx}": fa["tau"],
-            f"rho_b{sfx}": fb["rho"], f"tau_b{sfx}": fb["tau"]}
+    '_p1') fields: rho, tau, the current jpx/jpy/jpz and, for the ground
+    state, inv_rho."""
+    out = {}
+    chans = [("", fa)] if fb is None else [("_a", fa), ("_b", fb)]
+    for c, f in chans:
+        out[f"rho{c}{sfx}"] = f["rho"]
+        out[f"tau{c}{sfx}"] = f["tau"]
+        for i, ax in enumerate(_AX):
+            out[f"jp{ax}{c}{sfx}"] = f["jp"][i]
+        if not sfx:
+            out[f"inv_rho{c}"] = 1.0 / f["rho"][0]
+    return out
 
 
 # --- the synthetic system ----------------------------------------------------------
@@ -292,6 +323,17 @@ class System:
         self.Da, self.Db = dm(), dm()
         self.D1a = 0.3 * (lambda M: M + M.T)(rng.standard_normal((nbf, nbf)))
         self.D1b = 0.3 * (lambda M: M + M.T)(rng.standard_normal((nbf, nbf)))
+        anti = lambda: 0.2 * (lambda M: M - M.T)(rng.standard_normal((nbf, nbf)))
+        self.Aa, self.Ab, self.A1a, self.A1b = anti(), anti(), anti(), anti()
+
+    def dms(self, fam):
+        """(Ma, Mb, X1a, X1b): ground and perturbation density matrices,
+        general (with an antisymmetric, current-carrying part) for the
+        current-density family."""
+        if fam in GENERAL_DM:
+            return (self.Da + self.Aa, self.Db + self.Ab,
+                    self.D1a + self.A1a, self.D1b + self.A1b)
+        return self.Da, self.Db, self.D1a, self.D1b
 
     def weights(self, centers, pts):
         """Toy partition weights: depend on every center and the point,
@@ -385,6 +427,8 @@ def check_matrix(lib, rep, fam, sysm):
     w = sysm.weights(c0, p0)
     T = colloc(c0, p0)
     nbf = T.shape[1]
+    Ma, Mb, X1a, X1b = sysm.dms(fam)
+    general = fam in GENERAL_DM
     for spin in ("r", "ua"):
         o1 = CatalogEntry(fam, spin, 1).name
         o2 = CatalogEntry(fam, spin, 2).name
@@ -394,25 +438,30 @@ def check_matrix(lib, rep, fam, sysm):
             return lib(o1, w=w, chi=T,
                        **_matrix_ops(lib, o1, fam, spin, sysm, w, T, Da, Db))
 
-        # o1 == dExc/dD (alpha channel for ua); D perturbed symmetrically
-        F = F_at(sysm.Da, sysm.Db)
+        # o1 == dExc/dD (alpha channel for ua): every entry independently
+        # for a general D, symmetric pairs otherwise
+        F = F_at(Ma, Mb)
         fd = np.zeros((nbf, nbf))
         for u in range(nbf):
-            for v in range(u, nbf):
+            for v in range(nbf if general else u + 1):
                 dD = np.zeros((nbf, nbf))
-                dD[u, v] += 0.5
-                dD[v, u] += 0.5
-                fd[u, v] = fd[v, u] = richardson(
+                if general:
+                    dD[u, v] = 1.0
+                else:
+                    dD[u, v] += 0.5
+                    dD[v, u] += 0.5
+                fd[u, v] = richardson(
                     lambda h: sysm.energy(fam, espin, c0, c0, p0, w,
-                                          sysm.Da + h * dD, sysm.Db))
+                                          Ma + h * dD, Mb))
+                if not general:
+                    fd[v, u] = fd[u, v]
         rep.check(f"{fam:9s} {spin:2s} o1 == dExc/dD", F, fd, 1e-9)
 
         # o2 == directional derivative of o1 along D1 (both channels)
         F2 = lib(o2, w=w, chi=T,
-                 **_matrix_ops(lib, o2, fam, spin, sysm, w, T, sysm.Da,
-                               sysm.Db, sysm.D1a, sysm.D1b))
-        fd2 = richardson(lambda h: F_at(sysm.Da + h * sysm.D1a,
-                                        sysm.Db + h * sysm.D1b))
+                 **_matrix_ops(lib, o2, fam, spin, sysm, w, T, Ma, Mb,
+                               X1a, X1b))
+        fd2 = richardson(lambda h: F_at(Ma + h * X1a, Mb + h * X1b))
         rep.check(f"{fam:9s} {spin:2s} o2 == d(o1)/dD . D1", F2, fd2, 1e-9)
 
 
@@ -422,30 +471,35 @@ def check_gradient(lib, rep, fam, spin, sysm):
     w = sysm.weights(c0, p0)
     T = colloc(c0, p0)
     nbf, ng = T.shape[1:]
+    Ma, Mb, _, _ = sysm.dms(fam)
+    general = fam in GENERAL_DM
+    dm = {"Da": Ma, "Db": Mb}
     if spin == "r":
-        f = fields(sysm.Da + sysm.Db, T)
+        f = fields(Ma + Mb, T)
         e = energy_density(fam, "r", f)
         ops = tower_ops(f)
         vnames = {n for k in ("xck_%s_r_g1", "xck_%s_r_gg")
                   for n in lib.scal_names(k % fam) if n.startswith("v")}
         ops.update(libxc_arrays(vnames, fam, "r", f))
-        chans = [("r", sysm.Da + sysm.Db)]
+        chans = [("r", Ma + Mb)]
         rho_tot = f["rho"][0]
     else:
-        fa, fb = fields(sysm.Da, T), fields(sysm.Db, T)
+        fa, fb = fields(Ma, T), fields(Mb, T)
         e = energy_density(fam, "u", fa, fb)
         ops = tower_ops(fa, fb)
         vnames = {n for k in ("xck_%s_ua_g1", "xck_%s_ub_g1", "xck_%s_u_gg")
                   for n in lib.scal_names(k % fam) if n.startswith("v")}
         ops.update(libxc_arrays(vnames, fam, "u", fa, fb))
-        chans = [("ua", sysm.Da), ("ub", sysm.Db)]
+        chans = [("ua", Ma), ("ub", Mb)]
         rho_tot = fa["rho"][0] + fb["rho"][0]
 
     # ----- basis class: per channel -----
     rows = {}
     for ch, D in chans:
+        extra = ({"DTchi": np.einsum("vu,kvg->kug", D, T)} if general
+                 else {})
         rows[ch] = lib(f"xck_{fam}_{ch}_g1", w=w, chi=T,
-                       Dchi=np.einsum("uv,kvg->kug", D, T), **ops)
+                       Dchi=np.einsum("uv,kvg->kug", D, T), **extra, **ops)
     basis = np.zeros((sysm.natom, 3))
     for ch, _ in chans:
         for A in range(sysm.natom):
@@ -460,7 +514,7 @@ def check_gradient(lib, rep, fam, spin, sysm):
                     c[A, d] += h
                     ca = c if ch in ("r", "ua") else c0
                     cb = c if ch == "ub" else c0
-                    return sysm.energy(fam, spin, ca, cb, p0, w)
+                    return sysm.energy(fam, spin, ca, cb, p0, w, **dm)
                 fd.append(richardson(E))
                 got.append(rows[ch][d, BF_ATOM == A].sum())
         rep.check(f"{fam:9s} {ch:2s} g1 basis class vs FD", got, fd, 1e-9)
@@ -475,7 +529,7 @@ def check_gradient(lib, rep, fam, spin, sysm):
             def E(h, A=A, d=d):
                 p = p0.copy()
                 p[sysm.parent == A, d] += h
-                return sysm.energy(fam, spin, c0, c0, p, w)
+                return sysm.energy(fam, spin, c0, c0, p, w, **dm)
             fd[A, d] = richardson(E)
     rep.check(f"{fam:9s} {spin:2s} gg grid class vs FD", grid, fd, 1e-9)
 
@@ -496,7 +550,8 @@ def check_gradient(lib, rep, fam, spin, sysm):
                 c, p = c0.copy(), p0.copy()
                 c[A, d] += h
                 p[sysm.parent == A, d] += h
-                return sysm.energy(fam, spin, c, c, p, sysm.weights(c, p))
+                return sysm.energy(fam, spin, c, c, p, sysm.weights(c, p),
+                                   **dm)
             fd[A, d] = richardson(E)
     rep.check(f"{fam:9s} {spin:2s} basis+grid+weight vs FD", total, fd, 1e-9)
 
@@ -514,7 +569,7 @@ def main():
         print("Fock diagonal")
         check_diag(lib, rep)
         sysm = System()
-        for fam in GRADIENT_FAMILIES:
+        for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")
             check_matrix(lib, rep, fam, sysm)
         for fam in gradient_families():

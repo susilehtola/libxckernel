@@ -91,11 +91,19 @@ class Library:
         """Derivative order the kernel reads of a collocation tower."""
         return ctypes.c_int.in_dll(self._dll, f"{name}_{array}_order").value
 
-    def __call__(self, name: str, *, w, chi=None, Dchi=None, out=None,
-                 **operands) -> np.ndarray:
+    def _has(self, symbol: str) -> bool:
+        try:
+            ctypes.c_int.in_dll(self._dll, symbol)
+            return True
+        except ValueError:
+            return False
+
+    def __call__(self, name: str, *, w, chi=None, Dchi=None, DTchi=None,
+                 out=None, **operands) -> np.ndarray:
         """Call a kernel with named operands; returns ``out`` (accumulated
         into when given): (nbf, nbf), (nbf,) for *_o1_diag, (3, nbf) for
-        *_g1, (3, ng) for *_gg."""
+        *_g1, (3, ng) for *_gg. Gradient rows of a general density matrix
+        M take Dchi = M chi and DTchi = M^T chi."""
         kind = _kind(name)
         ng = np.asarray(w).shape[0]
         scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
@@ -109,9 +117,14 @@ class Library:
         args = [ctypes.c_int64(ng)]
         keep = []                       # the converted towers, alive for the call
         nbf = None
-        for arr, val in (("chi", chi), ("Dchi", Dchi)):
-            if kind == "gg" or (arr == "Dchi" and kind != "g1"):
-                continue
+        towers = [] if kind == "gg" else ["chi"]
+        if kind == "g1":
+            towers.append("Dchi")
+            if self._has(f"{name}_DTchi_order"):
+                towers.append("DTchi")
+        given = {"chi": chi, "Dchi": Dchi, "DTchi": DTchi}
+        for arr in towers:
+            val = given[arr]
             val = np.ascontiguousarray(val, dtype=np.float64)
             if val.ndim == 2:
                 val = val[None]

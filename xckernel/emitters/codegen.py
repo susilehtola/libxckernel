@@ -111,6 +111,11 @@ _DLAPL_CHI = re.compile(r"^dlapl_chi_(\w+?)_([xyz])$")
 # third derivatives of the density (the density-Hessian gradient)
 _TCHI = re.compile(r"^tchi_(\w+?)_([xyz]{3})$")
 _UHROW = re.compile(r"^Uh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
+# D^T-contracted rows (general density matrices) and the spatial gradient
+# of the paramagnetic current, jpgrad_<i>_<d> = d_d jp_i
+_UTROW = re.compile(r"^UT(0|[123]|L)_(\w+)$")
+_UTHROW = re.compile(r"^UTh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
+_JPGRAD = re.compile(r"^jpgrad_(?:([ab])_)?([xyz])_([xyz])$")
 _D3RHO = re.compile(r"^d3rho_(?:([ab])_)?([xyz]{3})$")
 _GTAU = re.compile(r"^grad_tau_(?:([ab])_)?([xyz])$")
 _GLAPL = re.compile(r"^grad_lapl_rho_(?:([ab])_)?([xyz])$")
@@ -187,6 +192,17 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _UHROW.match(name)
     if m:
         return Operand(f"Uh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _UTROW.match(name)
+    if m:
+        return Operand(f"UT{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _UTHROW.match(name)
+    if m:
+        return Operand(f"UTh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _JPGRAD.match(name)
+    if m:
+        sfx = f"_{m.group(1)}" if m.group(1) else ""
+        return Operand(f"jpgrad{sfx}[{_AX_ANY[m.group(2)]}][{_AX_ANY[m.group(3)]}]",
+                       "g"), f"jpgrad{sfx}"
     m = _D3RHO.match(name)
     if m:
         sfx = f"_{m.group(1)}" if m.group(1) else ""
@@ -432,7 +448,7 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
     for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl"),
-                       ("d3rho", "d3rho")):
+                       ("d3rho", "d3rho"), ("jpgrad", "jpgrad")):
         for sfx in ("", "_a", "_b"):
             if f"{kind}{sfx}" in uses:
                 params.append(f"{base}{sfx}")
@@ -540,7 +556,8 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                       "hrho", "hrho_a", "hrho_b", "dgrad_g",
                       "gtau", "gtau_a", "gtau_b",
                       "glapl", "glapl_a", "glapl_b",
-                      "d3rho", "d3rho_a", "d3rho_b"):
+                      "d3rho", "d3rho_a", "d3rho_b",
+                      "jpgrad", "jpgrad_a", "jpgrad_b"):
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                                       "gscalar:", "geometry:")):
@@ -604,7 +621,7 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
     for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl"),
-                       ("d3rho", "d3rho")):
+                       ("d3rho", "d3rho"), ("jpgrad", "jpgrad")):
         for sfx in ("", "_a", "_b"):
             if f"{kind}{sfx}" in uses:
                 params.append(f"{base}{sfx}")

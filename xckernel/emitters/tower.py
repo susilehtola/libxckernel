@@ -85,6 +85,16 @@ def basis_operand(code: str) -> Tuple[str, Combo]:
     m = re.fullmatch(r"Uh\[([xyz]{2})\]", code)
     if m:
         return "Dchi", [(m.group(1), 1)]
+    if code == "UT0":
+        return "DTchi", [("", 1)]
+    m = re.fullmatch(r"UT([123])", code)
+    if m:
+        return "DTchi", [(AXES[int(m.group(1)) - 1], 1)]
+    if code == "UTL":
+        return "DTchi", _lapl()
+    m = re.fullmatch(r"UTh\[([xyz]{2})\]", code)
+    if m:
+        return "DTchi", [(m.group(1), 1)]
     if code == "U0":
         return "Dchi", [("", 1)]
     m = re.fullmatch(r"U([123])", code)
@@ -139,6 +149,9 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     if m:
         return [(_name("rho", m.group(1), None, ax), wt)
                 for ax, wt in _lapl(m.group(2))]
+    m = re.fullmatch(r"jpgrad" + _SP + r"_([xyz])_([xyz])", name)
+    if m:
+        return [(_name(f"jp{m.group(2)}", m.group(1), None, m.group(3)), 1)]
     m = re.fullmatch(r"jp" + _SP + _PT + r"_([xyz])", name)
     if m:
         return [(_name(f"jp{m.group(3)}", m.group(1), m.group(2), ""), 1)]

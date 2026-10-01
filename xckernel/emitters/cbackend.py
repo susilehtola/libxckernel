@@ -72,6 +72,11 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
+        elif p.startswith("jpgrad"):
+            # d_d jp_i, i the current component, d the derivative
+            for i in ("x", "y", "z"):
+                for d in ("x", "y", "z"):
+                    order.append(f"{p}_{i}_{d}")
         elif p.startswith("d3rho"):
             # the ten third derivatives of the density
             from .tower import components
@@ -488,6 +493,9 @@ ABI_KINDS = {
     "matrix": (True, ("chi",), "(nbf, nbf)"),
     "diag": (True, ("chi",), "(nbf,)"),
     "g1": (True, ("chi", "Dchi"), "(3, nbf)"),
+    # gradient rows of a general (non-symmetric) density matrix M:
+    # Dchi = M chi and DTchi = M^T chi
+    "g1c": (True, ("chi", "Dchi", "DTchi"), "(3, nbf)"),
     "gg": (False, (), "(3, ng)"),
 }
 
@@ -725,6 +733,9 @@ _KIND_NOTE = {
     "diag": "out (nbf,): the diagonal F_uu of the order-1 kernel",
     "g1": ("out (3, nbf): nuclear-gradient basis-class rows; summed over the "
            "functions on atom A, +dE/dX_{A,d}. Dchi = D chi (tower)"),
+    "g1c": ("out (3, nbf): nuclear-gradient basis-class rows for a general "
+            "density matrix M; summed over the functions on atom A, "
+            "+dE/dX_{A,d}. Dchi = M chi, DTchi = M^T chi (towers)"),
     "gg": ("out (3, ng): nuclear-gradient grid class w * d_d e(r_g); summed "
            "over the points of atom A, its grid-motion term"),
 }

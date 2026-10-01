@@ -48,7 +48,15 @@ from ..inputs.basis import AXES, HESS_COMPS
 from .kernel import KernelIntegrand
 
 #: families with nuclear-gradient integrands
-GRADIENT_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga", "hmgga")
+GRADIENT_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga", "hmgga",
+                     "cmgga_tau")
+
+#: families with a GENERAL density matrix M (complex orbitals in a real
+#: basis: the symmetric part is Re P, the antisymmetric part Im P carries
+#: the paramagnetic current). The displaced function then enters through
+#: both index slots differently: the first contracts with M chi, the
+#: second with M^T chi (the DTchi tower).
+GENERAL_DM_FAMILIES = ("cmgga_tau",)
 
 _BASIS_SYM = re.compile(
     r"^(chi|dchi|lapl_chi|hess_chi)_(\w+?)(?:_([xyz]{1,2}))?$")
@@ -88,15 +96,17 @@ def _seeded(kind: str, axes, d: int) -> sp.Symbol:
     return sp.Symbol(f"dlapl_chi_u_{AXES[d]}", real=True)
 
 
-def _row(kind: str, axes) -> sp.Symbol:
-    """The D-contracted collocation row of a basis factor (v side)."""
+def _row(kind: str, axes, transposed: bool = False) -> sp.Symbol:
+    """The D-contracted collocation row of a basis factor (v side); with
+    ``transposed``, the D^T-contracted one (general density matrices)."""
+    t = "T" if transposed else ""
     if kind == "chi":
-        return sp.Symbol("U0_v", real=True)
+        return sp.Symbol(f"U{t}0_v", real=True)
     if kind == "dchi":
-        return sp.Symbol(f"U{AXES.index(axes) + 1}_v", real=True)
+        return sp.Symbol(f"U{t}{AXES.index(axes) + 1}_v", real=True)
     if kind == "hess_chi":
-        return sp.Symbol(f"Uh_v_{axes}", real=True)
-    return sp.Symbol("UL_v", real=True)
+        return sp.Symbol(f"U{t}h_v_{axes}", real=True)
+    return sp.Symbol(f"U{t}L_v", real=True)
 
 
 def _fock_expr(family: str, spin: str):
@@ -119,6 +129,7 @@ def energy_gradient_rows(family: str, spin: str, d: int) -> KernelIntegrand:
     if family not in GRADIENT_FAMILIES:
         raise ValueError(f"no gradient rows for family {family!r}")
     func, expr = _fock_expr(family, spin)
+    general = family in GENERAL_DM_FAMILIES
     labels = ("u", "v")
     total = sp.Integer(0)
     for term in sp.Add.make_args(sp.expand(expr)):
@@ -135,9 +146,11 @@ def energy_gradient_rows(family: str, spin: str, d: int) -> KernelIntegrand:
         if parts[0] is None or parts[1] is None:
             raise ValueError(f"Fock term without both basis factors: {term}")
         (ku, au), (kv, av) = parts
-        # displace the first slot, contract the second -- and vice versa
+        # displace the first slot and contract the second with D -- and
+        # displace the second, contracting the first with D^T (= D for a
+        # symmetric density matrix)
         total += rest * (_seeded(ku, au, d) * _row(kv, av)
-                         + _row(ku, au) * _seeded(kv, av, d))
+                         + _row(ku, au, general) * _seeded(kv, av, d))
     # d chi/dX_{A,d} = -d_d chi
     return KernelIntegrand(functional=func, index_pairs=[("u", "v")],
                            expr=sp.expand(-total))
@@ -157,6 +170,18 @@ def _d3(prefix: str, i: int, j: int, k: int) -> sp.Symbol:
     """Third derivative of the density, d_i d_j d_k rho."""
     return sp.Symbol(f"{prefix}_{''.join(sorted(AXES[i] + AXES[j] + AXES[k]))}",
                      real=True)
+
+
+def _dtau_tilde(s: str, d: int) -> sp.Expr:
+    """d_d of the gauge-corrected tau~ = tau - jp^2/(2 rho), channel suffix
+    s: d_d tau - (jp . d_d jp)/rho + jp^2 d_d rho / (2 rho^2)."""
+    jp = [sp.Symbol(f"jp{s}_{a}", real=True) for a in AXES]
+    djp = [sp.Symbol(f"jpgrad{s}_{a}_{AXES[d]}", real=True) for a in AXES]
+    inv = sp.Symbol(f"inv_rho{s}", real=True)
+    return (_grad_scalar(f"grad_tau{s}", d)
+            - inv * sum(j * dj for j, dj in zip(jp, djp))
+            + sp.Rational(1, 2) * inv**2 * sum(j * j for j in jp)
+            * _grad_scalar(f"grad_rho{s}", d))
 
 
 def _deta(s: str, d: int) -> sp.Expr:
@@ -185,7 +210,8 @@ def energy_grid_gradient(family: str, spin: str, d: int) -> sp.Expr:
             "rho": grad[d],
             "sigma": 2 * sum(grad[i] * _hess("hess_rho", i, d)
                              for i in range(3)),
-            "tau": _grad_scalar("grad_tau", d),
+            "tau": (_dtau_tilde("", d) if family in GENERAL_DM_FAMILIES
+                    else _grad_scalar("grad_tau", d)),
             "lapl": _grad_scalar("grad_lapl_rho", d),
             "eta": _deta("", d),
         }
@@ -208,7 +234,9 @@ def energy_grid_gradient(family: str, spin: str, d: int) -> sp.Expr:
                      + grad[s2][i] * _hess(f"hess_rho_{s1}", i, d)
                      for i in range(3))
         elif K.group == "tau":
-            df = _grad_scalar(f"grad_tau_{K.comp}", d)
+            df = (_dtau_tilde(f"_{K.comp}", d)
+                  if family in GENERAL_DM_FAMILIES
+                  else _grad_scalar(f"grad_tau_{K.comp}", d))
         elif K.group == "lapl":
             df = _grad_scalar(f"grad_lapl_rho_{K.comp}", d)
         elif K.group == "eta":
