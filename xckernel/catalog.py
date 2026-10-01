@@ -96,11 +96,19 @@ class CatalogEntry:
     #: explicit GIAO magnetic-field derivative of the Fock matrix
     #: (London orbitals; F^{B_s} = (i/2c) K_s at a real reference)
     giao: bool = False
+    #: one-free-index and pointwise kernels (C backend): 'diag' (the
+    #: order-1 diagonal F_uu), 'g1' (nuclear-gradient basis-class rows),
+    #: 'gg' (nuclear-gradient grid class, per point); '' for the rest
+    kind: str = ""
 
     @property
     def name(self) -> str:
         if self.giao:
             return f"xck_{self.family}_{self.spin}_giao"
+        if self.kind == "diag":
+            return f"xck_{self.family}_{self.spin}_o1_diag"
+        if self.kind in ("g1", "gg"):
+            return f"xck_{self.family}_{self.spin}_{self.kind}"
         parts = ["xck", self.family, self.spin, f"o{self.order}"]
         if self.parities:
             parts.append("".join("p" if p > 0 else "m" for p in self.parities))
@@ -115,6 +123,19 @@ class CatalogEntry:
             return (f"explicit GIAO magnetic-field derivative of the XC "
                     f"Fock matrix, {self.family}, {sd}; "
                     f"F^(B_s) = (i/2c) K_s at a real reference")
+        if self.kind:
+            sd = {"r": "unpolarized", "ua": "unrestricted (alpha channel)",
+                  "ub": "unrestricted (beta channel)",
+                  "u": "unrestricted (both channels)"}[self.spin]
+            what = {
+                "diag": "diagonal F_uu of the XC Fock matrix",
+                "g1": ("XC nuclear gradient, basis class: per-function rows "
+                       "g_{d,u}, summed over the functions on atom A to "
+                       "+dE/dX_{A,d}"),
+                "gg": ("XC nuclear gradient, grid class: per-point "
+                       "w * d_d e(r_g), summed over the points of atom A"),
+            }[self.kind]
+            return f"{what}, {self.family}, {sd}"
         q = {0: "XC energy", 1: "XC Fock matrix"}.get(
             self.order, f"order-{self.order} XC response contraction")
         s = {"r": "unpolarized", "ua": "unrestricted (alpha channel)",
@@ -125,6 +146,20 @@ class CatalogEntry:
             p = " with perturbation parities (" + ", ".join(
                 "singlet" if x > 0 else "triplet" for x in self.parities) + ")"
         return f"{q}, {self.family}, {s}{p}"
+
+
+def _one_index_entries(fam: str) -> Iterator[CatalogEntry]:
+    """The C-backend Fock-diagonal and nuclear-gradient entries."""
+    from .engine.gradient import GRADIENT_FAMILIES
+    polarized = fam not in UNPOLARIZED_ONLY
+    spins = ("r", "ua", "ub") if polarized else ("r",)
+    for spin in spins:
+        yield CatalogEntry(fam, spin, 1, kind="diag")
+    if fam in GRADIENT_FAMILIES:
+        for spin in spins:
+            yield CatalogEntry(fam, spin, 1, kind="g1")
+        for spin in (("r", "u") if polarized else ("r",)):
+            yield CatalogEntry(fam, spin, 1, kind="gg")
 
 
 def entries(families=FAMILIES, max_order: int = 4,
@@ -141,6 +176,8 @@ def _all_entries(families, max_order: int) -> Iterator[CatalogEntry]:
         yield CatalogEntry(fam, "r", 0)                      # exc
         for o in range(1, fmax + 1):                         # unpolarized
             yield CatalogEntry(fam, "r", o, batch=(o >= 2))
+        if fmax >= 1:                       # Fock diagonal, gradient
+            yield from _one_index_entries(fam)
         if fam in UNPOLARIZED_ONLY:
             continue
         smax = min(fmax, FAMILY_SPIN_MAX_ORDER.get(fam, fmax))
@@ -244,6 +281,8 @@ def _param_meta(name: str, batch: bool) -> Dict[str, str]:
                 "kind": "center_scaled_collocation_laplacian"}
     if re.match(r"^hess_rho(_[ab])?$", name):
         return {"shape": "(6, ng)", "kind": "gs_field"}
+    if re.match(r"^(grad_tau|grad_lapl_rho)(_[ab])?$", name):
+        return {"shape": "(3, ng)", "kind": "gs_field_gradient"}
     if re.match(r"^inv_rho(_[ab])?$", name):
         return {"shape": "(ng,)", "kind": "gs_field"}
     if re.match(r"^(grad_rho|jp)(_[ab])?_p\d+$", name):
@@ -336,6 +375,131 @@ def _integrand_for(e: CatalogEntry):
     return response_fock_st(e.family, e.order, e.parities)
 
 
+#: operand metadata of the one-free-index ABIs beyond _param_meta
+_KIND_ARRAYS = {
+    "dlapl_chi": {"shape": "(3, nbf, ng)",
+                  "kind": "collocation_laplacian_gradient"},
+    "U0": {"shape": "(nbf, ng)", "kind": "dm_contracted_collocation",
+           "definition": "U0[u,g] = sum_v D[u,v] chi[v,g]"},
+    "Ui": {"shape": "(3, nbf, ng)", "kind": "dm_contracted_collocation",
+           "definition": "Ui[i,u,g] = sum_v D[u,v] dchi[i,v,g]"},
+    "UL": {"shape": "(nbf, ng)", "kind": "dm_contracted_collocation",
+           "definition": "UL[u,g] = sum_v D[u,v] lapl_chi[v,g]"},
+}
+
+def _arrays_read(blocks) -> set:
+    """The collocation arrays a diag/g1 kernel's patterns actually read."""
+    import re
+    names = set()
+    for ck in blocks:
+        for ufac, vfac, _ in ck.patterns:
+            for code in (ufac, vfac):
+                base = re.sub(r"\[\d\]$", "", code)
+                names.add("Ui" if re.fullmatch(r"U[123]", base) else base)
+    return names
+
+
+def _kind_kernels(e: CatalogEntry):
+    """(row blocks, collapsed form carrying the operand order) of a
+    diag/g1/gg entry."""
+    import sympy as sp
+
+    from .emitters.cbackend import collapse_pointwise
+    from .emitters.codegen import collapse
+    from .engine.kernel import KernelIntegrand
+    if e.kind == "diag":
+        ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 1)))
+        return [ck], ck
+    if e.kind == "g1":
+        from .engine.gradient import energy_gradient_rows
+        kis = [energy_gradient_rows(e.family, e.spin, d) for d in range(3)]
+        whole = KernelIntegrand(functional=kis[0].functional,
+                                index_pairs=[("u", "v")],
+                                expr=sp.Add(*[k.expr for k in kis]))
+        return [collapse(k) for k in kis], collapse(whole)
+    from .engine.gradient import energy_grid_gradient
+    from .inputs.functional import Functional
+    func = Functional.of_family(e.family)
+    exprs = [energy_grid_gradient(e.family, e.spin, d) for d in range(3)]
+    return ([collapse_pointwise(x, func) for x in exprs],
+            collapse_pointwise(sp.Add(*exprs), func))
+
+
+def _emit_kind(e: CatalogEntry):
+    """(hpp, cpp, manifest entry) of a diag/g1/gg entry."""
+    from .emitters.cbackend import (ABI_KINDS, emit_kind_cpp, emit_points_hpp,
+                                    emit_rows_hpp, scal_order)
+    blocks, scal_ck = _kind_kernels(e)
+    if e.kind == "gg":
+        hpp = emit_points_hpp(blocks, scal_ck, e.name)
+    else:
+        hpp = emit_rows_hpp(blocks, scal_ck, e.name, e.kind)
+    cpp = emit_kind_cpp(scal_ck, e.name, e.kind)
+
+    has_nbf, arrays, out_shape = ABI_KINDS[e.kind]
+    m: Dict = {
+        "name": e.name, "description": e.description,
+        "family": e.family, "spin": e.spin, "order": 1, "batch": False,
+        "kind": e.kind, "output_shape": out_shape, "abi": "xckernel.h",
+        "generator": "machine-generated by xckernel; do not edit",
+        "copyright": "Copyright (c) 2026 Susi Lehtola",
+        "ownership": OWNERSHIP,
+        "libxc": {
+            "input_variables": FAMILY_VARS[e.family],
+            "spin_mode": "unpolarized" if e.spin == "r" else "polarized",
+            "max_derivative_order": 1,
+            "derivative_arrays": list(scal_ck.libxc_args),
+        },
+    }
+    params = []
+    read = _arrays_read(blocks) if e.kind != "gg" else set()
+    for a in arrays:
+        meta = _KIND_ARRAYS.get(a) or _param_meta(a, False)
+        params.append({"name": a, **meta, "required": a in read})
+    for p in scal_ck.params:
+        if p in ("chi", "dchi", "lapl_chi", "hess_chi"):
+            continue
+        params.append({"name": p, **_param_meta(p, False)})
+    m["params"] = params
+    m["scal_names"] = scal_order(scal_ck)
+    if e.kind == "diag":
+        m["convention"] = "out[u] += F_uu, the diagonal of " + \
+            CatalogEntry(e.family, e.spin, 1).name
+    elif e.kind == "g1":
+        m["convention"] = (
+            "out[d*nbf + u] += g_{d,u}; dE/dX_{A,d} (basis class) = sum over "
+            "u on atom A of g_{d,u}. SIGN: the output is +dE/dX -- the "
+            "-d/dr of d chi/dX is folded into the kernel, so dchi, hess_chi "
+            "and dlapl_chi are the PLAIN collocation derivatives (unlike "
+            "geometric.py's masked operands). D must be symmetric.")
+        if e.spin != "r":
+            m["convention"] += (
+                f" Unrestricted: U0/Ui/UL are rows of the {e.spin[1]}-channel "
+                "spin density matrix and the output is that channel's "
+                "contribution; the gradient is the sum of the ua and ub calls.")
+    else:
+        m["convention"] = (
+            "out[d*ng + g] += w_g d_d e(r_g), e the XC energy density per "
+            "volume; the grid class of dE/dX_{A,d} is the sum over the points "
+            "whose parent atom is A (call with the plain weights; no atom "
+            "masking in the kernel).")
+    m["gradient_classes"] = _GRADIENT_CLASSES
+    return hpp, cpp, m
+
+
+#: the dispatch table of the XC nuclear gradient
+_GRADIENT_CLASSES = {
+    "basis": "xck_<family>_<r|ua|ub>_g1 (per-function rows, summed per atom)",
+    "grid": "xck_<family>_<r|u>_gg (per-point, summed over each atom's points)",
+    "weight": ("no new kernel: sum_g (dw_g/dX_{A,d}) e(r_g), e.g. "
+               "xck_<family>_r_o0 called with w := dw/dX (rho the total "
+               "density, zk the Libxc energy per particle); the host owns "
+               "the partition-weight derivative"),
+    "invariance": ("sum over atoms of basis + grid + weight classes is zero "
+                   "for each direction"),
+}
+
+
 VERSION = "0.1.0"
 
 
@@ -355,12 +519,19 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
     out = Path(outdir)
     manifest: Dict = {"generator": "xckernel", "backend": backend,
                       "version": VERSION, "max_order": max_order,
+                      "gradient_classes": _GRADIENT_CLASSES,
                       "kernels": []}
 
     if backend == "numpy":
         (out / "kernels").mkdir(parents=True, exist_ok=True)
         for e in entries(families, max_order, include_heavy):
             t0 = time.time()
+            if e.kind:
+                manifest["kernels"].append({
+                    "name": e.name, "description": e.description,
+                    "backends": ["c"],
+                    "note": "C backend only (one-free-index/pointwise ABI)"})
+                continue
             source, gen = build_entry(e)
             (out / "kernels" / f"{e.name}.py").write_text(
                 "import numpy as np\n\n" + source)
@@ -400,6 +571,17 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                               "center-scaled collocation operands Rchi, "
                               "Rdchi, Rlapl_chi and grid coordinates rg")}
                 manifest["kernels"].append(m)
+                continue
+            if e.kind:
+                hpp, cpp, m = _emit_kind(e)
+                (out / "include" / "xckernel" / "kernels"
+                 / f"{e.name}.hpp").write_text(hpp)
+                (out / "src" / f"{e.name}.cpp").write_text(cpp)
+                manifest["kernels"].append(m)
+                names.append((e.name, e.order, e.kind))
+                if verbose:
+                    print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
+                          f"{e.kind}", flush=True)
                 continue
             if e.order == 0:
                 (out / "include" / "xckernel" / "kernels"

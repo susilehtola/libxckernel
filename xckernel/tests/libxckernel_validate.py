@@ -40,7 +40,7 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                         "-DXCKERNEL_GRID_BLOCK=16",
                         f"-DCMAKE_PREFIX_PATH={sys.prefix}"],
                        cwd=bld, check=True, capture_output=True)
-        subprocess.run(["make", "-j8"], cwd=bld, check=True,
+        subprocess.run(["make", "-j3"], cwd=bld, check=True,
                        capture_output=True)
         lib = ctypes.CDLL(str(bld / "libxckernel.so"))
         man = json.loads((pkg / "manifest.json").read_text())
@@ -52,6 +52,10 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
             # skip cross-backend pointer entries (e.g. the GIAO notes,
             # which carry no "abi"/"order") and the order-0 energy kernels
             if "abi" not in k or k.get("order", 0) == 0:
+                continue
+            # the one-free-index and pointwise ABIs (Fock diagonal,
+            # nuclear gradient) have their own suite: gradient_validate
+            if "kind" in k:
                 continue
             e = CatalogEntry(k["family"], k["spin"], k["order"],
                              tuple(k.get("parities", ())))

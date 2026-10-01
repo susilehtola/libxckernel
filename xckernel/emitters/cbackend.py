@@ -69,7 +69,8 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
-        elif p.startswith(("grad_rho", "jp")) or p.startswith("dgrad_rho"):
+        elif p.startswith(("grad_rho", "jp", "dgrad_rho", "grad_tau",
+                           "grad_lapl_rho")):
             for ax in ("x", "y", "z"):
                 # grad_rho -> grad_rho_x; grad_rho_a_p1 -> grad_rho_a_p1_x;
                 # dgrad_rho_g (the direction-resolved density-Hessian row of
@@ -105,8 +106,10 @@ def _gemm_plan(patterns) -> Tuple[str, list]:
 
 
 def _stage_b_calls(ck: CollapsedKernel, bexpr, stage_a_call, indent="        ",
-                   gemm="gemm_nt", acc="accumulate", cast=lambda x: x):
-    """The per-block body: stage A per pattern, merge, one GEMM per group."""
+                   gemm="gemm_nt", acc="accumulate", cast=lambda x: x,
+                   out="out"):
+    """The per-block body: stage A per pattern, merge, one GEMM per group
+    (or, with gemm="rowdot", one row-wise dot product per group)."""
     side, groups = _gemm_plan(ck.patterns)
     lines: List[str] = []
     for shared, members in groups:
@@ -117,10 +120,10 @@ def _stage_b_calls(ck: CollapsedKernel, bexpr, stage_a_call, indent="        ",
         sh = f"{bexpr[shared]} + g0"
         if side == "u":
             lines.append(f"{indent}{gemm}(nbf, bk, {sh}, npts, {cast('W')}, "
-                         f"bk, out);")
+                         f"bk, {out});")
         else:
             lines.append(f"{indent}{gemm}(nbf, bk, {cast('W')}, bk, {sh}, "
-                         f"npts, out);")
+                         f"npts, {out});")
     return lines
 
 
@@ -383,6 +386,21 @@ XCK_HD inline void gemm_nt(int64_t n, int64_t k, const T* A, int64_t lda,
     }
 }
 
+/* Row-wise contraction: out(i) += sum_g A(i,g) B(i,g) -- the diagonal of
+ * gemm_nt, for kernels with one free basis index (Fock diagonals and
+ * nuclear-gradient rows). */
+template <typename T>
+XCK_HD inline void rowdot(int64_t n, int64_t k, const T* A, int64_t lda,
+                          const T* B, int64_t ldb, T* out) {
+    for (int64_t i = 0; i < n; ++i) {
+        const T* Ai = A + i * lda;
+        const T* Bi = B + i * ldb;
+        T s = T(0);
+        for (int64_t g = 0; g < k; ++g) s += Ai[g] * Bi[g];
+        out[i] += s;
+    }
+}
+
 #ifdef XCKERNEL_USE_BLAS
 namespace detail {
 inline bool blas_fits(int64_t n, int64_t k, int64_t lda, int64_t ldb) {
@@ -547,12 +565,230 @@ def emit_kernel_cpp(ck: CollapsedKernel, name: str) -> str:
     return "\n".join(lines)
 
 
+# --- one-free-index and pointwise kernels -------------------------------------
+
+#: collocation-operand code -> C++ array expression (nbf x npts blocks)
+_CXX_BASIS = {
+    "chi": "chi", "lapl_chi": "lapl_chi", "U0": "U0", "UL": "UL",
+    **{f"dchi[{k}]": f"dchi + (int64_t){k}*nbf*npts" for k in range(3)},
+    **{f"hess_chi[{k}]": f"hess_chi + (int64_t){k}*nbf*npts"
+       for k in range(6)},
+    **{f"dlapl_chi[{k}]": f"dlapl_chi + (int64_t){k}*nbf*npts"
+       for k in range(3)},
+    **{f"U{k + 1}": f"Ui + (int64_t){k}*nbf*npts" for k in range(3)},
+}
+
+#: per ABI kind: (has nbf, collocation arrays, output shape)
+ABI_KINDS = {
+    "matrix": (True, ("chi", "dchi", "lapl_chi", "hess_chi"), "(nbf, nbf)"),
+    "diag": (True, ("chi", "dchi", "lapl_chi", "hess_chi"), "(nbf,)"),
+    "g1": (True, ("chi", "dchi", "lapl_chi", "hess_chi", "dlapl_chi",
+                  "U0", "Ui", "UL"), "(3, nbf)"),
+    "gg": (False, (), "(3, ng)"),
+}
+
+
+def collapse_pointwise(expr, functional) -> CollapsedKernel:
+    """Collapse a per-point integrand (no basis factors) into the shared
+    table form: a single pattern carried on a dummy basis pair, whose
+    collocation factors the pointwise emitter never reads."""
+    import sympy as sp
+
+    from ..engine.kernel import KernelIntegrand
+    from .codegen import collapse
+    pair = sp.Symbol("chi_u", real=True) * sp.Symbol("chi_v", real=True)
+    return collapse(KernelIntegrand(functional=functional,
+                                    index_pairs=[("u", "v")],
+                                    expr=sp.expand(expr * pair)))
+
+
+def _tables(ck: CollapsedKernel, sidx: dict, tag: str) -> Tuple[list, dict]:
+    """constexpr monomial tables of every pattern, named c<tag>_<p>..."""
+    lines, nms = [], {}
+    for ip, (_, _, monos) in enumerate(ck.patterns):
+        coeffs, offs, fids = [], [0], []
+        for coeff, factors in monos:
+            coeffs.append(coeff)
+            for fname, e in factors:
+                fids.extend([sidx[fname]] * e)
+            offs.append(len(fids))
+        lines += [f"static constexpr double c{tag}_{ip}[] = {{",
+                  "    " + ",".join(f"{c!r}" for c in coeffs), "};",
+                  f"static constexpr int32_t o{tag}_{ip}[] = {{",
+                  "    " + ",".join(str(o) for o in offs), "};",
+                  f"static constexpr uint16_t f{tag}_{ip}[] = {{",
+                  "    " + (",".join(str(f) for f in fids) or "0"), "};"]
+        nms[ip] = len(monos)
+    return lines, nms
+
+
+def _n_fields(scal_ck: CollapsedKernel) -> int:
+    return len(scal_order(scal_ck)) - len(scal_ck.libxc_args)
+
+
+def emit_rows_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
+                  name: str, kind: str) -> str:
+    """Kernel with one free basis index: out[r*nbf + u] += sum_g sum_p
+    c_p(g) U_p(u,g) V_p(u,g) for each row block r -- the Fock diagonal
+    (kind 'diag', one block) or the nuclear-gradient rows (kind 'g1', one
+    block per direction). The same tables and pattern merging as the
+    matrix kernels, with the GEMM replaced by a row-wise dot product."""
+    sidx = _scal_index(scal_ck)
+    ns = f"detail_{name}"
+    arrays = ABI_KINDS[kind][1]
+    lines = ["/* generated by xckernel; do not edit. */", "#pragma once",
+             "#include <cstdint>", "#include <new>",
+             '#include "xckernel/evaluator.hpp"', "",
+             "namespace xckernel {", f"namespace {ns} {{"]
+    nms = []
+    for r, ck in enumerate(blocks):
+        t, n = _tables(ck, sidx, str(r))
+        lines += t
+        nms.append(n)
+    lines += [f"static constexpr int64_t NFLD = {_n_fields(scal_ck)};",
+              f"}} // namespace {ns}", "",
+              "/* fields: host-computed per-point operands (type T); xc: the",
+              " * functional-derivative arrays (type Txc). work: caller scratch",
+              " * of xckernel::work_size(npts, nbf) elements or nullptr. */",
+              "template <typename T, typename Txc = T>",
+              f"int {name}_t(int64_t npts, int64_t nbf,",
+              "             " + ", ".join(f"const T* {a}" for a in arrays) + ",",
+              "             const T* const* fields, const Txc* const* xc,",
+              "             T* out, T* work = nullptr) {"]
+    lines += [f"    (void){a};" for a in arrays]
+    lines += [
+        "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+        "    T* c = work;",
+        "    bool own = false;",
+        "    if (!c) {",
+        "        c = new (std::nothrow) T[work_size(npts, nbf)];",
+        "        own = true;",
+        "    }",
+        "    if (!c) return 1;",
+        "    T* W = c + blk;",
+        "    const T* Wc = W;",
+        "    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+        "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;",
+    ]
+    for r, ck in enumerate(blocks):
+        lines += _stage_b_calls(
+            ck, _CXX_BASIS,
+            lambda ip, r=r: (f"stage_a<T, Txc>(g0, bk, {nms[r][ip]}, "
+                             f"{ns}::c{r}_{ip}, {ns}::o{r}_{ip}, "
+                             f"{ns}::f{r}_{ip}, {ns}::NFLD, fields, xc, c);"),
+            gemm="rowdot", acc="accumulate<T>", cast=lambda w: "Wc",
+            out=f"out + (int64_t){r}*nbf")
+    lines += ["    }", "    if (own) delete[] c;", "    return 0;", "}", "",
+              "} // namespace xckernel", ""]
+    return "\n".join(lines)
+
+
+def emit_points_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
+                    name: str) -> str:
+    """Pointwise kernel: out[r*npts + g] += c_r(g), one coefficient table
+    per output row (the per-point spatial gradient, one row per
+    direction)."""
+    sidx = _scal_index(scal_ck)
+    ns = f"detail_{name}"
+    lines = ["/* generated by xckernel; do not edit. */", "#pragma once",
+             "#include <cstdint>", "#include <new>",
+             '#include "xckernel/evaluator.hpp"', "",
+             "namespace xckernel {", f"namespace {ns} {{"]
+    nms = []
+    for r, ck in enumerate(blocks):
+        if len(ck.patterns) != 1:
+            raise ValueError("pointwise kernels carry exactly one pattern")
+        t, n = _tables(ck, sidx, str(r))
+        lines += t
+        nms.append(n)
+    lines += [f"static constexpr int64_t NFLD = {_n_fields(scal_ck)};",
+              f"}} // namespace {ns}", "",
+              "/* work: caller scratch of xckernel::work_size(npts, 0)",
+              " * elements or nullptr. */",
+              "template <typename T, typename Txc = T>",
+              f"int {name}_t(int64_t npts,",
+              "             const T* const* fields, const Txc* const* xc,",
+              "             T* out, T* work = nullptr) {",
+              "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+              "    T* c = work;",
+              "    bool own = false;",
+              "    if (!c) {",
+              "        c = new (std::nothrow) T[work_size(npts, 0)];",
+              "        own = true;",
+              "    }",
+              "    if (!c) return 1;",
+              "    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+              "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;"]
+    for r in range(len(blocks)):
+        lines += [f"        stage_a<T, Txc>(g0, bk, {nms[r][0]}, "
+                  f"{ns}::c{r}_0, {ns}::o{r}_0, {ns}::f{r}_0, {ns}::NFLD, "
+                  "fields, xc, c);",
+                  f"        for (int64_t g = 0; g < bk; ++g) "
+                  f"out[(int64_t){r}*npts + g0 + g] += c[g];"]
+    lines += ["    }", "    if (own) delete[] c;", "    return 0;", "}", "",
+              "} // namespace xckernel", ""]
+    return "\n".join(lines)
+
+
+def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
+    has_nbf, arrays, _ = ABI_KINDS[kind]
+    args = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
+        + [f"const double* {a}" for a in arrays] \
+        + ["const double* const* scal", "double* out"]
+    return f"int {name}(" + (",\n" + indent).join(args) + ")"
+
+
+def emit_kind_cpp(scal_ck: CollapsedKernel, name: str, kind: str) -> str:
+    """The double instantiation + C ABI wrapper of a diag/g1/gg kernel."""
+    names = scal_order(scal_ck)
+    has_nbf, arrays, _ = ABI_KINDS[kind]
+    nfld = _n_fields(scal_ck)
+    call = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays)
+    lines = ["/* generated by xckernel; do not edit. */",
+             f'#include "xckernel/kernels/{name}.hpp"', "",
+             'extern "C" {', "",
+             f"const char* {name}_scal_names[{len(names)}] = {{"]
+    lines += [f'    "{n}",' for n in names]
+    lines += ["};",
+              f"extern const int {name}_n_scal;",
+              f"const int {name}_n_scal = {len(names)};",
+              f"extern const int {name}_n_fields;",
+              f"const int {name}_n_fields = {nfld};", "",
+              _c_signature(name, kind) + " {",
+              f"    return xckernel::{name}_t<double, double>(",
+              "        " + ", ".join(call) + ",",
+              f"        scal, scal + {nfld}, out);",
+              "}", "", "} // extern C", ""]
+    return "\n".join(lines)
+
+
 # --- package emission (libxckernel) ------------------------------------------
 
 _KERNEL_PROTO = ("int {name}(int64_t npts, int64_t nbf,\n"
                  "           const double* chi, const double* dchi,\n"
                  "           const double* lapl_chi, const double* hess_chi,\n"
                  "           const double* const* scal, double* out);")
+
+
+def _unpack(entry) -> Tuple[str, int, str]:
+    """(name, order[, kind]) -> (name, order, kind); kind defaults to the
+    matrix ABI of the response kernels."""
+    if len(entry) == 3:
+        return entry
+    name, order = entry
+    return name, order, "matrix"
+
+
+#: header comment per non-matrix ABI kind
+_KIND_NOTE = {
+    "diag": "out (nbf,): the diagonal F_uu of the order-1 kernel",
+    "g1": ("out (3, nbf): nuclear-gradient basis-class rows; sum over the "
+           "functions on atom A gives +dE/dX_{A,d}. dchi, hess_chi, "
+           "dlapl_chi are PLAIN collocation derivatives; U0 = D chi, "
+           "Ui = D d_i chi, UL = D lapl chi"),
+    "gg": ("out (3, ng): nuclear-gradient grid class w * d_d e(r_g); sum "
+           "over the points of atom A gives its grid-motion term"),
+}
 
 
 def emit_header(kernel_names: List[str], version: str) -> str:
@@ -591,14 +827,19 @@ def emit_header(kernel_names: List[str], version: str) -> str:
         f'#define XCKERNEL_VERSION "{version}"',
         "",
     ]
-    for name, order in kernel_names:
+    for entry in kernel_names:
+        name, order, kind = _unpack(entry)
         if order == 0:
             lines.append(f"double {name}(int64_t npts, const double* w,")
             lines.append(f"              const double* rho, "
                          f"const double* zk);")
             lines.append("")
             continue
-        lines.append(_KERNEL_PROTO.format(name=name))
+        if kind == "matrix":
+            lines.append(_KERNEL_PROTO.format(name=name))
+        else:
+            lines.append(f"/* {_KIND_NOTE[kind]} */")
+            lines.append(_c_signature(name, kind, indent="           ") + ";")
         lines.append(f"extern const char* {name}_scal_names[];")
         lines.append(f"extern const int {name}_n_scal;")
         lines.append(f"extern const int {name}_n_fields;")
@@ -641,7 +882,27 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
         "  public",
         "  interface",
     ]
-    for name, order in kernel_names:
+    for entry in kernel_names:
+        name, order, kind = _unpack(entry)
+        if kind in ("g1", "gg"):
+            has_nbf, arrays, _ = ABI_KINDS[kind]
+            args = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays) \
+                + ["scal", "out"]
+            lines += [
+                f"    integer(c_int) function {name}({', '.join(args)}) "
+                f"bind(C, name='{name}')",
+                "      import :: c_int, c_int64_t, c_double, c_ptr",
+                "      integer(c_int64_t), value :: "
+                + ", ".join(["npts"] + (["nbf"] if has_nbf else [])),
+            ]
+            if arrays:
+                lines.append("      type(c_ptr), value :: " + ", ".join(arrays))
+            lines += [
+                "      type(c_ptr), intent(in) :: scal(*)",
+                "      real(c_double), intent(inout) :: out(*)",
+                f"    end function {name}",
+            ]
+            continue
         if order == 0:
             lines += [
                 f"    real(c_double) function {name}(npts, w, rho, zk) "
@@ -670,7 +931,8 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
 def emit_cmake(kernel_names: List[Tuple[str, int]], version: str) -> str:
     import re as _re
     by_order: dict = {}
-    for n, order in kernel_names:
+    for entry in kernel_names:
+        n, order, _ = _unpack(entry)
         by_order.setdefault(order, []).append(n)
     groups = []
     for order in sorted(by_order):
