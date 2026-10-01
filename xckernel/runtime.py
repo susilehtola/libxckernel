@@ -55,6 +55,8 @@ def _operands(operands: Dict, ng: int) -> Dict[str, np.ndarray]:
 
 
 def _kind(name: str) -> str:
+    if name.endswith("_giao"):
+        return "giao"
     if name.endswith("_o1_diag"):
         return "diag"
     if name.endswith("_f1"):
@@ -104,7 +106,7 @@ class Library:
 
     def __call__(self, name: str, *, w, chi=None, Dchi=None, DTchi=None,
                  Dchi_a=None, Dchi_b=None, DTchi_a=None, DTchi_b=None,
-                 atom_mask=None, out=None,
+                 atom_mask=None, bf_centers=None, out=None,
                  **operands) -> np.ndarray:
         """Call a kernel with named operands; returns ``out`` (accumulated
         into when given): (nbf, nbf), (nbf,) for *_o1_diag, (3, nbf) for
@@ -157,8 +159,15 @@ class Library:
                 raise ValueError(f"{name}: atom_mask must be ({nbf},) int8")
             keep.append(mask)
             args.append(mask.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        if kind == "giao":
+            cen = np.ascontiguousarray(bf_centers, dtype=np.float64)
+            if cen.shape != (3, nbf):
+                raise ValueError(f"{name}: bf_centers must be (3, {nbf})")
+            keep.append(cen)
+            args.append(cen.ctypes.data_as(_P))
         shape = {"matrix": (nbf, nbf), "diag": (nbf,), "g1": (3, nbf),
-                 "gg": (3, ng), "f1": (3, nbf, nbf), "fg": (3, nbf, nbf)}[kind]
+                 "gg": (3, ng), "f1": (3, nbf, nbf), "fg": (3, nbf, nbf),
+                 "giao": (3, nbf, nbf)}[kind]
         out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
         fn = getattr(self._dll, name)
         fn.restype = ctypes.c_int

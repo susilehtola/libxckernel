@@ -66,6 +66,13 @@ def _lapl(prefix: str = "") -> Combo:
 
 # --- basis operands -------------------------------------------------------------
 
+def center_axis(code: str):
+    """The center coordinate a London-orbital operand is scaled by
+    (R_a chi, R_a d_c chi, R_a lapl chi), or None."""
+    m = re.match(r"R(?:chi|dchi|lapl_chi)\[(\d)\]", code)
+    return int(m.group(1)) if m else None
+
+
 def is_masked(code: str) -> bool:
     """Atom-masked operand (rows of functions off the atom are zero)."""
     return code.startswith("M")
@@ -74,6 +81,14 @@ def is_masked(code: str) -> bool:
 def basis_operand(code: str) -> Tuple[str, Combo]:
     """(tower array, combination of components) of an engine basis code;
     atom-masked codes (is_masked) map like their unmasked counterparts."""
+    m = re.fullmatch(r"R(chi|dchi|lapl_chi)\[(\d)\](?:\[(\d)\])?", code)
+    if m:
+        kind, _, c = m.groups()
+        if kind == "chi":
+            return "chi", [("", 1)]
+        if kind == "dchi":
+            return "chi", [(AXES[int(c)], 1)]
+        return "chi", _lapl()
     m = re.fullmatch(r"M(dchi|hess_chi|tchi|dlapl_chi)\[([xyz]{1,3})\]", code)
     if m:
         kind, ax = m.groups()
@@ -136,6 +151,10 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     """Tower names and weights of an engine per-point operand (Libxc
     derivative arrays excluded): a single entry with weight 1 for a plain
     rename, several for a combination the kernel forms."""
+    m = re.fullmatch(r"rg_([xyz])", name)
+    if m:
+        # grid coordinates: a vector, its component in the base name
+        return [(f"rg{m.group(1)}", 1)]
     if name in ("w",) or re.fullmatch(r"inv_rho" + _SP, name):
         return [(name, 1)]
     m = re.fullmatch(r"grad_rho" + _SP + _PT + r"_([xyz])", name)
@@ -213,7 +232,8 @@ class Layout:
 
     def derived_basis(self) -> List[str]:
         return [c for c, (_, combo) in self.basis.items()
-                if not is_component(combo) or is_masked(c)]
+                if not is_component(combo) or is_masked(c)
+                or center_axis(c) is not None]
 
     def require(self, array: str, order: int):
         self.orders[array] = max(self.orders.get(array, 0), order)
@@ -228,9 +248,12 @@ class Layout:
         for c in self.derived_basis():
             arr, combo = self.basis[c]
             out[c] = " + ".join((f"{wt}*" if wt != 1 else "")
-                                + f"{arr}_{ax}" for ax, wt in combo)
+                                + (f"{arr}_{ax}" if ax else arr)
+                                for ax, wt in combo)
             if is_masked(c):
                 out[c] = f"atom_mask * ({out[c]})"
+            if center_axis(c) is not None:
+                out[c] = f"bf_centers[{AXES[center_axis(c)]}] * ({out[c]})"
         for n in self.computed:
             out[n] = "perturbed field of the displacement (from chi, Dchi, " \
                      "atom_mask)"
