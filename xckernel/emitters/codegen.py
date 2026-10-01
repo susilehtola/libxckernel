@@ -103,7 +103,12 @@ _DDCHI_G = re.compile(r"^ddchi_(g|gA|gB)_(\w+)_([xyz])$")
 # same function) and density-contracted collocation rows
 _D2CHI_G2 = re.compile(r"^d2chi_g2_(\w+)$")
 _D3CHI_G2 = re.compile(r"^d3chi_g2_(\w+)_([xyz])$")
-_UROW = re.compile(r"^U(0|[123])_(\w+)$")
+_UROW = re.compile(r"^U(0|[123]|L)_(\w+)$")
+# nuclear-gradient operands: the displaced Laplacian collocation
+# d_d lapl chi, and the spatial gradients of tau and of lapl rho
+_DLAPL_CHI = re.compile(r"^dlapl_chi_(\w+?)_([xyz])$")
+_GTAU = re.compile(r"^grad_tau_(?:([ab])_)?([xyz])$")
+_GLAPL = re.compile(r"^grad_lapl_rho_(?:([ab])_)?([xyz])$")
 # the local density-matrix pair factor (two free labels)
 _DPAIR = re.compile(r"^D_(\w+)_(\w+)$")
 _DGRAD_G = re.compile(r"^dgrad_rho_g_([xyz])$")
@@ -167,6 +172,17 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _UROW.match(name)
     if m:
         return Operand(f"U{m.group(1)}", f"{m.group(2)}g"), "basis"
+    m = _DLAPL_CHI.match(name)
+    if m:
+        return Operand(f"dlapl_chi[{_AX_ANY[m.group(2)]}]",
+                       f"{m.group(1)}g"), "basis"
+    for rx, base, kind in ((_GTAU, "grad_tau", "gtau"),
+                           (_GLAPL, "grad_lapl_rho", "glapl")):
+        m = rx.match(name)
+        if m:
+            sfx = f"_{m.group(1)}" if m.group(1) else ""
+            return Operand(f"{base}{sfx}[{_AX_ANY[m.group(2)]}]", "g"), \
+                f"{kind}{sfx}"
     m = _DPAIR.match(name)
     if m:
         return Operand("Dloc", f"{m.group(1)}{m.group(2)}"), "dpair"
@@ -400,6 +416,10 @@ def generate(ki: KernelIntegrand, func_name: str = "kernel",
             params.append(f"hess_rho_{sk[-1]}")
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
+    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl")):
+        for sfx in ("", "_a", "_b"):
+            if f"{kind}{sfx}" in uses:
+                params.append(f"{base}{sfx}")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     pert_grads = sorted(u.split(":", 1)[1] for u in uses if u.startswith("pgrad:"))
@@ -501,7 +521,9 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
                 elif kind == "grad":
                     uses.add("grad")
                 elif kind in ("grad_a", "grad_b", "jp", "jp_a", "jp_b",
-                      "hrho", "hrho_a", "hrho_b", "dgrad_g"):
+                      "hrho", "hrho_a", "hrho_b", "dgrad_g",
+                      "gtau", "gtau_a", "gtau_b",
+                      "glapl", "glapl_a", "glapl_b"):
                     uses.add(kind)
                 elif kind.startswith(("pgrad:", "pscalar:", "pjp:", "phrho:",
                                       "gscalar:", "geometry:")):
@@ -564,6 +586,10 @@ def collapse(ki: KernelIntegrand) -> CollapsedKernel:
             params.append(f"hess_rho_{sk[-1]}")
     if "dgrad_g" in uses:
         params.append("dgrad_rho_g")
+    for base, kind in (("grad_tau", "gtau"), ("grad_lapl_rho", "glapl")):
+        for sfx in ("", "_a", "_b"):
+            if f"{kind}{sfx}" in uses:
+                params.append(f"{base}{sfx}")
     params += sorted(u.split(":", 1)[1] for u in uses
                      if u.startswith("gscalar:"))
     params += [f"grad_rho_{lbl}" for lbl in pert_grads]

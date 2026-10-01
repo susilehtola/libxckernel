@@ -76,8 +76,9 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **169 kernels** named
-`xck_<family>_<case>_o<order>[_<parities>]`, spanning seven functional
+`catalog.py` enumerates, generates, and manifests **215 kernels**: 169
+named `xck_<family>_<case>_o<order>[_<parities>]` and 46 Fock-diagonal
+and nuclear-gradient kernels (below), spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
 gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
@@ -101,6 +102,31 @@ purely real or imaginary have their zero parts eliminated at generation
 time), a matrix-free two-sided mode that emits σ-vector contractions
 from MO-pair collocation, and nuclear derivatives of the XC contribution
 including the full quadrature-grid response (`geometric.py`).
+
+### Fock diagonal and nuclear gradient
+
+The C package also carries kernels with one free basis index, or none:
+
+| entry | `out` | contents |
+|---|---|---|
+| `xck_<family>_{r,ua,ub}_o1_diag` | `(nbf,)` | the diagonal `F_uu` of `xck_<family>_<spin>_o1` at O(nbf·ng), with the same arguments; all seven families |
+| `xck_<family>_{r,ua,ub}_g1` | `(3, nbf)` | nuclear gradient, basis class, as per-function rows |
+| `xck_<family>_{r,u}_gg` | `(3, ng)` | nuclear gradient, grid class, per grid point |
+
+The gradient entries cover `lda`, `gga`, `mgga_tau`, `mgga_lapl` and
+`mgga`. Every class is returned as **+dE/dX**, and the three classes
+add up to the full gradient with grid response:
+
+| class | what moves | how to evaluate dE/dX_{A,d} |
+|---|---|---|
+| basis | atom A's basis functions | `g1`: sum `out[d, u]` over the functions u on atom A. Inputs: the plain collocation tower `chi` (to third order for the Laplacian families) and its density contraction `Dchi = D chi`. Unrestricted: call `ua` with Dᵅ and `ub` with Dᵝ, and add. |
+| grid | atom A's grid points | `gg`: sum `out[d, g]` over the points g whose parent atom is A. Inputs: the density tower to second order (third for the Laplacian families) and `tau_x`, `tau_y`, `tau_z` (per channel for `u`). |
+| weight | the partition weights | no new kernel: `Σ_g (∂w_g/∂X_{A,d}) e(r_g)`, e.g. `xck_<family>_r_o0` with `w := dw/dX` (total density, Libxc `zk`). The host owns the weight derivative. |
+
+Summed over atoms, the three classes cancel for each direction. The
+density matrices must be symmetric. For `cmgga_tau` at a real reference
+the paramagnetic current vanishes along any real displacement, so its
+gradient is that of `mgga_tau` with the same derivative arrays.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -186,6 +212,32 @@ cmake -S clib -B build -DXCKERNEL_FAMILIES=lda,gga,mgga_tau -DXCKERNEL_MAX_ORDER
 cmake --build build
 ```
 
+### The interface: derivative towers
+
+Every spatially varying operand is a component of a Cartesian derivative
+tower, named `<base>[_<spin>][_<pert>][_<axes>]` with the derivative axes
+sorted and empty for the value:
+
+| name | meaning |
+|---|---|
+| `chi` | collocation, one array `chi[k][u][g]` |
+| `Dchi` | `D chi`, for the gradient rows |
+| `rho_x`, `rho_xy`, `rho_xyz` | derivatives of the density |
+| `rho_a_p1_xx` | ∂²/∂x² of the α perturbed density of perturbation 1 |
+| `tau_p1`, `tau_x` | τ fields |
+| `jpx_a` | x component of the α paramagnetic current (a vector's component is part of its base, so a trailing axis string always means a derivative) |
+
+The tower components `k` run in the order 1, x, y, z, xx, xy, xz, yy,
+yz, zz, xxx, xxy, … , that of PySCF's `eval_ao(deriv=n)`. Each kernel
+exports the order it reads (`<name>_chi_order`) and its ordered
+per-point operands (`<name>_scal_names`); `manifest.json` lists both.
+
+Laplacians are never operands. The kernel forms `∇²χ`, `∂_d∇²χ`,
+`∇²ρ¹` and the like from the tower components, the basis-level ones once
+per grid block. Each formed operand takes the place of the single
+host-supplied array it replaces, so the number of GEMMs is unchanged.
+`manifest.json` records every such definition under `formed_in_kernel`.
+
 Generation takes a small fraction of the time needed to compile the
 emitted code. To produce a self-contained source tree for distribution
 (no Python required downstream), run the generator directly:
@@ -213,6 +265,9 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | quadratic-response σ (E[3]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-6 |
 | cubic-response σ (E[4]) | LDA/GGA | R | FD of Exc, both κ signs | ~1e-5 |
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
+| C kernels on the tower interface: `o1`, `o2` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | FD of Exc in D; FD of `o1` along D¹ | ~1e-13 |
+| C gradient kernels `g1` + `gg` + weight class | LDA/GGA/mGGA(τ,∇²ρ) | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
+| C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | GauXC Hessian assembly recipe | LDA/GGA/mGGA(tau) | R | contracted `geometric_hessian` | ~1e-16 |
 | GauXC Hessian emitted C++ | LDA/GGA/mGGA(tau) | R | SymPy, same operands | exact |
@@ -275,6 +330,7 @@ xckernel/
     spin.py          spin-resolved ingredients, seeds, component packing
     spin_kernel.py   open-shell tower, singlet/triplet parities
     geometric.py     nuclear derivatives incl. quadrature-grid response
+    gradient.py      the XC nuclear gradient as C-catalog rows/points
     strain.py        cell-deformation (strain) seeds from the master law
     london.py        explicit magnetic-field derivatives (London orbitals)
     noncollinear.py  locally collinear map: noncollinear/relativistic
@@ -296,7 +352,8 @@ xckernel/
     gauxcwriter.py   GauXC emitter: fixed-grid nuclear-Hessian kernels
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
-  catalog.py       the 169-kernel catalog + machine-readable manifests
+    tower.py         the derivative-tower interface of the C kernels
+  catalog.py       the 215-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/
