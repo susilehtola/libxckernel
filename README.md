@@ -76,9 +76,9 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **225 kernels**: 169
-named `xck_<family>_<case>_o<order>[_<parities>]` and 56 Fock-diagonal
-and nuclear-gradient kernels (below), spanning seven functional
+`catalog.py` enumerates, generates, and manifests **261 kernels**: 169
+named `xck_<family>_<case>_o<order>[_<parities>]` and 92 Fock-diagonal,
+nuclear-gradient and Fock-derivative kernels (below), spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
 gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
@@ -129,6 +129,22 @@ gradient holds for complex orbitals in a real basis. Its density matrix
 M is general (symmetric part Re P, antisymmetric part Im P, which carries
 the paramagnetic current), and its `g1` rows take `DTchi = Mᵀ chi` next
 to `Dchi = M chi`; its `gg` reads the current towers `jpx`, `jpx_y`, ….
+
+### Nuclear derivative of the Fock matrix
+
+For CPHF right-hand sides and nuclear Hessians, `dF/dX_{A,d}` splits into
+the same three classes, each computed one atom at a time with output
+`(3, nbf, nbf)`:
+
+| class | entry | how |
+|---|---|---|
+| basis | `xck_<family>_{r,ua,ub}_f1` | pass `chi`, `Dchi = D chi` (`Dchi_a` and `Dchi_b` for `ua`/`ub`, since dFᵅ/dX also responds to the β density) and `atom_mask`, an `int8[nbf]` flagging A's functions. The kernel forms the perturbed fields of the displacement itself. |
+| grid | `xck_<family>_{r,ua,ub}_fg` | pass the weights of A's points, `w := w·Mᴬ` (zero elsewhere). |
+| weight | `xck_<family>_<spin>_o1` | called with `w := dw/dX`. |
+
+Summed over atoms, the three classes vanish. These entries exist for
+every family except `cmgga_tau`, need the response order (`max_order >= 2`)
+and assume symmetric density matrices.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -269,6 +285,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
 | C kernels on the tower interface: `o1`, `o2` | all seven; `cmgga_tau` with complex orbitals | R + U | FD of Exc in D; FD of `o1` along D¹ | ~1e-12 |
 | C gradient kernels `g1` + `gg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
+| C Fock derivative `f1` + `fg` + weight class | all but `cmgga_tau` | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | geometric Hessian + grid response | LDA/GGA/mGGA | R + U | FD of gradients | ~1e-9 |
 | GauXC Hessian assembly recipe | LDA/GGA/mGGA(tau) | R | contracted `geometric_hessian` | ~1e-16 |
@@ -355,7 +372,7 @@ xckernel/
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
     tower.py         the derivative-tower interface of the C kernels
-  catalog.py       the 225-kernel catalog + machine-readable manifests
+  catalog.py       the 261-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/

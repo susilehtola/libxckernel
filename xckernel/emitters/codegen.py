@@ -116,6 +116,8 @@ _UHROW = re.compile(r"^Uh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
 _UTROW = re.compile(r"^UT(0|[123]|L)_(\w+)$")
 _UTHROW = re.compile(r"^UTh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
 _JPGRAD = re.compile(r"^jpgrad_(?:([ab])_)?([xyz])_([xyz])$")
+# atom-masked displaced collocation of the dF/dX basis class
+_MASKED = re.compile(r"^M(dchi|hess_chi|tchi|dlapl_chi)_(\w+?)_([xyz]{1,3})$")
 _D3RHO = re.compile(r"^d3rho_(?:([ab])_)?([xyz]{3})$")
 _GTAU = re.compile(r"^grad_tau_(?:([ab])_)?([xyz])$")
 _GLAPL = re.compile(r"^grad_lapl_rho_(?:([ab])_)?([xyz])$")
@@ -192,6 +194,10 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _UHROW.match(name)
     if m:
         return Operand(f"Uh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _MASKED.match(name)
+    if m:
+        return Operand(f"M{m.group(1)}[{m.group(3)}]", f"{m.group(2)}g"), \
+            "basis"
     m = _UTROW.match(name)
     if m:
         return Operand(f"UT{m.group(1)}", f"{m.group(2)}g"), "basis"

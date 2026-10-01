@@ -465,6 +465,70 @@ def check_matrix(lib, rep, fam, sysm):
         rep.check(f"{fam:9s} {spin:2s} o2 == d(o1)/dD . D1", F2, fd2, 1e-9)
 
 
+def check_fock_derivative(lib, rep, fam, spin, sysm):
+    """dF/dX: basis class (f1, atom mask), grid class (fg, w := w M^A)
+    and weight class (o1, w := dw/dX), each against FD of the o1 kernel
+    with that R-dependence isolated; their sum against moving the atom
+    completely; the translational sum rule."""
+    c0, p0 = sysm.centers, sysm.pts
+    w0 = sysm.weights(c0, p0)
+    Ma, Mb, _, _ = sysm.dms(fam)
+    o1 = CatalogEntry(fam, spin, 1).name
+    f1, fg = f"xck_{fam}_{spin}_f1", f"xck_{fam}_{spin}_fg"
+    T = colloc(c0, p0)
+
+    def F_at(centers, pts, w):
+        Tc = colloc(centers, pts)
+        return lib(o1, w=w, chi=Tc, **_matrix_ops(lib, o1, fam, spin, sysm,
+                                                  w, Tc, Ma, Mb))
+
+    towers = ({"Dchi": np.einsum("uv,kvg->kug", Ma + Mb, T)} if spin == "r"
+              else {"Dchi_a": np.einsum("uv,kvg->kug", Ma, T),
+                    "Dchi_b": np.einsum("uv,kvg->kug", Mb, T)})
+    ops_b = _matrix_ops(lib, f1, fam, spin, sysm, w0, T, Ma, Mb)
+    ops_g = _matrix_ops(lib, fg, fam, spin, sysm, w0, T, Ma, Mb)
+    ops_w = _matrix_ops(lib, o1, fam, spin, sysm, w0, T, Ma, Mb)
+    natom = sysm.natom
+    total = []
+    for A in range(natom):
+        mask = (BF_ATOM == A).astype(np.int8)
+        basis = lib(f1, w=w0, chi=T, atom_mask=mask, **towers, **ops_b)
+        grid = lib(fg, w=w0 * (sysm.parent == A), chi=T, **ops_g)
+        weight = np.stack([lib(o1, w=sysm.dweights(A, d), chi=T, **ops_w)
+                           for d in range(3)])
+        fdb, fdg, fdt = [], [], []
+        for d in range(3):
+            def Eb(h):
+                c = c0.copy()
+                c[A, d] += h
+                return F_at(c, p0, w0)
+
+            def Eg(h):
+                p = p0.copy()
+                p[sysm.parent == A, d] += h
+                return F_at(c0, p, w0)
+
+            def Et(h):
+                c, p = c0.copy(), p0.copy()
+                c[A, d] += h
+                p[sysm.parent == A, d] += h
+                return F_at(c, p, sysm.weights(c, p))
+            fdb.append(richardson(Eb))
+            fdg.append(richardson(Eg))
+            fdt.append(richardson(Et))
+        rep.check(f"{fam:9s} {spin:2s} A={A} f1 basis class vs FD", basis,
+                  np.stack(fdb), 1e-9)
+        rep.check(f"{fam:9s} {spin:2s} A={A} fg grid class vs FD", grid,
+                  np.stack(fdg), 1e-9)
+        total.append(basis + grid + weight)
+        rep.check(f"{fam:9s} {spin:2s} A={A} f1+fg+weight vs FD", total[-1],
+                  np.stack(fdt), 1e-9)
+    total = np.stack(total)
+    rep.check(f"{fam:9s} {spin:2s} dF/dX translational sum rule",
+              total.sum(0), np.zeros_like(total[0]), 1e-12,
+              scale=np.abs(total).max())
+
+
 def check_gradient(lib, rep, fam, spin, sysm):
     """spin 'r' or 'u'."""
     c0, p0 = sysm.centers, sysm.pts
@@ -572,6 +636,11 @@ def main():
         for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")
             check_matrix(lib, rep, fam, sysm)
+        from ..engine.geofock import FOCK_DERIV_FAMILIES
+        for fam in FOCK_DERIV_FAMILIES:
+            print(f"nuclear derivative of the Fock matrix: {fam}")
+            for spin in ("r", "ua"):
+                check_fock_derivative(lib, rep, fam, spin, sysm)
         for fam in gradient_families():
             print(f"nuclear gradient: {fam}")
             for spin in ("r", "u"):
