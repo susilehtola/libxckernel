@@ -122,6 +122,36 @@ def perturbed_field_terms(name: str, d: int, general: bool = False):
     return ch, [(c, a, b) for (a, b), c in acc.items() if c != 0]
 
 
+def mo_field_terms(name: str):
+    """The perturbed field ``name`` of a trial vector X in the occupied x
+    virtual space, P = C_occ X C_vir^T + C_vir X^T C_occ^T:
+
+        field(g) = sum_t c_t sum_i phi_o[a_t](i,g) Z[b_t](i,g),
+        Z[b](i,g) = sum_a X(i,a) phi_v[b](a,g),
+
+    returned as (channel, [(c_t, a_t, b_t)]) with a_t, b_t tower axis
+    strings of the occupied and virtual MO collocation."""
+    prim, ch = _primitive_for(name)
+    expr = sp.expand(prim.kernel(Orbital.make("u"), Orbital.make("v")))
+    acc: Counter = Counter()
+    for term in sp.Add.make_args(expr):
+        coeff, rest = term.as_coeff_Mul()
+        parts = {}
+        for base, e in rest.as_powers_dict().items():
+            info = _basis_parts(base)
+            if info is None or e != 1:
+                raise ValueError(f"field kernel not bilinear: {term}")
+            parts[info[0]] = info[1:]
+        (ku, au), (kv, av) = parts["u"], parts["v"]
+        # B(phi_i, phi_a) and B(phi_a, phi_i): the occupied orbital in either
+        # slot, the virtual one contracted with X
+        for (ko, ao), (kw, aw) in (((ku, au), (kv, av)), ((kv, av), (ku, au))):
+            for so, wo in _tower(ko, ao):
+                for sv, wv in _tower(kw, aw):
+                    acc[(so, sv)] += coeff * wo * wv
+    return ch, [(c, a, b) for (a, b), c in acc.items() if c != 0]
+
+
 # --- the basis class -----------------------------------------------------------
 
 def _masked(kind: str, ax: str, lbl: str, d: int) -> sp.Symbol:
