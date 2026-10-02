@@ -111,7 +111,8 @@ class CatalogEntry:
         if self.kind == "o2b":
             return CatalogEntry(self.family, self.spin, self.order,
                                 self.parities).name + "_batch"
-        if self.kind in ("g1", "gg", "f1", "fg"):
+        if self.kind in ("g1", "gg", "f1", "fg", "h2bb", "h2bg", "h2gg",
+                         "e1p"):
             return f"xck_{self.family}_{self.spin}_{self.kind}"
         parts = ["xck", self.family, self.spin, f"o{self.order}"]
         if self.parities:
@@ -142,6 +143,13 @@ class CatalogEntry:
                        "+dE/dX_{A,d}"),
                 "gg": ("XC nuclear gradient, grid class: per-point "
                        "w * d_d e(r_g), summed over the points of atom A"),
+                "h2bb": ("explicit XC nuclear Hessian, basis-basis rows, one "
+                         "atom B per call"),
+                "h2bg": ("explicit XC nuclear Hessian, basis-grid rows, one "
+                         "atom B per call"),
+                "h2gg": ("explicit XC nuclear Hessian, grid-grid, per point"),
+                "e1p": ("per-point energy-density derivative from the motion "
+                        "of one atom's functions (Hessian weight classes)"),
                 "o2b": ("linear-response contraction for a batch of "
                         "perturbations at one ground state"),
                 "f1": ("nuclear derivative of the XC Fock matrix "
@@ -186,6 +194,13 @@ def _one_index_entries(fam: str, max_order: int = 2) -> Iterator[CatalogEntry]:
         if polarized:
             for par in ((+1,), (-1,)):
                 yield CatalogEntry(fam, "st", 2, parities=par, kind="o2b")
+    from .engine.hessian import HESSIAN_FAMILIES
+    if fam in HESSIAN_FAMILIES and max_order >= 2:   # the nuclear Hessian
+        for kind in ("h2bb", "h2bg", "e1p"):
+            for spin in spins:
+                yield CatalogEntry(fam, spin, 2, kind=kind)
+        for spin in (("r", "u") if polarized else ("r",)):
+            yield CatalogEntry(fam, spin, 2, kind="h2gg")
     if fam in FOCK_DERIV_FAMILIES and max_order >= 2:
         for kind in ("f1", "fg"):
             for spin in spins:
@@ -430,6 +445,37 @@ def _kind_kernels(e: CatalogEntry):
         ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 2,
                                                   e.parities)))
         return [ck], ck, None
+    if e.kind in ("h2bb", "h2bg", "h2gg", "e1p"):
+        from .engine import hessian
+        from .engine.gradient import GENERAL_DM_FAMILIES
+        from .emitters.cbackend import scal_order
+        from .inputs.functional import Functional
+        func = Functional.of_family(e.family)
+        if e.kind == "h2gg":
+            exprs = [hessian.hessian_gg(e.family, e.spin, d, f)
+                     for d in range(3) for f in range(3)]
+            return ([collapse_pointwise(x, func) for x in exprs],
+                    collapse_pointwise(sp.Add(*exprs), func), None)
+        if e.kind == "e1p":
+            kis = [hessian.energy_eps_rows(e.family, e.spin, f)
+                   for f in range(3)]
+        else:
+            make = (hessian.hessian_bb if e.kind == "h2bb"
+                    else hessian.hessian_bg)
+            kis = [make(e.family, e.spin, d, f)
+                   for d in range(3) for f in range(3)]
+        whole = collapse(KernelIntegrand(functional=func,
+                                         index_pairs=[("u", "v")],
+                                         expr=sp.Add(*[k.expr for k in kis])))
+        computed = None
+        if e.kind == "h2bb":
+            from .engine import geofock
+            general = e.family in GENERAL_DM_FAMILIES
+            # row block r = 3 d + e: the perturbed fields of direction e
+            computed = {n: [geofock.perturbed_field_terms(n, r % 3, general)
+                            for r in range(9)]
+                        for n in scal_order(whole) if "_p1" in n}
+        return [collapse(k) for k in kis], whole, computed
     if e.kind in ("f1", "fg"):
         from .engine import geofock
         from .emitters.cbackend import scal_order
@@ -490,10 +536,10 @@ def _tower_params(layout, kind: str) -> List[Dict]:
 
 
 def _tower_manifest(m: Dict, blocks, scal_ck, kind: str,
-                    computed=None) -> Dict:
+                    computed=None, rename=None) -> Dict:
     """Overwrite a manifest entry's operands with the C ABI's."""
     from .emitters.cbackend import MASKED_KINDS, kernel_layout
-    layout = kernel_layout(blocks, scal_ck, kind, computed)
+    layout = kernel_layout(blocks, scal_ck, kind, computed, rename)
     m["params"] = _tower_params(layout, kind)
     if kind in MASKED_KINDS:
         m["params"].insert(len([p for p in m["params"]
@@ -517,6 +563,14 @@ def abi_kind(e: CatalogEntry) -> str:
         return "giao"
     if e.kind == "o2b":
         return "o2b"
+    general = e.family in GENERAL_DM_FAMILIES
+    if e.kind == "h2bb":
+        return "h2bb" + ("c" if general else "") + \
+            ("" if e.spin == "r" else "u")
+    if e.kind in ("h2bg", "e1p"):
+        return e.kind + ("c" if general else "")
+    if e.kind == "h2gg":
+        return "h2gg"
     if e.kind == "g1" and e.family in GENERAL_DM_FAMILIES:
         return "g1c"
     if e.kind == "f1":
@@ -530,12 +584,16 @@ def _emit_kind(e: CatalogEntry):
     from .emitters.cbackend import ABI_KINDS, emit_tower_cpp, emit_tower_hpp
     blocks, scal_ck, computed = _kind_kernels(e)
     abi = abi_kind(e)
+    # the basis-basis rows of an unrestricted channel read that channel's
+    # contracted towers
+    rename = ({"Dchi": f"Dchi_{e.spin[1]}", "DTchi": f"DTchi_{e.spin[1]}"}
+              if e.kind == "h2bb" and e.spin in ("ua", "ub") else None)
     if abi == "o2b":
         from .emitters.cbackend import emit_batch_hpp
         hpp = emit_batch_hpp(blocks[0], e.name)
     else:
-        hpp = emit_tower_hpp(blocks, scal_ck, e.name, abi, computed)
-    cpp = emit_tower_cpp(blocks, scal_ck, e.name, abi, computed)
+        hpp = emit_tower_hpp(blocks, scal_ck, e.name, abi, computed, rename)
+    cpp = emit_tower_cpp(blocks, scal_ck, e.name, abi, computed, rename)
     m: Dict = {
         "name": e.name, "description": e.description,
         "family": e.family, "spin": e.spin, "order": e.order, "batch": False,
@@ -551,7 +609,7 @@ def _emit_kind(e: CatalogEntry):
             "max_derivative_order": e.order,
         },
     }
-    _tower_manifest(m, blocks, scal_ck, abi, computed)
+    _tower_manifest(m, blocks, scal_ck, abi, computed, rename)
     if e.kind == "diag":
         m["convention"] = "out[u] += F_uu, the diagonal of " + \
             CatalogEntry(e.family, e.spin, 1).name
@@ -573,6 +631,9 @@ def _emit_kind(e: CatalogEntry):
                 f" Unrestricted: Dchi is formed with the {e.spin[1]}-channel "
                 "spin density matrix and the output is that channel's "
                 "contribution; the gradient is the sum of the ua and ub calls.")
+    elif e.kind in ("h2bb", "h2bg", "h2gg", "e1p"):
+        m["convention"] = _HESSIAN_CONVENTION[e.kind]
+        m["hessian_classes"] = _HESSIAN_CLASSES
     elif e.kind == "o2b":
         single = CatalogEntry(e.family, e.spin, 2, e.parities).name
         m["convention"] = (
@@ -620,6 +681,46 @@ def _emit_kind(e: CatalogEntry):
             "masking in the kernel).")
     m["gradient_classes"] = _GRADIENT_CLASSES
     return hpp, cpp, m
+
+
+#: per-kind conventions of the explicit nuclear Hessian
+_HESSIAN_CONVENTION = {
+    "h2bb": ("out[((d*3 + e)*nbf) + u] += row u of d2E/dX_{A,d} dY_{B,e}, "
+             "basis-basis class at a fixed grid, for the atom B whose "
+             "functions atom_mask flags: one call per atom B, the host sums "
+             "rows over the functions u on each atom A. chi is the plain "
+             "collocation tower, Dchi = D chi, D (nbf, nbf) the (row "
+             "channel's) density matrix; the kernel forms D (mask o d chi) "
+             "and the perturbed fields of B's displacement itself. "
+             "Unrestricted: call ua and ub and add."),
+    "h2bg": ("out[((d*3 + e)*nbf) + u] += row u of the basis (A, d) x grid "
+             "(B, e) class: call with w := w M^B (the weights of B's points), "
+             "sum rows over A's functions; the grid-basis class is the "
+             "transpose (A <-> B, d <-> e). Unrestricted: ua + ub."),
+    "h2gg": ("out[(d*3 + e)*ng + g] += w_g d_d d_e e(r_g): the grid-grid "
+             "class; its (A, A) block is the sum over A's points, other "
+             "blocks are zero."),
+    "e1p": ("out[e*ng + g] += d_e e(r_g) from the motion of the functions "
+            "atom_mask flags (no weight factor): with the grid part (the gg "
+            "kernel with w = 1 at the atom's points) this is eps^B(g) of the "
+            "weight classes. Unrestricted: ua + ub."),
+}
+
+#: the explicit XC nuclear Hessian, all classes
+_HESSIAN_CLASSES = {
+    "formula": ("d2E/dX_{A,d} dY_{B,e} = BB + BG + GB + GG + sum_g [ "
+                "w^{AB}_g e_g + w^A_g eps^B_g + w^B_g eps^A_g ]"),
+    "BB": "xck_<family>_<spin>_h2bb (atom mask B), rows summed over A",
+    "BG": ("xck_<family>_<spin>_h2bg (w := w M^B), rows summed over A; GB "
+           "is the transpose"),
+    "GG": "xck_<family>_<r|u>_h2gg, per point summed over A's points (A = B)",
+    "eps": ("eps^B_e(g) = xck_<family>_<spin>_e1p (mask B) + [parent(g) = B] "
+            "xck_<family>_<r|u>_gg with w = 1"),
+    "weight": ("host-owned: w^{AB} = d2w/dX_A dY_B and w^A = dw/dX_A "
+               "contracted with e = rho zk and eps"),
+    "cphf": ("the density response is the host's: dF/dX via f1 + fg + o1 "
+             "(w := dw/dX), and the o2 kernels"),
+}
 
 
 #: the dispatch table of the XC nuclear gradient

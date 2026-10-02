@@ -112,7 +112,7 @@ BASIS = [(0, 0.9, (0, 0, 0)), (0, 1.3, (1, 0, 0)), (1, 0.7, (0, 1, 0)),
          (1, 1.1, (0, 0, 1)), (2, 0.8, (1, 1, 0)), (2, 1.2, (0, 0, 0)),
          (2, 1.0, (0, 1, 1))]
 BF_ATOM = np.array([b[0] for b in BASIS])
-COMPS = components(3)
+COMPS = components(4)
 
 
 def _colloc_funcs():
@@ -153,32 +153,22 @@ def _subsets(axes):
         yield a, b
 
 
-def fields(D, T, order=3):
-    """The density tower (Leibniz rule), the tau tower to first order and
-    the paramagnetic-current towers jp[i] to first order. D need not be
-    symmetric: its antisymmetric part (Im P) carries the current, with the
-    engine's convention jp_i = sum_uv D_uv (chi_u d_i chi_v - d_i chi_u
-    chi_v) / 2."""
+def fields(D, T, order=4):
+    """The density tower to ``order`` and the tau and paramagnetic-current
+    towers to ``order - 2`` (Leibniz rule). D need not be symmetric: its
+    antisymmetric part (Im P) carries the current, with the engine's
+    convention jp_i = sum_uv D_uv (chi_u d_i chi_v - d_i chi_u chi_v) / 2."""
     t = lambda ax: T[comp_index(ax)]
-    rho = np.stack([sum(np.einsum("uv,ug,vg->g", D, t(a), t(b))
-                        for a, b in _subsets(ax))
+    pair = lambda a, b: np.einsum("uv,ug,vg->g", D, t(a), t(b))
+    rho = np.stack([sum(pair(a, b) for a, b in _subsets(ax))
                     for ax in components(order)])
-    tau = [0.5 * sum(np.einsum("uv,ug,vg->g", D, t(i), t(i)) for i in _AX)]
-    for k in _AX:
-        tau.append(0.5 * sum(np.einsum("uv,ug,vg->g", D, t(k + i), t(i))
-                             + np.einsum("uv,ug,vg->g", D, t(i), t(k + i))
-                             for i in _AX))
-    jp = []
-    for i in _AX:
-        comp = [0.5 * (np.einsum("uv,ug,vg->g", D, t(""), t(i))
-                       - np.einsum("uv,ug,vg->g", D, t(i), t("")))]
-        for d in _AX:
-            comp.append(0.5 * (np.einsum("uv,ug,vg->g", D, t(d), t(i))
-                               + np.einsum("uv,ug,vg->g", D, t(""), t(d + i))
-                               - np.einsum("uv,ug,vg->g", D, t(d + i), t(""))
-                               - np.einsum("uv,ug,vg->g", D, t(i), t(d))))
-        jp.append(np.stack(comp))
-    return {"rho": rho, "tau": np.stack(tau), "jp": np.stack(jp)}
+    low = components(max(order - 2, 1))
+    tau = np.stack([0.5 * sum(pair(a + i, b + i) for a, b in _subsets(ax)
+                              for i in _AX) for ax in low])
+    jp = np.stack([np.stack([0.5 * sum(pair(a, b + i) - pair(a + i, b)
+                                       for a, b in _subsets(ax))
+                             for ax in low]) for i in _AX])
+    return {"rho": rho, "tau": tau, "jp": jp}
 
 
 def _tau_tilde(f):
@@ -358,6 +348,28 @@ class System:
         dwdr = -2 * self.beta * (self.pts[:, d][:, None]
                                  - self.centers[None, :, d]).sum(1) * w
         return dwdC + (self.parent == A) * dwdr
+
+    def dw(self, centers, pts):
+        """dw_g/dX_{A,d}, (natom, 3, ng), for points riding their parents."""
+        w = self.weights(centers, pts)
+        v = pts[:, None, :] - centers[None, :, :]            # (ng, C, 3)
+        P = np.eye(self.natom)[self.parent]                  # (ng, A)
+        sA = 2 * (P[:, :, None] * v.sum(1)[:, None, :] - v)  # (ng, A, 3)
+        return np.transpose(-self.beta * sA * w[:, None, None], (1, 2, 0))
+
+    def d2w(self, centers, pts):
+        """d2w_g/dX_{A,d} dX_{B,e}, (natom, 3, natom, 3, ng)."""
+        w = self.weights(centers, pts)
+        v = pts[:, None, :] - centers[None, :, :]
+        n = self.natom
+        P = np.eye(n)[self.parent]
+        sA = 2 * (P[:, :, None] * v.sum(1)[:, None, :] - v)  # (ng, A, 3)
+        sAB = 2 * (n * P[:, :, None] * P[:, None, :] - P[:, :, None]
+                   - P[:, None, :] + np.eye(n)[None])        # (ng, A, B)
+        out = (self.beta ** 2 * np.einsum("gad,gbe->gadbe", sA, sA)
+               - self.beta * np.einsum("gab,de->gadbe", sAB, np.eye(3)))
+        return np.transpose(out * w[:, None, None, None, None],
+                            (1, 2, 3, 4, 0))
 
     def energy(self, fam, spin, centers_a, centers_b, pts, w, Da=None,
                Db=None):
@@ -619,6 +631,167 @@ def check_giao(lib, rep, fam, spin, sysm, seed=7):
               scale=np.abs(K).max())
 
 
+def _gradient_classes(lib, fam, spin, sysm, centers, pts, w, Ma, Mb):
+    """(basis (natom, 3), grid (natom, 3), e (ng,), T, ops) at a geometry,
+    from the g1/gg kernels -- the reference the Hessian is a derivative
+    of. spin 'r' or 'u'."""
+    T = colloc(centers, pts)
+    general = fam in GENERAL_DM
+    if spin == "r":
+        f = fields(Ma + Mb, T)
+        ops = tower_ops(f)
+        e = energy_density(fam, "r", f)
+        chans = [("r", Ma + Mb)]
+        gg = f"xck_{fam}_r_gg"
+    else:
+        fa, fb = fields(Ma, T), fields(Mb, T)
+        ops = tower_ops(fa, fb)
+        e = energy_density(fam, "u", fa, fb)
+        chans = [("ua", Ma), ("ub", Mb)]
+        gg = f"xck_{fam}_u_gg"
+    vnames = set()
+    for k in ([f"xck_{fam}_{c}_{x}" for c, _ in chans
+               for x in ("g1", "h2bb", "h2bg", "e1p")]
+              + [gg, f"xck_{fam}_{'r' if spin == 'r' else 'u'}_h2gg"]):
+        vnames |= {n for n in lib.scal_names(k) if n.startswith("v")}
+    ops.update(libxc_arrays(sorted(vnames), fam, spin,
+                            *([f] if spin == "r" else [fa, fb])))
+    basis = np.zeros((sysm.natom, 3))
+    for c, M in chans:
+        extra = ({"DTchi": np.einsum("vu,kvg->kug", M, T)} if general else {})
+        rows = lib(f"xck_{fam}_{c}_g1", w=w, chi=T,
+                   Dchi=np.einsum("uv,kvg->kug", M, T), **extra, **ops)
+        for A in range(sysm.natom):
+            basis[A] += rows[:, BF_ATOM == A].sum(1)
+    pg = lib(gg, w=w, **ops)
+    grid = np.array([pg[:, sysm.parent == A].sum(1)
+                     for A in range(sysm.natom)])
+    return basis, grid, e, T, ops, chans
+
+
+def check_hessian(lib, rep, fam, spin, sysm):
+    """The explicit nuclear Hessian: each class against FD of the matching
+    gradient class with that R-dependence isolated, the full Hessian
+    (weight classes included) against FD of the full gradient, and the
+    translational sum rule. spin 'r' or 'u'."""
+    c0, p0 = sysm.centers, sysm.pts
+    w = sysm.weights(c0, p0)
+    Ma, Mb, _, _ = sysm.dms(fam)
+    general = fam in GENERAL_DM
+    n = sysm.natom
+    basis0, grid0, e0, T, ops, chans = _gradient_classes(
+        lib, fam, spin, sysm, c0, p0, w, Ma, Mb)
+    s = "r" if spin == "r" else "u"
+
+    def towers(c, M):
+        if spin == "r":
+            t = {"Dchi": np.einsum("uv,kvg->kug", M, T)}
+            if general:
+                t["DTchi"] = np.einsum("vu,kvg->kug", M, T)
+            return t
+        t = {"Dchi_a": np.einsum("uv,kvg->kug", Ma, T),
+             "Dchi_b": np.einsum("uv,kvg->kug", Mb, T)}
+        if general:
+            t["DTchi_a"] = np.einsum("vu,kvg->kug", Ma, T)
+            t["DTchi_b"] = np.einsum("vu,kvg->kug", Mb, T)
+        return t
+
+    def rows_sum(rows):                         # (3, 3, nbf) -> (A, 3, 3)
+        return np.array([rows[..., BF_ATOM == A].sum(-1) for A in range(n)])
+
+    BB = np.zeros((n, n, 3, 3))                 # [A, B, d, e]
+    BG = np.zeros((n, n, 3, 3))
+    eps = np.zeros((n, 3, len(w)))
+    gg1 = lib(f"xck_{fam}_{s}_gg", w=np.ones_like(w), **ops)
+    for B in range(n):
+        mask = (BF_ATOM == B).astype(np.int8)
+        for c, M in chans:
+            dt = {"DTchi": np.einsum("vu,kvg->kug", M, T)} if general else {}
+            own = {"Dchi": np.einsum("uv,kvg->kug", M, T), **dt}
+            BB[:, B] += rows_sum(lib(f"xck_{fam}_{c}_h2bb", w=w, chi=T,
+                                     D=M, atom_mask=mask, **towers(c, M),
+                                     **ops))
+            BG[:, B] += rows_sum(lib(f"xck_{fam}_{c}_h2bg",
+                                     w=w * (sysm.parent == B), chi=T,
+                                     **own, **ops))
+            eps[B] += lib(f"xck_{fam}_{c}_e1p", w=w, chi=T, atom_mask=mask,
+                          **own, **ops)
+        eps[B] += gg1 * (sysm.parent == B)
+    GG = lib(f"xck_{fam}_{s}_h2gg", w=w, **ops)
+    GGA = np.array([GG[..., sysm.parent == A].sum(-1) for A in range(n)])
+
+    def fd(move):
+        """[B, e] -> FD of (basis, grid, total gradient) under move(B, e)."""
+        out = np.zeros((3, n, 3, n, 3))         # [class, A, d, B, e]
+        for B in range(n):
+            for e in range(3):
+                def G(h):
+                    c, p = move(B, e, h)
+                    wt = sysm.weights(c, p) if move is full else w
+                    b, g, en, *_ = _gradient_classes(lib, fam, spin, sysm, c,
+                                                     p, wt, Ma, Mb)
+                    wcl = np.einsum("adg,g->ad", sysm.dw(c, p), en)
+                    return np.stack([b, g, b + g + wcl])
+                out[:, :, :, B, e] = richardson(G)
+        return out
+
+    def basis_move(B, e, h):
+        c = c0.copy()
+        c[B, e] += h
+        return c, p0
+
+    def grid_move(B, e, h):
+        p = p0.copy()
+        p[sysm.parent == B, e] += h
+        return c0, p
+
+    def full(B, e, h):
+        c, p = c0.copy(), p0.copy()
+        c[B, e] += h
+        p[sysm.parent == B, e] += h
+        return c, p
+
+    lab = f"{fam:9s} {spin}"
+    fb = fd(basis_move)
+    fg = fd(grid_move)
+    as_adbe = lambda X: np.transpose(X, (0, 2, 1, 3))   # [A,B,d,e] -> [A,d,B,e]
+    rep.check(f"{lab} h2bb == d(g1)/d(basis)", as_adbe(BB), fb[0], 1e-9)
+    rep.check(f"{lab} h2bg == d(g1)/d(grid)", as_adbe(BG), fg[0], 1e-9)
+    GB = np.transpose(BG, (1, 0, 3, 2))                  # [A,B,d,e]
+    rep.check(f"{lab} h2bg^T == d(gg)/d(basis)", as_adbe(GB), fb[1], 1e-9)
+    GGfull = np.zeros((n, n, 3, 3))
+    for A in range(n):
+        GGfull[A, A] = GGA[A]
+    rep.check(f"{lab} h2gg == d(gg)/d(grid)", as_adbe(GGfull), fg[1], 1e-9)
+
+    # eps (basis part) against FD of the energy density
+    epsb = eps - np.stack([gg1 * (sysm.parent == B) for B in range(n)])
+    fe = np.zeros_like(epsb)
+    for B in range(n):
+        for e in range(3):
+            def En(h):
+                c, _ = basis_move(B, e, h)
+                return _gradient_classes(lib, fam, spin, sysm, c, p0, w, Ma,
+                                         Mb)[2]
+            fe[B, e] = richardson(En)
+    rep.check(f"{lab} e1p == d(e)/d(basis)", epsb, fe, 1e-9)
+
+    # the full Hessian, weight classes included
+    dw, d2w = sysm.dw(c0, p0), sysm.d2w(c0, p0)
+    H = BB + BG + GB + GGfull
+    H += np.einsum("adbeg,g->abde", d2w, e0)
+    H += np.einsum("adg,beg->abde", dw, eps)
+    H += np.einsum("beg,adg->abde", dw, eps)
+    ff = fd(full)
+    rep.check(f"{lab} full Hessian == d(gradient)/dX", as_adbe(H), ff[2],
+              1e-9)
+    rep.check(f"{lab} Hessian symmetric", as_adbe(H),
+              np.transpose(as_adbe(H), (2, 3, 0, 1)), 1e-11,
+              scale=np.abs(H).max())
+    rep.check(f"{lab} Hessian translational sum rule", H.sum(1),
+              np.zeros((n, 3, 3)), 1e-11, scale=np.abs(H).max())
+
+
 def check_gradient(lib, rep, fam, spin, sysm):
     """spin 'r' or 'u'."""
     c0, p0 = sysm.centers, sysm.pts
@@ -738,6 +911,11 @@ def main():
             print(f"nuclear derivative of the Fock matrix: {fam}")
             for spin in ("r", "ua"):
                 check_fock_derivative(lib, rep, fam, spin, sysm)
+        from ..engine.hessian import HESSIAN_FAMILIES
+        for fam in HESSIAN_FAMILIES:
+            print(f"nuclear Hessian: {fam}")
+            for spin in ("r", "u"):
+                check_hessian(lib, rep, fam, spin, sysm)
         for fam in gradient_families():
             print(f"nuclear gradient: {fam}")
             for spin in ("r", "u"):
