@@ -140,7 +140,9 @@ class Library:
             k = ctypes.c_char_p.in_dll(self._dll, f"{name}_kind").value.decode()
         except ValueError:
             return _kind(name)
-        return {"g1c": "g1", "f1u": "f1", "f1c": "f1", "f1cu": "f1"}.get(k, k)
+        return {"g1c": "g1", "f1u": "f1", "f1c": "f1", "f1cu": "f1",
+                "h2bbu": "h2bb", "h2bbc": "h2bb", "h2bbcu": "h2bb",
+                "h2bgc": "h2bg", "e1pc": "e1p"}.get(k, k)
 
     def _has(self, symbol: str) -> bool:
         try:
@@ -151,7 +153,7 @@ class Library:
 
     def __call__(self, name: str, *, w, chi=None, Dchi=None, DTchi=None,
                  Dchi_a=None, Dchi_b=None, DTchi_a=None, DTchi_b=None,
-                 atom_mask=None, bf_centers=None, out=None,
+                 D=None, atom_mask=None, bf_centers=None, out=None,
                  **operands) -> np.ndarray:
         """Call a kernel with named operands; returns ``out`` (accumulated
         into when given): (nbf, nbf), (nbf,) for *_o1_diag, (3, nbf) for
@@ -177,12 +179,12 @@ class Library:
         args = [ctypes.c_int64(ng)]
         keep = []                       # the converted towers, alive for the call
         nbf = None
-        towers = [] if kind == "gg" else ["chi"]
+        towers = [] if kind in ("gg", "h2gg") else ["chi"]
         if kind == "g1":
             towers.append("Dchi")
             if self._has(f"{name}_DTchi_order"):
                 towers.append("DTchi")
-        if kind == "f1":
+        if kind in ("f1", "h2bb", "h2bg", "e1p"):
             for t in ("Dchi", "Dchi_a", "Dchi_b", "DTchi", "DTchi_a",
                       "DTchi_b"):
                 if self._has(f"{name}_{t}_order"):
@@ -205,7 +207,13 @@ class Library:
                     args.append(ctypes.c_int64(nx))
             keep.append(val)
             args.append(val.ctypes.data_as(_P))
-        if kind == "f1":
+        if kind == "h2bb":
+            dm = np.ascontiguousarray(D, dtype=np.float64)
+            if dm.shape != (nbf, nbf):
+                raise ValueError(f"{name}: D must be ({nbf}, {nbf})")
+            keep.append(dm)
+            args.append(dm.ctypes.data_as(_P))
+        if kind in ("f1", "h2bb", "e1p"):
             mask = np.ascontiguousarray(atom_mask, dtype=np.int8)
             if mask.shape != (nbf,):
                 raise ValueError(f"{name}: atom_mask must be ({nbf},) int8")
@@ -219,7 +227,9 @@ class Library:
             args.append(cen.ctypes.data_as(_P))
         shape = {"matrix": (nbf, nbf), "diag": (nbf,), "g1": (3, nbf),
                  "gg": (3, ng), "f1": (3, nbf, nbf), "fg": (3, nbf, nbf),
-                 "giao": (3, nbf, nbf), "o2b": (nx, nbf, nbf)}[kind]
+                 "giao": (3, nbf, nbf), "o2b": (nx, nbf, nbf),
+                 "h2bb": (3, 3, nbf), "h2bg": (3, 3, nbf), "h2gg": (3, 3, ng),
+                 "e1p": (3, ng)}[kind]
         out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
         fn = getattr(self._dll, name)
         fn.restype = ctypes.c_int

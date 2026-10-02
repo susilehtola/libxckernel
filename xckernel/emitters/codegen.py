@@ -116,6 +116,12 @@ _UHROW = re.compile(r"^Uh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
 _UTROW = re.compile(r"^UT(0|[123]|L)_(\w+)$")
 _UTHROW = re.compile(r"^UTh_(\w+?)_(xx|xy|xz|yy|yz|zz)$")
 _JPGRAD = re.compile(r"^jpgrad_(?:([ab])_)?([xyz])_([xyz])$")
+# generic tower operands of the nuclear Hessian: collocation T, atom-masked
+# collocation MT, D-contracted rows R (RT: D^T), masked-contracted rows
+# RM = D (mask o d chi) (RMT: D^T), and field-tower components by their
+# ABI names (rho_xy, tau_a_xz, jpx_y)
+_TOWER_BASIS = re.compile(r"^(T|MT|R|RT|RM|RMT)_(\w)_([xyz]*)$")
+_TOWER_FIELD = re.compile(r"^(?:rho|tau|jp[xyz])(?:_[ab])?_[xyz]+$")
 # atom-masked displaced collocation of the dF/dX basis class
 _MASKED = re.compile(r"^M(dchi|hess_chi|tchi|dlapl_chi)_(\w+?)_([xyz]{1,3})$")
 _D3RHO = re.compile(r"^d3rho_(?:([ab])_)?([xyz]{3})$")
@@ -194,6 +200,12 @@ def _classify(name: str) -> Tuple[Operand, str]:
     m = _UHROW.match(name)
     if m:
         return Operand(f"Uh[{m.group(2)}]", f"{m.group(1)}g"), "basis"
+    m = _TOWER_BASIS.match(name)
+    if m:
+        return Operand(f"{m.group(1)}[{m.group(3)}]", f"{m.group(2)}g"), \
+            "basis"
+    if _TOWER_FIELD.match(name):
+        return Operand(name, "g"), f"gscalar:{name}"
     m = _MASKED.match(name)
     if m:
         return Operand(f"M{m.group(1)}[{m.group(3)}]", f"{m.group(2)}g"), \

@@ -78,9 +78,21 @@ def is_masked(code: str) -> bool:
     return code.startswith("M")
 
 
+def contraction(code: str):
+    """'D' or 'DT' for a masked-contracted row D (mask o d chi) (RM) or
+    D^T (mask o d chi) (RMT), else None."""
+    m = re.match(r"RM(T?)\[", code)
+    return None if not m else ("DT" if m.group(1) else "D")
+
+
 def basis_operand(code: str) -> Tuple[str, Combo]:
     """(tower array, combination of components) of an engine basis code;
     atom-masked codes (is_masked) map like their unmasked counterparts."""
+    m = re.fullmatch(r"(T|MT|R|RT|RM|RMT)\[([xyz]*)\]", code)
+    if m:
+        kind, ax = m.groups()
+        arr = {"R": "Dchi", "RT": "DTchi"}.get(kind, "chi")
+        return arr, [(ax, 1)]
     m = re.fullmatch(r"R(chi|dchi|lapl_chi)\[(\d)\](?:\[(\d)\])?", code)
     if m:
         kind, _, c = m.groups()
@@ -151,6 +163,9 @@ def scalar_operand(name: str) -> List[Tuple[str, int]]:
     """Tower names and weights of an engine per-point operand (Libxc
     derivative arrays excluded): a single entry with weight 1 for a plain
     rename, several for a combination the kernel forms."""
+    if re.fullmatch(r"(?:rho|tau|jp[xyz])(?:_[ab])?_[xyz]+", name):
+        # already a tower component (the Hessian's field derivatives)
+        return [(name, 1)]
     m = re.fullmatch(r"rg_([xyz])", name)
     if m:
         # grid coordinates: a vector, its component in the base name
@@ -198,7 +213,7 @@ class Layout:
     (fields first, as in scal_order); libxc: the derivative arrays."""
 
     def __init__(self, internal_fields: List[str], libxc: List[str],
-                 basis_codes, computed=()):
+                 basis_codes, computed=(), rename=None):
         #: per-point operands the kernel computes itself (not passed)
         self.computed = [n for n in internal_fields if n in set(computed)]
         internal_fields = [n for n in internal_fields if n not in self.computed]
@@ -214,8 +229,13 @@ class Layout:
                 entry.append((abi.index(comp), wt))
             self.field_map[n] = entry
         self.fields = abi
-        #: engine basis code -> (array, combo)
-        self.basis = {c: basis_operand(c) for c in sorted(basis_codes)}
+        #: engine basis code -> (array, combo); `rename` maps tower arrays
+        #: to a kernel's own names (the row channel's Dchi_a, ...)
+        rename = rename or {}
+        self.basis = {}
+        for c in sorted(basis_codes):
+            arr, combo = basis_operand(c)
+            self.basis[c] = (rename.get(arr, arr), combo)
         self.orders: Dict[str, int] = {}
         for arr, combo in self.basis.values():
             k = max(len(ax) for ax, _ in combo)
@@ -233,7 +253,8 @@ class Layout:
     def derived_basis(self) -> List[str]:
         return [c for c, (_, combo) in self.basis.items()
                 if not is_component(combo) or is_masked(c)
-                or center_axis(c) is not None]
+                or center_axis(c) is not None
+                or contraction(c) is not None]
 
     def require(self, array: str, order: int):
         self.orders[array] = max(self.orders.get(array, 0), order)
@@ -250,7 +271,9 @@ class Layout:
             out[c] = " + ".join((f"{wt}*" if wt != 1 else "")
                                 + (f"{arr}_{ax}" if ax else arr)
                                 for ax, wt in combo)
-            if is_masked(c):
+            if contraction(c) is not None:
+                out[c] = f"{contraction(c)} . (atom_mask * ({out[c]}))"
+            elif is_masked(c):
                 out[c] = f"atom_mask * ({out[c]})"
             if center_axis(c) is not None:
                 out[c] = f"bf_centers[{AXES[center_axis(c)]}] * ({out[c]})"

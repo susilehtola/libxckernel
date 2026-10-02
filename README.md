@@ -76,9 +76,10 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **267 kernels**: 169
-named `xck_<family>_<case>_o<order>[_<parities>]` and 98 Fock-diagonal,
-nuclear-gradient and Fock-derivative kernels (below), spanning seven functional
+`catalog.py` enumerates, generates, and manifests **379 kernels**: 169
+named `xck_<family>_<case>_o<order>[_<parities>]` and 210 Fock-diagonal,
+batched-response, nuclear-gradient, Fock-derivative and nuclear-Hessian
+kernels (below), spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
 gauge-corrected τ̃ = τ − j²ₚ/2ρ), and `hmgga` (density-Hessian η of
@@ -159,6 +160,37 @@ all seven families and need the response order (`max_order >= 2`). The
 density matrices are symmetric, except for `cmgga_tau` with complex
 orbitals: its `f1` kernels also take the Mᵀ-contracted towers `DTchi`
 (`DTchi_a`, `DTchi_b`).
+
+### Nuclear Hessian
+
+The explicit second derivative of the XC energy at fixed density, with
+the full quadrature response:
+
+    d²E/dX_{A,d} dY_{B,e} = BB + BG + GB + GG
+                            + Σ_g [ wᴬᴮ e + wᴬ εᴮ + wᴮ εᴬ ]
+
+εᴮ(g) is the derivative of the energy density at point g for atom B, and
+wᴬ, wᴬᴮ are the first and second weight derivatives, which the host
+supplies. All seven families, restricted and unrestricted (call `ua`
+and `ub` and add); generated with `max_order >= 2`.
+
+| class | entry | how |
+|---|---|---|
+| BB (basis-basis) | `xck_<family>_{r,ua,ub}_h2bb` | one call per atom B: `chi`, `Dchi` (`Dchi_a`, `Dchi_b`), the row channel's `D (nbf, nbf)` and B's `atom_mask`; output rows `(3, 3, nbf)`, summed by the host over the functions of each atom A. The kernel forms `D (mask∘∂χ)` and B's perturbed fields itself. |
+| BG (basis A, grid B) | `xck_<family>_{r,ua,ub}_h2bg` | `w := w·Mᴮ`; rows `(3, 3, nbf)` summed over A's functions. GB is its transpose. |
+| GG (grid-grid) | `xck_<family>_{r,u}_h2gg` | per point `(3, 3, ng)`; its (A, A) block is the sum over A's points. |
+| εᴮ | `xck_<family>_{r,ua,ub}_e1p` + `gg` | `e1p` (B's `atom_mask`, `(3, ng)`) is the basis part; add the `gg` output with `w = 1` at B's points. |
+
+The CPHF part of an analytic Hessian comes from the `f1`/`fg` and `o2`
+kernels. The manifest's `hessian_classes` entry restates the assembly.
+
+### Batched linear response
+
+`xck_<family>_{r,ua,ub}_o2_batch` and `xck_<family>_st_o2_{p,m}_batch`
+apply the linear response to `nx` perturbations at one ground state, with
+output `(nx, nbf, nbf)`. The perturbed operands (`*_p1*`, listed in the
+manifest's `batched_operands`) point to `(nx, npts)` arrays, the rest are
+shared.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -270,6 +302,13 @@ per grid block. Each formed operand takes the place of the single
 host-supplied array it replaces, so the number of GEMMs is unchanged.
 `manifest.json` records every such definition under `formed_in_kernel`.
 
+Every kernel also exports its ABI kind (`<name>_kind`: `"matrix"`,
+`"diag"`, `"g1"`, `"f1u"`, `"h2bb"`, ...), output rank and shape
+(`<name>_out_rank`, `<name>_out_shape`), and `xckernel.h` declares an
+index of the build, `xckernel_kernels[]` of `{name, kind, order,
+out_rank, out_shape}`, so a host can dispatch without parsing
+signatures.
+
 Generation takes a small fraction of the time needed to compile the
 emitted code. To produce a self-contained source tree for distribution
 (no Python required downstream), run the generator directly:
@@ -299,6 +338,8 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | geometric gradient + grid response | LDA/GGA/mGGA | R + U | FD of Exc | ~1e-10 |
 | C kernels on the tower interface: `o1`, `o2` | all seven; `cmgga_tau` with complex orbitals | R + U | FD of Exc in D; FD of `o1` along D¹ | ~1e-12 |
 | C gradient kernels `g1` + `gg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
+| C nuclear Hessian (all classes, weight terms included) | all seven | R + U | FD of the matching gradient class; FD of the full gradient; translational sum rule | ~1e-11; ~1e-15 |
+| C batched response `o2_batch` | all seven | R + U + spin-adapted | nx single `o2` calls | ~1e-13 |
 | C Fock derivative `f1` + `fg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | C London-orbital kernels `giao` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | NumPy GIAO kernels (FD-validated in `london_validate`); antisymmetry | ~1e-15 |
@@ -365,6 +406,8 @@ xckernel/
     spin_kernel.py   open-shell tower, singlet/triplet parities
     geometric.py     nuclear derivatives incl. quadrature-grid response
     gradient.py      the XC nuclear gradient as C-catalog rows/points
+    geofock.py       nuclear derivatives of the Fock matrix (dF/dX)
+    hessian.py       the explicit XC nuclear Hessian classes
     strain.py        cell-deformation (strain) seeds from the master law
     london.py        explicit magnetic-field derivatives (London orbitals)
     noncollinear.py  locally collinear map: noncollinear/relativistic
@@ -387,7 +430,7 @@ xckernel/
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
     tower.py         the derivative-tower interface of the C kernels
-  catalog.py       the 267-kernel catalog + machine-readable manifests
+  catalog.py       the 379-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/
