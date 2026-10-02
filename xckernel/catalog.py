@@ -24,6 +24,7 @@ host-owned).
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from itertools import combinations_with_replacement
@@ -107,6 +108,9 @@ class CatalogEntry:
             return f"xck_{self.family}_{self.spin}_giao"
         if self.kind == "diag":
             return f"xck_{self.family}_{self.spin}_o1_diag"
+        if self.kind == "o2b":
+            return CatalogEntry(self.family, self.spin, self.order,
+                                self.parities).name + "_batch"
         if self.kind in ("g1", "gg", "f1", "fg"):
             return f"xck_{self.family}_{self.spin}_{self.kind}"
         parts = ["xck", self.family, self.spin, f"o{self.order}"]
@@ -126,7 +130,11 @@ class CatalogEntry:
         if self.kind:
             sd = {"r": "unpolarized", "ua": "unrestricted (alpha channel)",
                   "ub": "unrestricted (beta channel)",
-                  "u": "unrestricted (both channels)"}[self.spin]
+                  "u": "unrestricted (both channels)",
+                  "st": "closed-shell spin-adapted"}[self.spin]
+            if self.parities:
+                sd += " (" + ", ".join("singlet" if x > 0 else "triplet"
+                                       for x in self.parities) + ")"
             what = {
                 "diag": "diagonal F_uu of the XC Fock matrix",
                 "g1": ("XC nuclear gradient, basis class: per-function rows "
@@ -134,6 +142,8 @@ class CatalogEntry:
                        "+dE/dX_{A,d}"),
                 "gg": ("XC nuclear gradient, grid class: per-point "
                        "w * d_d e(r_g), summed over the points of atom A"),
+                "o2b": ("linear-response contraction for a batch of "
+                        "perturbations at one ground state"),
                 "f1": ("nuclear derivative of the XC Fock matrix "
                        "dF/dX_{A,d}, basis class, one atom per call"),
                 "fg": ("nuclear derivative of the XC Fock matrix "
@@ -170,6 +180,12 @@ def _one_index_entries(fam: str, max_order: int = 2) -> Iterator[CatalogEntry]:
             yield CatalogEntry(fam, spin, 1, kind="g1")
         for spin in (("r", "u") if polarized else ("r",)):
             yield CatalogEntry(fam, spin, 1, kind="gg")
+    if max_order >= 2:                     # batched linear response
+        for spin in spins:
+            yield CatalogEntry(fam, spin, 2, kind="o2b")
+        if polarized:
+            for par in ((+1,), (-1,)):
+                yield CatalogEntry(fam, "st", 2, parities=par, kind="o2b")
     if fam in FOCK_DERIV_FAMILIES and max_order >= 2:
         for kind in ("f1", "fg"):
             for spin in spins:
@@ -410,6 +426,10 @@ def _kind_kernels(e: CatalogEntry):
     if e.kind == "diag":
         ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 1)))
         return [ck], ck, None
+    if e.kind == "o2b":
+        ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 2,
+                                                  e.parities)))
+        return [ck], ck, None
     if e.kind in ("f1", "fg"):
         from .engine import geofock
         from .emitters.cbackend import scal_order
@@ -495,6 +515,8 @@ def abi_kind(e: CatalogEntry) -> str:
     from .engine.gradient import GENERAL_DM_FAMILIES
     if e.giao:
         return "giao"
+    if e.kind == "o2b":
+        return "o2b"
     if e.kind == "g1" and e.family in GENERAL_DM_FAMILIES:
         return "g1c"
     if e.kind == "f1":
@@ -508,7 +530,11 @@ def _emit_kind(e: CatalogEntry):
     from .emitters.cbackend import ABI_KINDS, emit_tower_cpp, emit_tower_hpp
     blocks, scal_ck, computed = _kind_kernels(e)
     abi = abi_kind(e)
-    hpp = emit_tower_hpp(blocks, scal_ck, e.name, abi, computed)
+    if abi == "o2b":
+        from .emitters.cbackend import emit_batch_hpp
+        hpp = emit_batch_hpp(blocks[0], e.name)
+    else:
+        hpp = emit_tower_hpp(blocks, scal_ck, e.name, abi, computed)
     cpp = emit_tower_cpp(blocks, scal_ck, e.name, abi, computed)
     m: Dict = {
         "name": e.name, "description": e.description,
@@ -547,6 +573,17 @@ def _emit_kind(e: CatalogEntry):
                 f" Unrestricted: Dchi is formed with the {e.spin[1]}-channel "
                 "spin density matrix and the output is that channel's "
                 "contribution; the gradient is the sum of the ua and ub calls.")
+    elif e.kind == "o2b":
+        single = CatalogEntry(e.family, e.spin, 2, e.parities).name
+        m["convention"] = (
+            f"out[(x*nbf + u)*nbf + v] += {single} for perturbation x, "
+            "x < nx: the perturbed operands (listed under batched_operands) "
+            "point to (nx, npts) arrays, perturbation x at offset x*npts; all "
+            "other operands are (npts,) and shared.")
+        m["batched_operands"] = [n for n in m["scal_names"]
+                                 if re.search(r"_p\d+(?:_|$)", n)]
+        if e.parities:
+            m["parities"] = list(e.parities)
     elif e.giao:
         m["convention"] = (
             "out[(s*nbf + u)*nbf + v] += K^s_uv, s = x, y, z: the explicit "
