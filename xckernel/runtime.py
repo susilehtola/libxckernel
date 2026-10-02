@@ -97,6 +97,16 @@ class Library:
         """Derivative order the kernel reads of a collocation tower."""
         return ctypes.c_int.in_dll(self._dll, f"{name}_{array}_order").value
 
+    def kind(self, name: str) -> str:
+        """The kernel's ABI kind, as exported (<name>_kind), reduced to the
+        dispatch family used here; older libraries without the symbol fall
+        back to the name suffix."""
+        try:
+            k = ctypes.c_char_p.in_dll(self._dll, f"{name}_kind").value.decode()
+        except ValueError:
+            return _kind(name)
+        return {"g1c": "g1", "f1u": "f1", "f1c": "f1", "f1cu": "f1"}.get(k, k)
+
     def _has(self, symbol: str) -> bool:
         try:
             ctypes.c_int.in_dll(self._dll, symbol)
@@ -114,7 +124,7 @@ class Library:
         rows of a general density matrix M take Dchi = M chi and
         DTchi = M^T chi; the dF/dX basis class takes Dchi (or Dchi_a and
         Dchi_b) and the atom mask (nbf,), one atom per call."""
-        kind = _kind(name)
+        kind = self.kind(name)
         ng = np.asarray(w).shape[0]
         scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
                 **_operands(operands, ng)}

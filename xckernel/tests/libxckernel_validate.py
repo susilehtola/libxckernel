@@ -67,6 +67,39 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                 failures += 1
                 print(f"  [FAIL] {name}")
 
+        # machine-readable kinds: every kernel's exported kind, rank and
+        # shape match its manifest entry, and the index lists exactly the
+        # built kernels
+        import ctypes
+
+        from ..emitters.cbackend import out_rank
+
+        class _Info(ctypes.Structure):
+            _fields_ = [("name", ctypes.c_char_p), ("kind", ctypes.c_char_p),
+                        ("order", ctypes.c_int), ("out_rank", ctypes.c_int),
+                        ("out_shape", ctypes.c_char_p)]
+        dll = rt._dll
+        n = ctypes.c_int.in_dll(dll, "xckernel_n_kernels").value
+        table = (_Info * n).in_dll(dll, "xckernel_kernels")
+        index = {t.name.decode(): (t.kind.decode(), t.out_rank,
+                                   t.out_shape.decode()) for t in table}
+        built = {k["name"]: k for k in man["kernels"] if "abi" in k}
+        tested += 1
+        if set(index) != set(built):
+            failures += 1
+            print("  [FAIL] kernel index:", sorted(set(index) ^ set(built)))
+        for name, k in built.items():
+            got = (ctypes.c_char_p.in_dll(dll, f"{name}_kind").value.decode(),
+                   ctypes.c_int.in_dll(dll, f"{name}_out_rank").value,
+                   ctypes.c_char_p.in_dll(dll, f"{name}_out_shape").value
+                   .decode())
+            want = (k["abi_kind"], out_rank(k["output_shape"]),
+                    k["output_shape"])
+            tested += 1
+            if got != want or index.get(name) != got:
+                failures += 1
+                print(f"  [FAIL] kind export {name}: {got} vs {want}")
+
         # datatype templating: instantiate a kernel at long double through
         # the header-only path and compare against the double ABI result
         prog = pkg / "ld_test.cpp"
