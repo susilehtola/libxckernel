@@ -69,7 +69,11 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
         if p in ("chi", "dchi", "lapl_chi", "hess_chi", "Rchi", "Rdchi",
                  "Rlapl_chi"):
             continue
-        if p.startswith("hess_rho"):
+        if re.fullmatch(r"(?:rho|tau|jp[xyz])(?:_[ab])?_[xyz]+", p):
+            # already a single tower component (the Hessian's field
+            # derivatives): not a vector to expand
+            order.append(p)
+        elif p.startswith("hess_rho"):
             # packed symmetric tensor: six components
             for comp in _H6_COMPS:
                 order.append(f"{p}_{comp}")
@@ -457,6 +461,37 @@ XCK_HD inline void gemm_rect(int64_t m, int64_t n, int64_t k, const T* A,
     }
 }
 
+/* X(i,g) = sum_j D(i,j) Y(j,g) (or D(j,i) when trans): the D-contracted
+ * rows of atom-masked collocation, D (n x n) row-major, X and Y (n x k)
+ * with row stride k. */
+template <typename T>
+XCK_HD inline void gemm_dn(int64_t n, int64_t k, const double* D, bool trans,
+                           const T* Y, T* X) {
+    for (int64_t i = 0; i < n * k; ++i) X[i] = T(0);
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < n; ++j) {
+            const T d = T(trans ? D[j * n + i] : D[i * n + j]);
+            if (d == T(0)) continue;
+            const T* Yj = Y + j * k;
+            T* Xi = X + i * k;
+            for (int64_t g = 0; g < k; ++g) Xi[g] += d * Yj[g];
+        }
+}
+
+/* out(g) += sum_{i: mask[i]} A(i,g) B(i,g): a per-point reduction over the
+ * functions on an atom (the first derivative of the energy density). */
+template <typename T>
+XCK_HD inline void masked_rowcolsum(int64_t n, int64_t k, const T* A,
+                                    int64_t lda, const T* B, int64_t ldb,
+                                    T* out, const int8_t* mask) {
+    for (int64_t i = 0; i < n; ++i) {
+        if (!mask[i]) continue;
+        const T* Ai = A + i * lda;
+        const T* Bi = B + i * ldb;
+        for (int64_t g = 0; g < k; ++g) out[g] += Ai[g] * Bi[g];
+    }
+}
+
 /* Zero the rows of functions off the atom: X(i,g) = 0 where !mask[i]. */
 template <typename T>
 XCK_HD inline void mask_rows(int64_t bk, int64_t n, const int8_t* mask,
@@ -542,6 +577,18 @@ inline void gemm_rect(int64_t m, int64_t n, int64_t k, const double* A,
     dgemm_("T", "N", &bn, &bm, &bk, &one, B, &bb, A, &ba, &one, C, &bc);
 }
 
+/* Row-major X = D Y is column-major X^T = Y^T D^T. */
+inline void gemm_dn(int64_t n, int64_t k, const double* D, bool trans,
+                    const double* Y, double* X) {
+    if (n == 0 || k == 0) return;
+    if (!detail::blas_fits(n, k, n, k))
+        return gemm_dn<double>(n, k, D, trans, Y, X);
+    const XCKERNEL_BLAS_INT bn = n, bk = k;
+    const double one = 1.0, zero = 0.0;
+    dgemm_("N", trans ? "T" : "N", &bk, &bn, &bn, &one, Y, &bk, D, &bn,
+           &zero, X, &bk);
+}
+
 inline void gemm_nt(int64_t n, int64_t k, const float* A, int64_t lda,
                     const float* B, int64_t ldb, float* out) {
     if (n == 0 || k == 0) return;
@@ -603,6 +650,30 @@ ABI_KINDS = {
     "o2b": (True, ("chi",), "(nx, nbf, nbf)"),
 }
 
+#: the explicit nuclear Hessian (one atom B per masked call): basis-basis
+#: rows (h2bb*: atom mask and the row channel's density matrix D),
+#: basis-grid rows (h2bg*, w := w M^B), grid-grid per point (h2gg), and
+#: the per-point basis part of the energy-density derivative (e1p*)
+ABI_KINDS.update({
+    "h2bb": (True, ("chi", "Dchi"), "(3, 3, nbf)"),
+    "h2bbu": (True, ("chi", "Dchi_a", "Dchi_b"), "(3, 3, nbf)"),
+    "h2bbc": (True, ("chi", "Dchi", "DTchi"), "(3, 3, nbf)"),
+    "h2bbcu": (True, ("chi", "Dchi_a", "Dchi_b", "DTchi_a", "DTchi_b"),
+               "(3, 3, nbf)"),
+    "h2bg": (True, ("chi", "Dchi"), "(3, 3, nbf)"),
+    "h2bgc": (True, ("chi", "Dchi", "DTchi"), "(3, 3, nbf)"),
+    "h2gg": (False, (), "(3, 3, ng)"),
+    "e1p": (True, ("chi", "Dchi"), "(3, ng)"),
+    "e1pc": (True, ("chi", "Dchi", "DTchi"), "(3, ng)"),
+})
+#: kinds taking the row channel's density matrix (const double* D,
+#: (nbf, nbf), after the towers)
+DMAT_KINDS = ("h2bb", "h2bbu", "h2bbc", "h2bbcu")
+#: pointwise kinds (no basis index): out[r*npts + g]
+POINT_KINDS = ("gg", "h2gg")
+#: per-point reductions over the functions on an atom
+REDUCE_KINDS = ("e1p", "e1pc")
+
 #: kinds taking a batch size (int64_t nx, after nbf)
 BATCH_KINDS = ("o2b",)
 
@@ -611,7 +682,8 @@ BATCH_KINDS = ("o2b",)
 CENTER_KINDS = ("giao",)
 
 #: kinds taking the atom mask (const int8_t* atom_mask, after the towers)
-MASKED_KINDS = ("f1", "f1u", "f1c", "f1cu")
+MASKED_KINDS = ("f1", "f1u", "f1c", "f1cu", "h2bb", "h2bbu", "h2bbc",
+                "h2bbcu", "e1p", "e1pc")
 #: kinds whose output is one nbf x nbf matrix per row block
 MATRIX_KINDS = ("matrix", "f1", "f1u", "f1c", "f1cu", "fg", "giao")
 
@@ -631,7 +703,7 @@ def collapse_pointwise(expr, functional) -> CollapsedKernel:
 
 
 def kernel_layout(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
-                  kind: str = "matrix", computed=None):
+                  kind: str = "matrix", computed=None, rename=None):
     """The tower interface of a kernel (tower.Layout). ``computed``: the
     per-point fields the kernel evaluates itself, name -> per row block
     (channel, [(c, chi axes, Dchi axes)]) (the dF/dX perturbed fields)."""
@@ -639,12 +711,12 @@ def kernel_layout(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     internal = scal_order(scal_ck)
     nf = len(internal) - len(scal_ck.libxc_args)
     codes = set()
-    if kind != "gg":
+    if kind not in POINT_KINDS:
         for ck in blocks:
             for u, v, _ in ck.patterns:
                 codes |= {u, v}
     L = Layout(internal[:nf], internal[nf:], codes,
-               computed=tuple(computed or ()))
+               computed=tuple(computed or ()), rename=rename)
     for n in L.computed:
         for ch, terms in computed[n]:
             for _, a, b in terms:
@@ -693,14 +765,15 @@ def _combine_call(srcs: List[str], wts: List[int], lds: str, bk: str, n: str,
 
 
 def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
-                   name: str, kind: str, computed=None) -> str:
+                   name: str, kind: str, computed=None, rename=None) -> str:
     """Header-only templated kernel on the tower interface.
 
     kind 'matrix': out (nbf, nbf), one GEMM per pattern group; 'diag'
     (one block) and 'g1' (one block per direction): out[r*nbf + u], one
     row-wise dot product per group; 'gg': out[r*npts + g], pointwise."""
-    from .tower import center_axis, comp_index, is_masked
-    L = kernel_layout(blocks, scal_ck, kind, computed)
+    from .tower import center_axis, comp_index, contraction, is_masked
+    L = kernel_layout(blocks, scal_ck, kind, computed, rename)
+    ncon = any(contraction(c) is not None for c in L.basis)
     sidx = _scal_index(scal_ck)
     ns = f"detail_{name}"
     has_nbf, arrays, _ = ABI_KINDS[kind]
@@ -725,12 +798,14 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
               " * much as `work`, or nullptr to allocate it internally. */",
               f"inline int64_t {name}_work(int64_t npts, int64_t nbf) {{",
               "    const int64_t blk = npts < grid_block ? npts : grid_block;",
-              f"    return blk * (1 + nbf * {1 + len(xder) if has_nbf else 0})"
+              f"    return blk * (1 + nbf * "
+              f"{1 + len(xder) + int(ncon) if has_nbf else 0})"
               f" + {len(sder) + len(cfld)} * npts + 1;",
               "}", ""]
 
     sig = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
         + [f"const T* {a}" for a in arrays] \
+        + (["const double* D"] if kind in DMAT_KINDS else []) \
         + (["const int8_t* atom_mask"] if kind in MASKED_KINDS else []) \
         + (["const double* bf_centers"] if kind in CENTER_KINDS else []) \
         + ["const T* const* fields", "const Txc* const* xc", "T* out",
@@ -753,7 +828,10 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         lines += ["    T* W = c + blk;", "    const T* Wc = W;"]
         lines += [f"    T* X{j} = W + (int64_t){j + 1}*nbf*blk;"
                   for j in range(len(xder))]
-    base = f"blk * (1 + nbf * {1 + len(xder)})" if has_nbf else "blk"
+        if ncon:
+            lines.append(f"    T* Y = W + (int64_t){len(xder) + 1}*nbf*blk;")
+    base = (f"blk * (1 + nbf * {1 + len(xder) + int(ncon)})" if has_nbf
+            else "blk")
     for j, n in enumerate(sder):
         lines.append(f"    T* S{j} = c + {base} + (int64_t){j}*npts;")
         lines += _combine_call([f"fields[{i}]" for i, _ in L.field_map[n]],
@@ -784,10 +862,17 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         for code, (arr, combo) in L.basis.items():
             if code in xder:
                 j = xder.index(code)
+                con = contraction(code)
+                dst = "Y" if con else f"X{j}"
                 out.extend(_combine_call(
                     [f"{arr} + (int64_t){comp_index(ax)}*nbf*npts + g0"
                      for ax, _ in combo], [w for _, w in combo],
-                    "npts", "bk", "nbf", f"X{j}", "        "))
+                    "npts", "bk", "nbf", dst, "        "))
+                if con:
+                    out += [f"        mask_rows<T>(bk, nbf, atom_mask, Y);",
+                            f"        gemm_dn(nbf, bk, D, "
+                            f"{'true' if con == 'DT' else 'false'}, "
+                            f"static_cast<const T*>(Y), X{j});"]
                 if is_masked(code):
                     out.append(f"        mask_rows<T>(bk, nbf, atom_mask, X{j});")
                 a = center_axis(code)
@@ -813,7 +898,7 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
 
     def row_body(r):
         ck = blocks[r]
-        if kind == "gg":
+        if kind in POINT_KINDS:
             return ["        " + sa(r, 0),
                     f"        for (int64_t g = 0; g < bk; ++g) "
                     f"out[(int64_t){r}*npts + g0 + g] += c[g];"]
@@ -821,6 +906,12 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
             return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
                                   acc="accumulate<T>", cast=lambda w: "Wc",
                                   out=f"out + (int64_t){r}*nbf*nbf")
+        if kind in REDUCE_KINDS:
+            return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
+                                  gemm="masked_rowcolsum",
+                                  acc="accumulate<T>", cast=lambda w: "Wc",
+                                  out=f"out + (int64_t){r}*npts + g0, "
+                                      "atom_mask")
         return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
                               gemm="rowdot", acc="accumulate<T>",
                               cast=lambda w: "Wc",
@@ -1016,6 +1107,7 @@ def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
     args = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
         + (["int64_t nx"] if kind in BATCH_KINDS else []) \
         + [f"const double* {a}" for a in arrays] \
+        + (["const double* D"] if kind in DMAT_KINDS else []) \
         + (["const int8_t* atom_mask"] if kind in MASKED_KINDS else []) \
         + (["const double* bf_centers"] if kind in CENTER_KINDS else []) \
         + ["const double* const* scal", "double* out"]
@@ -1023,14 +1115,15 @@ def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
 
 
 def emit_tower_cpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
-                   name: str, kind: str, computed=None) -> str:
+                   name: str, kind: str, computed=None, rename=None) -> str:
     """The double instantiation, the C ABI wrapper and the operand tables."""
-    L = kernel_layout(blocks, scal_ck, kind, computed)
+    L = kernel_layout(blocks, scal_ck, kind, computed, rename)
     names = L.scal_names
     has_nbf, arrays, _ = ABI_KINDS[kind]
     nf = len(L.fields)
     call = ["npts"] + (["nbf"] if has_nbf else []) \
         + (["nx"] if kind in BATCH_KINDS else []) + list(arrays) \
+        + (["D"] if kind in DMAT_KINDS else []) \
         + (["atom_mask"] if kind in MASKED_KINDS else []) \
         + (["bf_centers"] if kind in CENTER_KINDS else [])
     lines = ["/* generated by xckernel; do not edit. */",
@@ -1090,6 +1183,28 @@ _KIND_NOTE = {
             "whose functions atom_mask flags. Dchi_a/b = D^a/b chi"),
     "fg": ("out (3, nbf, nbf): dF/dX_{A,d}, grid class: call with the "
            "weights of atom A's points (w M^A), one call per atom"),
+    "h2bb": ("out (3, 3, nbf): nuclear Hessian, basis-basis rows for "
+             "(A, d) x (B, e), B flagged by atom_mask (one call per atom B); "
+             "the host sums the rows over the functions on each atom A. "
+             "Dchi = D chi, D (nbf, nbf)"),
+    "h2bbu": ("out (3, 3, nbf): nuclear Hessian, basis-basis rows of the "
+              "row channel; Dchi_a/b = D^a/b chi, D the row channel's"),
+    "h2bbc": ("out (3, 3, nbf): nuclear Hessian, basis-basis rows, general "
+              "density matrix M: Dchi = M chi, DTchi = M^T chi, D = M"),
+    "h2bbcu": ("out (3, 3, nbf): nuclear Hessian, basis-basis rows, general "
+               "density matrices; D the row channel's M"),
+    "h2bg": ("out (3, 3, nbf): nuclear Hessian, basis (A, d) x grid (B, e) "
+             "rows: call with w := w M^B; the grid-basis block is its "
+             "transpose"),
+    "h2bgc": ("out (3, 3, nbf): nuclear Hessian, basis x grid rows, general "
+              "density matrix (Dchi = M chi, DTchi = M^T chi)"),
+    "h2gg": ("out (3, 3, ng): nuclear Hessian, grid-grid per point, "
+             "w d_d d_e e; summed over the points of each atom A, the (A, A) "
+             "block"),
+    "e1p": ("out (3, ng): d_e e(r_g) per point from the motion of the "
+            "functions atom_mask flags (no weight): the basis part of the "
+            "energy-density derivative for the weight classes"),
+    "e1pc": ("out (3, ng): as e1p for a general density matrix"),
     "o2b": ("out (nx, nbf, nbf): the o2 response for nx perturbations at "
             "one ground state; perturbed operands (_p1) are (nx, npts) "
             "arrays, the rest (npts,)"),
@@ -1232,8 +1347,10 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
             masked = kind in MASKED_KINDS
             centered = kind in CENTER_KINDS
             batched = kind in BATCH_KINDS
+            dmat = kind in DMAT_KINDS
             args = ["npts"] + (["nbf"] if has_nbf else []) \
                 + (["nx"] if batched else []) + list(arrays) \
+                + (["D"] if dmat else []) \
                 + (["atom_mask"] if masked else []) \
                 + (["bf_centers"] if centered else []) + ["scal", "out"]
             lines += [
@@ -1244,9 +1361,10 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
                 + ", ".join(["npts"] + (["nbf"] if has_nbf else [])
                             + (["nx"] if batched else [])),
             ]
-            if arrays:
+            if arrays or dmat:
                 lines.append("      real(c_double), intent(in) :: "
-                             + ", ".join(f"{a}(*)" for a in arrays))
+                             + ", ".join([f"{a}(*)" for a in arrays]
+                                         + (["D(*)"] if dmat else [])))
             if masked:
                 lines.append("      integer(c_int8_t), intent(in) :: "
                              "atom_mask(*)")
