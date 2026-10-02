@@ -426,6 +426,37 @@ XCK_HD inline void combine(int64_t bk, int64_t n, int nt, const T* const* src,
     }
 }
 
+/* A batched coefficient: c(g) = sum_t A[t](g) P[t](g) -- the response
+ * coefficient of one perturbation from the ground-state tables A[t] and
+ * that perturbation's field components P[t]. */
+template <typename T>
+XCK_HD inline void lincomb(int64_t bk, int nt, const T* const* A,
+                           const T* const* P, T* c) {
+    for (int64_t g = 0; g < bk; ++g) c[g] = T(0);
+    for (int t = 0; t < nt; ++t) {
+        const T* a = A[t];
+        const T* p = P[t];
+        for (int64_t g = 0; g < bk; ++g) c[g] += a[g] * p[g];
+    }
+}
+
+/* Rectangular C(i,j) += sum_g A(i,g) B(j,g), i < m, j < n; row-major with
+ * row strides lda, ldb, ldc. The stacked GEMM of the batched kernels. */
+template <typename T>
+XCK_HD inline void gemm_rect(int64_t m, int64_t n, int64_t k, const T* A,
+                             int64_t lda, const T* B, int64_t ldb, T* C,
+                             int64_t ldc) {
+    for (int64_t i = 0; i < m; ++i) {
+        const T* Ai = A + i * lda;
+        for (int64_t j = 0; j < n; ++j) {
+            const T* Bj = B + j * ldb;
+            T s = T(0);
+            for (int64_t g = 0; g < k; ++g) s += Ai[g] * Bj[g];
+            C[i * ldc + j] += s;
+        }
+    }
+}
+
 /* Zero the rows of functions off the atom: X(i,g) = 0 where !mask[i]. */
 template <typename T>
 XCK_HD inline void mask_rows(int64_t bk, int64_t n, const int8_t* mask,
@@ -498,6 +529,19 @@ inline void gemm_nt(int64_t n, int64_t k, const double* A, int64_t lda,
     dgemm_("T", "N", &bn, &bn, &bk, &one, B, &bb, A, &ba, &one, out, &bn);
 }
 
+/* Row-major C = A B^T (m x n) is column-major C^T = B^T A. */
+inline void gemm_rect(int64_t m, int64_t n, int64_t k, const double* A,
+                      int64_t lda, const double* B, int64_t ldb, double* C,
+                      int64_t ldc) {
+    if (m == 0 || n == 0 || k == 0) return;
+    if (!detail::blas_fits(m, k, lda, ldb) || !detail::blas_fits(n, k, ldc, 1))
+        return gemm_rect<double>(m, n, k, A, lda, B, ldb, C, ldc);
+    const XCKERNEL_BLAS_INT bm = m, bn = n, bk = k, ba = lda, bb = ldb,
+        bc = ldc;
+    const double one = 1.0;
+    dgemm_("T", "N", &bn, &bm, &bk, &one, B, &bb, A, &ba, &one, C, &bc);
+}
+
 inline void gemm_nt(int64_t n, int64_t k, const float* A, int64_t lda,
                     const float* B, int64_t ldb, float* out) {
     if (n == 0 || k == 0) return;
@@ -554,7 +598,13 @@ ABI_KINDS = {
     # K^s, s = x, y, z, with dF/dB_s = (i/2c) K^s at a real reference; the
     # kernel forms R_a chi etc. from chi and the basis-function centers
     "giao": (True, ("chi",), "(3, nbf, nbf)"),
+    # linear response for a batch of nx perturbations at one ground state:
+    # perturbed operands point to (nx, npts) arrays
+    "o2b": (True, ("chi",), "(nx, nbf, nbf)"),
 }
+
+#: kinds taking a batch size (int64_t nx, after nbf)
+BATCH_KINDS = ("o2b",)
 
 #: kinds taking the basis-function centers (const double* bf_centers,
 #: (3, nbf), after the towers)
@@ -804,6 +854,158 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     return "\n".join(lines)
 
 
+#: perturbations per stacked GEMM in the batched kernels
+BATCH_CHUNK = 8
+
+_PERT = re.compile(r"_p\d+(?:_|$)")
+
+
+def _split_batched(ck: CollapsedKernel, L):
+    """Split each pattern's monomials by their (single) perturbed factor:
+    pattern p -> {ABI perturbed component j: [(coeff, ground factors)]}.
+    A derived perturbed operand (lapl_rho_p1) folds into its tower
+    components with their weights."""
+    out = []
+    for ufac, vfac, monos in ck.patterns:
+        tabs: dict = {}
+        for coeff, factors in monos:
+            pert = [(f, e) for f, e in factors if _PERT.search(f)]
+            if len(pert) != 1 or pert[0][1] != 1:
+                raise ValueError(f"o2 monomial not linear in one perturbed "
+                                 f"factor: {factors}")
+            rest = tuple((f, e) for f, e in factors if not _PERT.search(f))
+            for j, w in L.field_map[pert[0][0]]:
+                tabs.setdefault(j, []).append((coeff * w, rest))
+        out.append((ufac, vfac, tabs))
+    return out
+
+
+def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
+    """The o2 response for nx perturbations at one ground state.
+
+    The ground-state tables of every pattern (one per perturbed tower
+    component) are evaluated once per grid block; per perturbation the
+    coefficient is their combination with its fields (lincomb), and the
+    perturbations of a chunk share one stacked GEMM per V-factor group:
+    [W_1; ...; W_n] V^T lands directly in out (nx, nbf, nbf)."""
+    from .tower import comp_index
+    L = kernel_layout([ck], ck, "matrix")
+    ns = f"detail_{name}"
+    split = _split_batched(ck, L)
+    # the tables' operands: the ground-state fields, then the Libxc arrays
+    order = scal_order(ck)
+    nf_all = len(order) - len(ck.libxc_args)
+    ground = [n for n in order[:nf_all] if not _PERT.search(n)]
+    gidx = {n: i for i, n in enumerate(ground + list(ck.libxc_args))}
+    nfld = len(ground)
+    xder = L.derived_basis()
+    sder = [n for n in L.derived_fields() if not _PERT.search(n)]
+
+    lines = ["/* generated by xckernel; do not edit. */", "#pragma once",
+             "#include <cstdint>", "#include <new>",
+             '#include "xckernel/evaluator.hpp"', "",
+             "namespace xckernel {", f"namespace {ns} {{"]
+    tables = []          # (pattern, component j, tag, n monomials)
+    for ip, (_, _, tabs) in enumerate(split):
+        for j, monos in sorted(tabs.items()):
+            tag = f"{ip}_{j}"
+            fake = CollapsedKernel.__new__(CollapsedKernel)
+            fake.patterns = [(None, None, monos)]
+            t, nm = _tables(fake, gidx, tag)
+            lines += [x.replace(f"c{tag}_0", f"c{tag}")
+                       .replace(f"o{tag}_0", f"o{tag}")
+                       .replace(f"f{tag}_0", f"f{tag}") for x in t]
+            tables.append((ip, j, tag, nm[0]))
+    ntab = len(tables)
+    lines += [f"static constexpr int64_t NFLD = {nfld};",
+              f"}} // namespace {ns}", "",
+              "/* Scratch (elements of T) the kernel needs for nx "
+              "perturbations. */",
+              f"inline int64_t {name}_work(int64_t npts, int64_t nbf, "
+              "int64_t nx) {",
+              "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+              f"    const int64_t nxc = nx < {BATCH_CHUNK} ? nx : {BATCH_CHUNK};",
+              f"    return blk * ({1 + ntab} + nbf * (nxc + {len(xder)}))"
+              f" + {len(sder)} * npts + 1;",
+              "}", "",
+              "/* fields: the per-point tower operands in the order of",
+              f" * {name}_scal_names; perturbed ones (_p1) are (nx, npts). */",
+              "template <typename T, typename Txc = T>",
+              f"int {name}_t(int64_t npts, int64_t nbf, int64_t nx,",
+              "        const T* chi, const T* const* fields,",
+              "        const Txc* const* xc, T* out, T* work = nullptr) {",
+              "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+              f"    const int64_t nxc = nx < {BATCH_CHUNK} ? nx : {BATCH_CHUNK};",
+              "    T* c = work;",
+              "    bool own = false;",
+              "    if (!c) {",
+              f"        c = new (std::nothrow) T[{name}_work(npts, nbf, nx)];",
+              "        own = true;",
+              "    }",
+              "    if (!c) return 1;",
+              "    T* A = c + blk;"]
+    lines.append(f"    T* W = A + (int64_t){ntab}*blk;")
+    lines += [f"    T* X{j} = W + nxc*nbf*blk + (int64_t){j}*nbf*blk;"
+              for j in range(len(xder))]
+    lines.append(f"    T* Sb = c + blk * ({1 + ntab} + nbf * (nxc + "
+                 f"{len(xder)}));")
+    for j, n in enumerate(sder):
+        lines.append(f"    T* S{j} = Sb + (int64_t){j}*npts;")
+        lines += _combine_call([f"fields[{i}]" for i, _ in L.field_map[n]],
+                               [w for _, w in L.field_map[n]],
+                               "0", "npts", "1", f"S{j}", "    ")
+    fi = [f"S{sder.index(n)}" if n in sder else
+          f"fields[{L.field_map[n][0][0]}]" for n in ground]
+    lines.append(f"    const T* fi[{max(nfld, 1)}] = {{" + ", ".join(fi or ["nullptr"])
+                 + "};")
+    lines += ["    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+              "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;"]
+    bexpr = {}
+    for code, (arr, combo) in L.basis.items():
+        if code in xder:
+            j = xder.index(code)
+            lines += _combine_call(
+                [f"{arr} + (int64_t){comp_index(ax)}*nbf*npts + g0"
+                 for ax, _ in combo], [w for _, w in combo],
+                "npts", "bk", "nbf", f"X{j}", "        ")
+            bexpr[code] = (f"X{j}", "bk")
+        else:
+            k = comp_index(combo[0][0])
+            bexpr[code] = (f"{arr} + (int64_t){k}*nbf*npts + g0", "npts")
+    # the ground-state tables, once per block
+    for t, (ip, j, tag, nm) in enumerate(tables):
+        lines.append(f"        stage_a<T, Txc>(g0, bk, {nm}, {ns}::c{tag}, "
+                     f"{ns}::o{tag}, {ns}::f{tag}, {ns}::NFLD, fi, xc, "
+                     f"A + (int64_t){t}*blk);")
+    # groups sharing the V factor: one stacked GEMM per group and chunk
+    groups: dict = {}
+    for ip, (ufac, vfac, _) in enumerate(split):
+        groups.setdefault(vfac, []).append((ip, ufac))
+    lines += ["        for (int64_t x0 = 0; x0 < nx; x0 += nxc) {",
+              "            const int64_t nxb = nx - x0 < nxc ? nx - x0 : nxc;"]
+    for vfac, members in groups.items():
+        lines.append("            for (int64_t x = 0; x < nxb; ++x) {")
+        for k, (ip, ufac) in enumerate(members):
+            ts = [(t, j) for t, (p, j, _, _) in enumerate(tables) if p == ip]
+            lines += [
+                "                {",
+                "                    const T* A_[] = {" + ", ".join(
+                    f"A + (int64_t){t}*blk" for t, _ in ts) + "};",
+                "                    const T* P_[] = {" + ", ".join(
+                    f"fields[{j}] + (x0 + x)*npts + g0" for _, j in ts) + "};",
+                f"                    lincomb<T>(bk, {len(ts)}, A_, P_, c);",
+                "                }",
+                f"                accumulate<T>(bk, nbf, c, {bexpr[ufac][0]}, "
+                f"{bexpr[ufac][1]}, W + x*nbf*bk, {int(k == 0)});"]
+        lines += ["            }",
+                  f"            gemm_rect(nxb*nbf, nbf, bk, "
+                  f"static_cast<const T*>(W), bk, {bexpr[vfac][0]}, "
+                  f"{bexpr[vfac][1]}, out + x0*nbf*nbf, nbf);"]
+    lines += ["        }", "    }", "    if (own) delete[] c;", "    return 0;",
+              "}", "", "} // namespace xckernel", ""]
+    return "\n".join(lines)
+
+
 def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
     """A response (matrix) kernel on the tower interface."""
     return emit_tower_hpp([ck], ck, name, "matrix")
@@ -812,6 +1014,7 @@ def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
 def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
     has_nbf, arrays, _ = ABI_KINDS[kind]
     args = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
+        + (["int64_t nx"] if kind in BATCH_KINDS else []) \
         + [f"const double* {a}" for a in arrays] \
         + (["const int8_t* atom_mask"] if kind in MASKED_KINDS else []) \
         + (["const double* bf_centers"] if kind in CENTER_KINDS else []) \
@@ -826,7 +1029,8 @@ def emit_tower_cpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     names = L.scal_names
     has_nbf, arrays, _ = ABI_KINDS[kind]
     nf = len(L.fields)
-    call = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays) \
+    call = ["npts"] + (["nbf"] if has_nbf else []) \
+        + (["nx"] if kind in BATCH_KINDS else []) + list(arrays) \
         + (["atom_mask"] if kind in MASKED_KINDS else []) \
         + (["bf_centers"] if kind in CENTER_KINDS else [])
     lines = ["/* generated by xckernel; do not edit. */",
@@ -886,6 +1090,9 @@ _KIND_NOTE = {
             "whose functions atom_mask flags. Dchi_a/b = D^a/b chi"),
     "fg": ("out (3, nbf, nbf): dF/dX_{A,d}, grid class: call with the "
            "weights of atom A's points (w M^A), one call per atom"),
+    "o2b": ("out (nx, nbf, nbf): the o2 response for nx perturbations at "
+            "one ground state; perturbed operands (_p1) are (nx, npts) "
+            "arrays, the rest (npts,)"),
     "giao": ("out (3, nbf, nbf): K^s with dF/dB_s = (i/2c) K^s, the explicit "
              "London-orbital field derivative at a real reference; "
              "bf_centers (3, nbf) holds each basis function's center"),
@@ -1024,7 +1231,9 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
             has_nbf, arrays, _ = ABI_KINDS[kind]
             masked = kind in MASKED_KINDS
             centered = kind in CENTER_KINDS
-            args = ["npts"] + (["nbf"] if has_nbf else []) + list(arrays) \
+            batched = kind in BATCH_KINDS
+            args = ["npts"] + (["nbf"] if has_nbf else []) \
+                + (["nx"] if batched else []) + list(arrays) \
                 + (["atom_mask"] if masked else []) \
                 + (["bf_centers"] if centered else []) + ["scal", "out"]
             lines += [
@@ -1032,7 +1241,8 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
                 f"bind(C, name='{name}')",
                 "      import :: c_int, c_int8_t, c_int64_t, c_double, c_ptr",
                 "      integer(c_int64_t), value :: "
-                + ", ".join(["npts"] + (["nbf"] if has_nbf else [])),
+                + ", ".join(["npts"] + (["nbf"] if has_nbf else [])
+                            + (["nx"] if batched else [])),
             ]
             if arrays:
                 lines.append("      real(c_double), intent(in) :: "
