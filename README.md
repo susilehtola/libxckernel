@@ -76,9 +76,10 @@ for which linear, quadratic (E[3]) and cubic (E[4]) response are the n = 1,
 
 ## The kernel catalog
 
-`catalog.py` enumerates, generates, and manifests **379 kernels**: 169
-named `xck_<family>_<case>_o<order>[_<parities>]` and 210 Fock-diagonal,
-batched-response, nuclear-gradient, Fock-derivative and nuclear-Hessian
+`catalog.py` enumerates, generates, and manifests **407 kernels**: 169
+named `xck_<family>_<case>_o<order>[_<parities>]` and 238 Fock-diagonal,
+batched and MO-projected response, nuclear-gradient, Fock-derivative and
+nuclear-Hessian
 kernels (below), spanning seven functional
 families — `lda`, `gga`, `mgga_tau` (τ-only), `mgga_lapl` (Laplacian-only),
 `mgga` (full), `cmgga_tau` (current-density: the Libxc τ slot is fed the
@@ -191,6 +192,31 @@ apply the linear response to `nx` perturbations at one ground state, with
 output `(nx, nbf, nbf)`. The perturbed operands (`*_p1*`, listed in the
 manifest's `batched_operands`) point to `(nx, npts)` arrays, the rest are
 shared.
+
+### MO-projected linear response (sigma vectors)
+
+`xck_<family>_st_o2_{p,m}_mo` and `xck_<family>_{ua,ub}_o2_mo` compute the
+occupied × virtual block of the response directly, for Casida/TDDFT,
+stability analysis and orbital-rotation solvers:
+
+    sigma_x[i,a] = (C_occᵀ F¹[P_x] C_vir)[i,a],   P_x = C_occ X_x C_virᵀ + transpose
+
+for `nx` trial vectors `X (nx, nocc, nvir)` at one ground state. Instead of
+`chi`, the kernel takes the MO collocation towers `phi_o = C_occᵀ·chi` and
+`phi_v = C_virᵀ·chi` `(ncomp, nocc|nvir, npts)`, which the host forms once
+per ground state. It then forms each trial vector's perturbed fields in MO
+space itself: one `Z = X·phi_v` GEMM per tower component, then sums over the
+occupied orbitals. The output is one rectangular GEMM per pattern group.
+Neither direction touches an AO matrix, so the cost per trial vector scales
+with nocc·nvir, not nbf². The spin-adapted kernels take the α amplitudes;
+the β perturbation is the parity times them. The unrestricted kernels take
+both channels' towers and amplitudes (`phi_o_a`, …, `X_a`, `X_b`) and
+return the σ of their own channel.
+
+These kernels cover real response only (symmetric P), the case for
+real-orbital TDDFT and stability analysis. A purely imaginary (magnetic)
+perturbation of `cmgga_tau`, with an antisymmetric P, still goes through
+the AO `o2` kernels.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -340,6 +366,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | C gradient kernels `g1` + `gg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
 | C nuclear Hessian (all classes, weight terms included) | all seven | R + U | FD of the matching gradient class; FD of the full gradient; translational sum rule | ~1e-11; ~1e-15 |
 | C batched response `o2_batch` | all seven | R + U + spin-adapted | nx single `o2` calls | ~1e-13 |
+| C MO-projected response `o2_mo` | all seven | U + spin-adapted | C_occᵀ·`o2`[fields of P_x]·C_vir | ~1e-15 |
 | C Fock derivative `f1` + `fg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | C London-orbital kernels `giao` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | NumPy GIAO kernels (FD-validated in `london_validate`); antisymmetry | ~1e-15 |
@@ -430,7 +457,7 @@ xckernel/
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
     release.py       self-contained C source package assembly
     tower.py         the derivative-tower interface of the C kernels
-  catalog.py       the 379-kernel catalog + machine-readable manifests
+  catalog.py       the 407-kernel catalog + machine-readable manifests
   runtime.py       compiled-library loader
   tests/           validation suites (see table above)
 docs/
