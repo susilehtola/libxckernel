@@ -492,6 +492,38 @@ XCK_HD inline void masked_rowcolsum(int64_t n, int64_t k, const T* A,
     }
 }
 
+/* C(i,g) = sum_a A(i,a) B(a,g), A (m x n) row stride lda, B (n x k) row
+ * stride ldb, C (m x k) row stride ldc, overwritten: the trial vector
+ * applied to the virtual collocation, Z = X phi_v. */
+template <typename T>
+XCK_HD inline void gemm_nn(int64_t m, int64_t n, int64_t k, const double* A,
+                           int64_t lda, const T* B, int64_t ldb, T* C,
+                           int64_t ldc) {
+    for (int64_t i = 0; i < m; ++i) {
+        T* Ci = C + i * ldc;
+        for (int64_t g = 0; g < k; ++g) Ci[g] = T(0);
+        for (int64_t a = 0; a < n; ++a) {
+            const T x = T(A[i * lda + a]);
+            if (x == T(0)) continue;
+            const T* Ba = B + a * ldb;
+            for (int64_t g = 0; g < k; ++g) Ci[g] += x * Ba[g];
+        }
+    }
+}
+
+/* out(g) += c * sum_i A(i,g) B(i,g): a per-point sum over occupied
+ * orbitals (the perturbed fields of a trial vector). */
+template <typename T>
+XCK_HD inline void colsum_prod(int64_t n, int64_t k, double c, const T* A,
+                               int64_t lda, const T* B, int64_t ldb, T* out) {
+    const T cc = T(c);
+    for (int64_t i = 0; i < n; ++i) {
+        const T* Ai = A + i * lda;
+        const T* Bi = B + i * ldb;
+        for (int64_t g = 0; g < k; ++g) out[g] += cc * Ai[g] * Bi[g];
+    }
+}
+
 /* Zero the rows of functions off the atom: X(i,g) = 0 where !mask[i]. */
 template <typename T>
 XCK_HD inline void mask_rows(int64_t bk, int64_t n, const int8_t* mask,
@@ -589,6 +621,20 @@ inline void gemm_dn(int64_t n, int64_t k, const double* D, bool trans,
            &zero, X, &bk);
 }
 
+/* Row-major C = A B is column-major C^T = B^T A^T. */
+inline void gemm_nn(int64_t m, int64_t n, int64_t k, const double* A,
+                    int64_t lda, const double* B, int64_t ldb, double* C,
+                    int64_t ldc) {
+    if (m == 0 || k == 0) return;
+    if (n == 0 || !detail::blas_fits(m, n, lda, ldb)
+        || !detail::blas_fits(k, n, ldc, 1))
+        return gemm_nn<double>(m, n, k, A, lda, B, ldb, C, ldc);
+    const XCKERNEL_BLAS_INT bm = m, bn = n, bk = k, ba = lda, bb = ldb,
+        bc = ldc;
+    const double one = 1.0, zero = 0.0;
+    dgemm_("N", "N", &bk, &bm, &bn, &one, B, &bb, A, &ba, &zero, C, &bc);
+}
+
 inline void gemm_nt(int64_t n, int64_t k, const float* A, int64_t lda,
                     const float* B, int64_t ldb, float* out) {
     if (n == 0 || k == 0) return;
@@ -673,6 +719,22 @@ DMAT_KINDS = ("h2bb", "h2bbu", "h2bbc", "h2bbcu")
 POINT_KINDS = ("gg", "h2gg")
 #: per-point reductions over the functions on an atom
 REDUCE_KINDS = ("e1p", "e1pc")
+
+#: the MO-projected linear response: sigma_x = C_occ^T F1[P_x] C_vir for
+#: trial vectors X_x, P_x = C_occ X_x C_vir^T + transpose. Not on the
+#: AO basis: dims, MO collocation towers and amplitudes instead.
+MO_KINDS = {
+    "mo2": dict(dims=("nocc", "nvir"), towers=("phi_o", "phi_v"),
+                amps=("X",)),
+    "mo2u": dict(dims=("nocc_a", "nvir_a", "nocc_b", "nvir_b"),
+                 towers=("phi_o_a", "phi_v_a", "phi_o_b", "phi_v_b"),
+                 amps=("X_a", "X_b")),
+}
+ABI_KINDS.update({
+    "mo2": (False, MO_KINDS["mo2"]["towers"], "(nx, nocc, nvir)"),
+    "mo2u": (False, MO_KINDS["mo2u"]["towers"],
+             "(nx, nocc_s, nvir_s)"),
+})
 
 #: kinds taking a batch size (int64_t nx, after nbf)
 BATCH_KINDS = ("o2b",)
@@ -1097,12 +1159,306 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
     return "\n".join(lines)
 
 
+def _split_by_perturbed(ck: CollapsedKernel):
+    """pattern p -> {perturbed engine operand: [(coeff, ground factors)]}."""
+    out = []
+    for ufac, vfac, monos in ck.patterns:
+        tabs: dict = {}
+        for coeff, factors in monos:
+            pert = [(f, e) for f, e in factors if _PERT.search(f)]
+            if len(pert) != 1 or pert[0][1] != 1:
+                raise ValueError(f"o2 monomial not linear in one perturbed "
+                                 f"factor: {factors}")
+            rest = tuple((f, e) for f, e in factors if not _PERT.search(f))
+            tabs.setdefault(pert[0][0], []).append((coeff, rest))
+        out.append((ufac, vfac, tabs))
+    return out
+
+
+def _mo_abi(L, ground):
+    """The ABI field list of an MO-projected kernel (ground-state fields
+    only: the perturbed ones come from the amplitudes) and the map from a
+    Layout field index to it."""
+    abi = []
+    for n in ground:
+        for i, _ in L.field_map[n]:
+            if L.fields[i] not in abi:
+                abi.append(L.fields[i])
+    return abi, (lambda i: abi.index(L.fields[i]))
+
+
+def emit_mo_hpp(ck: CollapsedKernel, name: str, kind: str,
+                out_channel: str = "") -> str:
+    """The MO-projected linear response, sigma_x = C_occ^T F1[P_x] C_vir
+    for nx trial vectors at one ground state.
+
+    The perturbed fields of each trial vector are formed in MO space,
+    field = sum_t c_t sum_i phi_o[a_t] (X phi_v[b_t]) (gemm_nn,
+    colsum_prod); the response patterns take occupied operands on the
+    left and virtual ones on the right, the ground-state tables once per
+    block, one rectangular GEMM per V-factor group and chunk."""
+    from ..engine.geofock import mo_field_terms
+    from .tower import basis_operand, comp_index, is_component
+    spec = MO_KINDS[kind]
+    L = kernel_layout([ck], ck, "matrix")
+    ns = f"detail_{name}"
+    split = _split_by_perturbed(ck)
+    order = scal_order(ck)
+    nf_all = len(order) - len(ck.libxc_args)
+    ground = [n for n in order[:nf_all] if not _PERT.search(n)]
+    pert = [n for n in order[:nf_all] if _PERT.search(n)]
+    gidx = {n: i for i, n in enumerate(ground + list(ck.libxc_args))}
+    sder = [n for n in L.derived_fields() if not _PERT.search(n)]
+    _, fidx = _mo_abi(L, ground)
+
+    # channel names: '' (spin-adapted, alpha only) or 'a'/'b'
+    def arr(base, ch):
+        return f"{base}_{ch}" if (kind == "mo2u" and ch) else base
+
+    def dim(base, ch):
+        return f"{base}_{ch}" if (kind == "mo2u" and ch) else base
+    s = out_channel if kind == "mo2u" else ""
+    nocc, nvir = dim("nocc", s), dim("nvir", s)
+
+    # the perturbed fields: per field, its channel and terms
+    pf = {}
+    zneed = []                       # (channel, virtual axes)
+    for n in pert:
+        ch, terms = mo_field_terms(n)
+        ch = ch if kind == "mo2u" else ""
+        pf[n] = (ch, terms)
+        for _, _, b in terms:
+            if (ch, b) not in zneed:
+                zneed.append((ch, b))
+
+    lines = ["/* generated by xckernel; do not edit. */", "#pragma once",
+             "#include <cstdint>", "#include <new>",
+             '#include "xckernel/evaluator.hpp"', "",
+             "namespace xckernel {", f"namespace {ns} {{"]
+    tables = []                      # (pattern, pert operand, tag, n monos)
+    for ip, (_, _, tabs) in enumerate(split):
+        for k, monos in sorted(tabs.items()):
+            tag = f"{ip}_{pert.index(k)}"
+            fake = CollapsedKernel.__new__(CollapsedKernel)
+            fake.patterns = [(None, None, monos)]
+            t, nm = _tables(fake, gidx, tag)
+            lines += [x.replace(f"c{tag}_0", f"c{tag}")
+                       .replace(f"o{tag}_0", f"o{tag}")
+                       .replace(f"f{tag}_0", f"f{tag}") for x in t]
+            tables.append((ip, k, tag, nm[0]))
+    ntab = len(tables)
+
+    # derived (combined) collocation operands, occupied and virtual side
+    codes_u = sorted({u for u, _, _ in split})
+    codes_v = sorted({v for _, v, _ in split})
+    xo = [c for c in codes_u if not is_component(basis_operand(c)[1])]
+    xv = [c for c in codes_v if not is_component(basis_operand(c)[1])]
+    dims = list(spec["dims"])
+    dimargs = ", ".join(f"int64_t {d}" for d in dims)
+    occs = [d for d in dims if d.startswith("nocc")]
+    lines += [f"static constexpr int64_t NFLD = {len(ground)};",
+              f"}} // namespace {ns}", "",
+              "/* Scratch (elements of T) for nx trial vectors. */",
+              f"inline int64_t {name}_work(int64_t npts, {dimargs}, "
+              "int64_t nx) {",
+              "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+              f"    const int64_t nxc = nx < {BATCH_CHUNK} ? nx : {BATCH_CHUNK};",
+              "    int64_t no = 0;",
+              *[f"    if ({o} > no) no = {o};" for o in occs],
+              f"    return blk * ({1 + ntab} + nxc * ({nocc} + {len(pert)})"
+              f" + {len(xo)} * {nocc} + {len(xv)} * {nvir}"
+              f" + {len(zneed)} * no) + {len(sder)} * npts + 1;",
+              "}", ""]
+    towers = list(spec["towers"])
+    amps = list(spec["amps"])
+    sig = (["int64_t npts"] + [f"int64_t {d}" for d in dims]
+           + ["int64_t nx"] + [f"const T* {t}" for t in towers]
+           + [f"const double* {a}" for a in amps]
+           + ["const T* const* fields", "const Txc* const* xc", "T* out",
+              "T* work = nullptr"])
+    lines += ["template <typename T, typename Txc = T>",
+              f"int {name}_t(" + ",\n        ".join(sig) + ") {",
+              "    const int64_t blk = npts < grid_block ? npts : grid_block;",
+              f"    const int64_t nxc = nx < {BATCH_CHUNK} ? nx : {BATCH_CHUNK};",
+              "    int64_t no = 0;",
+              *[f"    if ({o} > no) no = {o};" for o in occs],
+              "    T* c = work;",
+              "    bool own = false;",
+              "    if (!c) {",
+              f"        c = new (std::nothrow) T[{name}_work(npts, "
+              + ", ".join(dims) + ", nx)];",
+              "        own = true;",
+              "    }",
+              "    if (!c) return 1;",
+              "    T* A = c + blk;",
+              f"    T* W = A + (int64_t){ntab}*blk;",
+              f"    T* F = W + nxc*{nocc}*blk;",
+              f"    T* Xo = F + nxc*(int64_t){len(pert)}*blk;",
+              f"    T* Xv = Xo + (int64_t){len(xo)}*{nocc}*blk;",
+              f"    T* Z = Xv + (int64_t){len(xv)}*{nvir}*blk;",
+              f"    T* Sb = Z + (int64_t){len(zneed)}*no*blk;"]
+    for j, n in enumerate(sder):
+        lines.append(f"    T* S{j} = Sb + (int64_t){j}*npts;")
+        lines += _combine_call([f"fields[{fidx(i)}]"
+                                for i, _ in L.field_map[n]],
+                               [w for _, w in L.field_map[n]],
+                               "0", "npts", "1", f"S{j}", "    ")
+    fi = [f"S{sder.index(n)}" if n in sder else
+          f"fields[{fidx(L.field_map[n][0][0])}]" for n in ground]
+    lines.append(f"    const T* fi[{max(len(ground), 1)}] = {{"
+                 + ", ".join(fi or ["nullptr"]) + "};")
+    lines += ["    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+              "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;"]
+
+    def operand(code, side):
+        tower = arr("phi_o" if side == "o" else "phi_v", s)
+        n = nocc if side == "o" else nvir
+        _, combo = basis_operand(code)
+        derived = xo if side == "o" else xv
+        if code in derived:
+            j = derived.index(code)
+            dst = f"{'Xo' if side == 'o' else 'Xv'} + (int64_t){j}*{n}*blk"
+            return dst, "bk", _combine_call(
+                [f"{tower} + (int64_t){comp_index(ax)}*{n}*npts + g0"
+                 for ax, _ in combo], [w for _, w in combo],
+                "npts", "bk", n, dst, "        ")
+        return (f"{tower} + (int64_t){comp_index(combo[0][0])}*{n}*npts + g0",
+                "npts", [])
+    bo, bv = {}, {}
+    for code in codes_u:
+        p_, ld, pre = operand(code, "o")
+        bo[code] = (p_, ld)
+        lines += pre
+    for code in codes_v:
+        p_, ld, pre = operand(code, "v")
+        bv[code] = (p_, ld)
+        lines += pre
+    for t, (ip, k, tag, nm) in enumerate(tables):
+        lines.append(f"        stage_a<T, Txc>(g0, bk, {nm}, {ns}::c{tag}, "
+                     f"{ns}::o{tag}, {ns}::f{tag}, {ns}::NFLD, fi, xc, "
+                     f"A + (int64_t){t}*blk);")
+    lines += ["        for (int64_t x0 = 0; x0 < nx; x0 += nxc) {",
+              "            const int64_t nxb = nx - x0 < nxc ? nx - x0 : nxc;",
+              "            for (int64_t x = 0; x < nxb; ++x) {"]
+    # the trial vector's perturbed fields on this block
+    for z, (ch, b) in enumerate(zneed):
+        no_, nv_ = dim("nocc", ch), dim("nvir", ch)
+        lines.append(
+            f"                gemm_nn({no_}, {nv_}, bk, "
+            f"{arr('X', ch)} + (x0 + x)*{no_}*{nv_}, {nv_}, "
+            f"static_cast<const T*>({arr('phi_v', ch)}) + "
+            f"(int64_t){comp_index(b)}*{nv_}*npts + g0, npts, "
+            f"Z + (int64_t){z}*no*blk, bk);")
+    for f, n in enumerate(pert):
+        ch, terms = pf[n]
+        dst = f"F + ((int64_t){f}*nxc + x)*blk"
+        lines.append(f"                for (int64_t g = 0; g < bk; ++g) "
+                     f"({dst})[g] = T(0);")
+        for c, a, b in terms:
+            z = zneed.index((ch, b))
+            no_ = dim("nocc", ch)
+            lines.append(
+                f"                colsum_prod({no_}, bk, {float(c)!r}, "
+                f"static_cast<const T*>({arr('phi_o', ch)}) + "
+                f"(int64_t){comp_index(a)}*{no_}*npts + g0, npts, "
+                f"static_cast<const T*>(Z) + (int64_t){z}*no*blk, bk, {dst});")
+    lines.append("            }")
+    groups: dict = {}
+    for ip, (ufac, vfac, _) in enumerate(split):
+        groups.setdefault(vfac, []).append((ip, ufac))
+    for vfac, members in groups.items():
+        lines.append("            for (int64_t x = 0; x < nxb; ++x) {")
+        for k, (ip, ufac) in enumerate(members):
+            ts = [(t, kk) for t, (p_, kk, _, _) in enumerate(tables) if p_ == ip]
+            lines += [
+                "                {",
+                "                    const T* A_[] = {" + ", ".join(
+                    f"A + (int64_t){t}*blk" for t, _ in ts) + "};",
+                "                    const T* P_[] = {" + ", ".join(
+                    f"F + ((int64_t){pert.index(kk)}*nxc + x)*blk"
+                    for _, kk in ts) + "};",
+                f"                    lincomb<T>(bk, {len(ts)}, A_, P_, c);",
+                "                }",
+                f"                accumulate<T>(bk, {nocc}, c, {bo[ufac][0]}, "
+                f"{bo[ufac][1]}, W + x*{nocc}*bk, {int(k == 0)});"]
+        lines += ["            }",
+                  f"            gemm_rect(nxb*{nocc}, {nvir}, bk, "
+                  f"static_cast<const T*>(W), bk, {bv[vfac][0]}, "
+                  f"{bv[vfac][1]}, out + x0*{nocc}*{nvir}, {nvir});"]
+    lines += ["        }", "    }", "    if (own) delete[] c;", "    return 0;",
+              "}", "", "} // namespace xckernel", ""]
+    return "\n".join(lines)
+
+
+def mo_layout(ck: CollapsedKernel):
+    """(ABI operand names, collocation tower order) of an MO-projected
+    response kernel."""
+    L = kernel_layout([ck], ck, "matrix")
+    order = scal_order(ck)
+    nf_all = len(order) - len(ck.libxc_args)
+    ground = [n for n in order[:nf_all] if not _PERT.search(n)]
+    abi, _ = _mo_abi(L, ground)
+    # the towers serve the output patterns and the perturbed fields
+    from ..engine.geofock import mo_field_terms
+    order_ = L.orders.get("chi", 0)
+    for n in order[:nf_all]:
+        if _PERT.search(n):
+            for _, a, b in mo_field_terms(n)[1]:
+                order_ = max(order_, len(a), len(b))
+    return abi + list(ck.libxc_args), len(abi), order_
+
+
+def emit_mo_cpp(ck: CollapsedKernel, name: str, kind: str) -> str:
+    """The double instantiation and C ABI wrapper of an MO-projected
+    response kernel; operand tables and order exports as for the rest."""
+    L = kernel_layout([ck], ck, "matrix")
+    order = scal_order(ck)
+    nf_all = len(order) - len(ck.libxc_args)
+    ground = [n for n in order[:nf_all] if not _PERT.search(n)]
+    # the ABI operands: only the ground-state fields (perturbed ones are
+    # formed from the amplitudes)
+    abi, _ = _mo_abi(L, ground)
+    names = abi + list(ck.libxc_args)
+    spec = MO_KINDS[kind]
+    lines = ["/* generated by xckernel; do not edit. */",
+             f'#include "xckernel/kernels/{name}.hpp"', "",
+             'extern "C" {', "",
+             f"const char* {name}_scal_names[{len(names)}] = {{"]
+    lines += [f'    "{n}",' for n in names]
+    lines += ["};",
+              f"extern const int {name}_n_scal;",
+              f"const int {name}_n_scal = {len(names)};",
+              f"extern const int {name}_n_fields;",
+              f"const int {name}_n_fields = {len(abi)};"]
+    tower_order = mo_layout(ck)[2]
+    for t in spec["towers"]:
+        lines += [f"extern const int {name}_{t}_order;",
+                  f"const int {name}_{t}_order = {tower_order};"]
+    lines += _kind_exports(name, kind)
+    call = (["npts"] + list(spec["dims"]) + ["nx"] + list(spec["towers"])
+            + list(spec["amps"]))
+    lines += ["", _c_signature(name, kind) + " {",
+              f"    return xckernel::{name}_t<double, double>(",
+              "        " + ", ".join(call) + ",",
+              f"        scal, scal + {len(abi)}, out);",
+              "}", "", "} // extern C", ""]
+    return "\n".join(lines)
+
+
 def emit_kernel_hpp(ck: CollapsedKernel, name: str) -> str:
     """A response (matrix) kernel on the tower interface."""
     return emit_tower_hpp([ck], ck, name, "matrix")
 
 
 def _c_signature(name: str, kind: str, indent: str = "    ") -> str:
+    if kind in MO_KINDS:
+        spec = MO_KINDS[kind]
+        args = (["int64_t npts"] + [f"int64_t {d}" for d in spec["dims"]]
+                + ["int64_t nx"]
+                + [f"const double* {t}" for t in spec["towers"]]
+                + [f"const double* {a}" for a in spec["amps"]]
+                + ["const double* const* scal", "double* out"])
+        return f"int {name}(" + (",\n" + indent).join(args) + ")"
     has_nbf, arrays, _ = ABI_KINDS[kind]
     args = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
         + (["int64_t nx"] if kind in BATCH_KINDS else []) \
@@ -1205,6 +1561,13 @@ _KIND_NOTE = {
             "functions atom_mask flags (no weight): the basis part of the "
             "energy-density derivative for the weight classes"),
     "e1pc": ("out (3, ng): as e1p for a general density matrix"),
+    "mo2": ("out (nx, nocc, nvir): sigma_x = C_occ^T F1[P_x] C_vir, P_x = "
+            "C_occ X_x C_vir^T + transpose (alpha amplitudes of the "
+            "spin-adapted response); phi_o = C_occ^T chi, phi_v = C_vir^T chi "
+            "towers (ncomp, nocc|nvir, npts), X (nx, nocc, nvir)"),
+    "mo2u": ("out (nx, nocc_s, nvir_s) for the output channel s: sigma^s_x = "
+             "C^s_occ^T F1^s[P^a_x, P^b_x] C^s_vir; both channels' MO towers "
+             "and amplitudes X_a (nx, nocc_a, nvir_a), X_b"),
     "o2b": ("out (nx, nbf, nbf): the o2 response for nx perturbations at "
             "one ground state; perturbed operands (_p1) are (nx, npts) "
             "arrays, the rest (npts,)"),
@@ -1342,6 +1705,24 @@ def emit_f03(kernel_names: List[str], version: str) -> str:
     ]
     for entry in kernel_names:
         name, order, kind = _unpack(entry)
+        if kind in MO_KINDS:
+            spec = MO_KINDS[kind]
+            ints = ["npts"] + list(spec["dims"]) + ["nx"]
+            args = ints + list(spec["towers"]) + list(spec["amps"]) \
+                + ["scal", "out"]
+            lines += [
+                f"    integer(c_int) function {name}({', '.join(args)}) "
+                f"bind(C, name='{name}')",
+                "      import :: c_int, c_int64_t, c_double, c_ptr",
+                "      integer(c_int64_t), value :: " + ", ".join(ints),
+                "      real(c_double), intent(in) :: " + ", ".join(
+                    f"{a}(*)" for a in list(spec["towers"])
+                    + list(spec["amps"])),
+                "      type(c_ptr), intent(in) :: scal(*)",
+                "      real(c_double), intent(inout) :: out(*)",
+                f"    end function {name}",
+            ]
+            continue
         if order != 0:
             has_nbf, arrays, _ = ABI_KINDS[kind]
             masked = kind in MASKED_KINDS

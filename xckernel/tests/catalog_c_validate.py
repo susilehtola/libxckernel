@@ -516,6 +516,63 @@ def check_batch(lib, rep, nbf=5, ng=37, seed=4):
                           ref, 1e-13)
 
 
+def check_mo(lib, rep, nbf=7, ng=41, nocc=3, seed=6):
+    """The MO-projected response: sigma_x == C_occ^T F1[P_x] C_vir with
+    F1 from the AO o2 kernel fed the perturbed fields of P_x = C_occ X_x
+    C_vir^T + transpose (built independently from the towers), every
+    family, spin-adapted p/m and unrestricted ua/ub."""
+    rng = np.random.default_rng(seed)
+    nvir = nbf - nocc
+    T = rng.standard_normal((len(components(4)), nbf, ng))
+    mo = lambda C: np.einsum("ui,kug->kig", C, T)
+    for fam in FAMILIES:
+        cases = [CatalogEntry(fam, "st", 2, (p,)) for p in (+1, -1)] + \
+            [CatalogEntry(fam, s, 2) for s in ("ua", "ub")]
+        for single in cases:
+            name = CatalogEntry(single.family, single.spin, 2,
+                                single.parities, kind="mo2").name
+            ground = {n: rng.standard_normal(ng)
+                      for n in lib.scal_names(name)}
+            ground["w"] = np.abs(ground["w"]) + 0.1
+            for nx in (1, 3, 11):
+                if single.spin == "st":
+                    Co, Cv = (rng.standard_normal((nbf, k))
+                              for k in (nocc, nvir))
+                    X = rng.standard_normal((nx, nocc, nvir))
+                    got = lib(name, w=ground["w"], phi_o=mo(Co), phi_v=mo(Cv),
+                              X=X, **{k: v for k, v in ground.items()
+                                      if k != "w"})
+                    ref = []
+                    for x in range(nx):
+                        P = Co @ X[x] @ Cv.T
+                        fP = fields(P + P.T, T)
+                        F = lib(single.name, chi=T, **ground,
+                                **tower_ops(fP, fP, sfx="_p1"))
+                        ref.append(Co.T @ F @ Cv)
+                else:
+                    C = {c: [rng.standard_normal((nbf, k))
+                             for k in (nocc, nvir)] for c in "ab"}
+                    X = {c: rng.standard_normal((nx, nocc, nvir))
+                         for c in "ab"}
+                    s = single.spin[1]
+                    got = lib(name, w=ground["w"],
+                              **{f"phi_o_{c}": mo(C[c][0]) for c in "ab"},
+                              **{f"phi_v_{c}": mo(C[c][1]) for c in "ab"},
+                              **{f"X_{c}": X[c] for c in "ab"},
+                              **{k: v for k, v in ground.items() if k != "w"})
+                    ref = []
+                    for x in range(nx):
+                        fP = {}
+                        for c in "ab":
+                            P = C[c][0] @ X[c][x] @ C[c][1].T
+                            fP[c] = fields(P + P.T, T)
+                        F = lib(single.name, chi=T, **ground,
+                                **tower_ops(fP["a"], fP["b"], sfx="_p1"))
+                        ref.append(C[s][0].T @ F @ C[s][1])
+                rep.check(f"{name} nx={nx} == C_occ^T o2 C_vir", got,
+                          np.stack(ref), 1e-12)
+
+
 def check_fock_derivative(lib, rep, fam, spin, sysm):
     """dF/dX: basis class (f1, atom mask), grid class (fg, w := w M^A)
     and weight class (o1, w := dw/dX), each against FD of the o1 kernel
@@ -897,6 +954,8 @@ def main():
         check_diag(lib, rep)
         print("batched linear response")
         check_batch(lib, rep)
+        print("MO-projected linear response")
+        check_mo(lib, rep)
         sysm = System()
         for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")

@@ -88,6 +88,8 @@ def _batch_operands(operands: Dict, ng: int):
 
 
 def _kind(name: str) -> str:
+    if name.endswith("_mo"):
+        return "mo2u" if ("_ua_" in name or "_ub_" in name) else "mo2"
     if name.endswith("_o2_batch"):
         return "o2b"
     if name.endswith("_giao"):
@@ -144,6 +146,53 @@ class Library:
                 "h2bbu": "h2bb", "h2bbc": "h2bb", "h2bbcu": "h2bb",
                 "h2bgc": "h2bg", "e1pc": "e1p"}.get(k, k)
 
+    def _call_mo(self, name, kind, w, out, operands):
+        """An MO-projected response kernel: towers phi_o, phi_v (or the
+        _a/_b pairs), amplitudes X (or X_a, X_b) of shape (nx, nocc, nvir);
+        returns sigma (nx, nocc, nvir) of the output channel."""
+        ng = np.asarray(w).shape[0]
+        chans = ["a", "b"] if kind == "mo2u" else [""]
+        sfx = lambda c: f"_{c}" if c else ""
+        keep, args, dims = [], [ctypes.c_int64(ng)], {}
+        towers = {}
+        for c in chans:
+            for t in ("phi_o", "phi_v"):
+                v = np.ascontiguousarray(operands.pop(t + sfx(c)),
+                                         dtype=np.float64)
+                towers[t + sfx(c)] = v
+            dims["nocc" + sfx(c)] = towers["phi_o" + sfx(c)].shape[1]
+            dims["nvir" + sfx(c)] = towers["phi_v" + sfx(c)].shape[1]
+        amps = {c: np.ascontiguousarray(operands.pop("X" + sfx(c)),
+                                        dtype=np.float64) for c in chans}
+        nx = next(iter(amps.values())).shape[0]
+        for c in chans:
+            args += [ctypes.c_int64(dims["nocc" + sfx(c)]),
+                     ctypes.c_int64(dims["nvir" + sfx(c)])]
+        args.append(ctypes.c_int64(nx))
+        for c in chans:
+            for t in ("phi_o", "phi_v"):
+                keep.append(towers[t + sfx(c)])
+                args.append(towers[t + sfx(c)].ctypes.data_as(_P))
+        for c in chans:
+            keep.append(amps[c])
+            args.append(amps[c].ctypes.data_as(_P))
+        scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
+                **_operands(operands, ng)}
+        names = self.scal_names(name)
+        missing = [n for n in names if n not in scal]
+        if missing:
+            raise TypeError(f"{name}: missing operands {missing}")
+        ptrs = (_P * len(names))(*[scal[n].ctypes.data_as(_P) for n in names])
+        s = "" if kind == "mo2" else ("a" if "_ua_" in name else "b")
+        shape = (nx, dims["nocc" + sfx(s)], dims["nvir" + sfx(s)])
+        out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
+        fn = getattr(self._dll, name)
+        fn.restype = ctypes.c_int
+        rc = fn(*args, ptrs, out.ctypes.data_as(_P))
+        if rc != 0:
+            raise RuntimeError(f"{name} returned {rc}")
+        return out
+
     def _has(self, symbol: str) -> bool:
         try:
             ctypes.c_int.in_dll(self._dll, symbol)
@@ -162,6 +211,8 @@ class Library:
         DTchi = M^T chi; the dF/dX basis class takes Dchi (or Dchi_a and
         Dchi_b) and the atom mask (nbf,), one atom per call."""
         kind = self.kind(name)
+        if kind in ("mo2", "mo2u"):
+            return self._call_mo(name, kind, w, out, operands)
         ng = np.asarray(w).shape[0]
         nx = None
         if kind == "o2b":
