@@ -111,6 +111,9 @@ class CatalogEntry:
         if self.kind == "o2b":
             return CatalogEntry(self.family, self.spin, self.order,
                                 self.parities).name + "_batch"
+        if self.kind == "mo2":
+            return CatalogEntry(self.family, self.spin, self.order,
+                                self.parities).name + "_mo"
         if self.kind in ("g1", "gg", "f1", "fg", "h2bb", "h2bg", "h2gg",
                          "e1p"):
             return f"xck_{self.family}_{self.spin}_{self.kind}"
@@ -150,6 +153,9 @@ class CatalogEntry:
                 "h2gg": ("explicit XC nuclear Hessian, grid-grid, per point"),
                 "e1p": ("per-point energy-density derivative from the motion "
                         "of one atom's functions (Hessian weight classes)"),
+                "mo2": ("linear-response sigma vectors C_occ^T F1[X] C_vir in "
+                        "the occupied x virtual space, for a batch of trial "
+                        "vectors"),
                 "o2b": ("linear-response contraction for a batch of "
                         "perturbations at one ground state"),
                 "f1": ("nuclear derivative of the XC Fock matrix "
@@ -194,6 +200,11 @@ def _one_index_entries(fam: str, max_order: int = 2) -> Iterator[CatalogEntry]:
         if polarized:
             for par in ((+1,), (-1,)):
                 yield CatalogEntry(fam, "st", 2, parities=par, kind="o2b")
+            # the MO-projected response (sigma vectors)
+            for par in ((+1,), (-1,)):
+                yield CatalogEntry(fam, "st", 2, parities=par, kind="mo2")
+            for spin in ("ua", "ub"):
+                yield CatalogEntry(fam, spin, 2, kind="mo2")
     from .engine.hessian import HESSIAN_FAMILIES
     if fam in HESSIAN_FAMILIES and max_order >= 2:   # the nuclear Hessian
         for kind in ("h2bb", "h2bg", "e1p"):
@@ -441,7 +452,7 @@ def _kind_kernels(e: CatalogEntry):
     if e.kind == "diag":
         ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 1)))
         return [ck], ck, None
-    if e.kind == "o2b":
+    if e.kind in ("o2b", "mo2"):
         ck = collapse(_integrand_for(CatalogEntry(e.family, e.spin, 2,
                                                   e.parities)))
         return [ck], ck, None
@@ -563,6 +574,8 @@ def abi_kind(e: CatalogEntry) -> str:
         return "giao"
     if e.kind == "o2b":
         return "o2b"
+    if e.kind == "mo2":
+        return "mo2" if e.spin == "st" else "mo2u"
     general = e.family in GENERAL_DM_FAMILIES
     if e.kind == "h2bb":
         return "h2bb" + ("c" if general else "") + \
@@ -584,6 +597,8 @@ def _emit_kind(e: CatalogEntry):
     from .emitters.cbackend import ABI_KINDS, emit_tower_cpp, emit_tower_hpp
     blocks, scal_ck, computed = _kind_kernels(e)
     abi = abi_kind(e)
+    if abi in ("mo2", "mo2u"):
+        return _emit_mo(e, blocks[0], abi)
     # the basis-basis rows of an unrestricted channel read that channel's
     # contracted towers
     rename = ({"Dchi": f"Dchi_{e.spin[1]}", "DTchi": f"DTchi_{e.spin[1]}"}
@@ -680,6 +695,65 @@ def _emit_kind(e: CatalogEntry):
             "whose parent atom is A (call with the plain weights; no atom "
             "masking in the kernel).")
     m["gradient_classes"] = _GRADIENT_CLASSES
+    return hpp, cpp, m
+
+
+def _emit_mo(e: CatalogEntry, ck, abi: str):
+    """(hpp, cpp, manifest entry) of an MO-projected response entry."""
+    from .emitters.cbackend import (ABI_KINDS, MO_KINDS, emit_mo_cpp,
+                                    emit_mo_hpp, mo_layout)
+    from .emitters.tower import ncomp
+    ch = e.spin[1] if e.spin in ("ua", "ub") else ""
+    hpp = emit_mo_hpp(ck, e.name, abi, ch)
+    cpp = emit_mo_cpp(ck, e.name, abi)
+    names, nf, order = mo_layout(ck)
+    spec = MO_KINDS[abi]
+    single = CatalogEntry(e.family, e.spin, 2, e.parities).name
+    params = []
+    for t in spec["towers"]:
+        side = "nocc" if "phi_o" in t else "nvir"
+        sfx = t[len("phi_o"):]
+        params.append({"name": t, "shape": f"(ncomp, {side}{sfx}, ng)",
+                       "order": order, "ncomp": ncomp(order),
+                       "kind": "mo_collocation_tower",
+                       "definition": f"{t}[k,i,g] = sum_u C{sfx}_occ|vir[u,i]"
+                                     " chi[k,u,g]"})
+    for a in spec["amps"]:
+        sfx = a[1:]
+        params.append({"name": a, "shape": f"(nx, nocc{sfx}, nvir{sfx})",
+                       "kind": "trial_amplitudes"})
+    for f in names[:nf]:
+        params.append({"name": f, "shape": "(ng,)",
+                       "kind": "grid_weights" if f == "w" else "gs_field"})
+    for x in names[nf:]:
+        params.append({"name": x, "shape": "(ng,)", "kind": "libxc_deriv"})
+    m: Dict = {
+        "name": e.name, "description": e.description, "family": e.family,
+        "spin": e.spin, "order": 2, "batch": True, "kind": "mo2",
+        "abi_kind": abi, "output_shape": ABI_KINDS[abi][2],
+        "abi": "xckernel.h",
+        "generator": "machine-generated by xckernel; do not edit",
+        "copyright": "Copyright (c) 2026 Susi Lehtola",
+        "ownership": OWNERSHIP,
+        "libxc": {"input_variables": FAMILY_VARS[e.family],
+                  "spin_mode": "polarized", "max_derivative_order": 2,
+                  "derivative_arrays": list(ck.libxc_args)},
+        "params": params, "scal_names": names, "tower_orders":
+            {t: order for t in spec["towers"]},
+        "convention": (
+            f"out[(x*nocc + i)*nvir + a] += sum_uv C_occ[u,i] F1_x[u,v] "
+            f"C_vir[v,a], F1_x the {single} response to P_x = C_occ X_x "
+            "C_vir^T + C_vir X_x^T C_occ^T, for trial vectors x < nx; the "
+            "kernel forms the perturbed fields of P_x from the MO "
+            "collocation towers and the amplitudes itself."
+            + (" Spin-adapted: X are the alpha amplitudes; the beta "
+               "perturbation is parity * X." if e.spin == "st" else
+               f" Unrestricted: both channels' towers and amplitudes; the "
+               f"output is the {ch} channel's sigma (nocc_{ch}, nvir_{ch}).")
+            + " Real response (symmetric P) only."),
+    }
+    if e.parities:
+        m["parities"] = list(e.parities)
     return hpp, cpp, m
 
 
