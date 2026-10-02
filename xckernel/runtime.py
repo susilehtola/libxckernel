@@ -54,7 +54,42 @@ def _operands(operands: Dict, ng: int) -> Dict[str, np.ndarray]:
     return scal
 
 
+_BATCHED = __import__("re").compile(r"_p\d+(?:_|$)")
+
+
+def _batch_operands(operands: Dict, ng: int):
+    """Operands of a batched kernel: perturbed ones (names with _pN) as
+    (nx, ng) arrays -- or whole (nx, ncomp, ng) towers under their base
+    name -- the rest as for _operands. Returns (scal, nx)."""
+    scal: Dict[str, np.ndarray] = {}
+    plain = {}
+    nx = None
+    for key, val in operands.items():
+        if not _BATCHED.search(key):
+            plain[key] = val
+            continue
+        val = np.asarray(val, dtype=np.float64)
+        if val.ndim == 2:
+            scal[key] = np.ascontiguousarray(val)
+        else:
+            n = next((k for k in range(8) if val.shape[1:] == (ncomp(k), ng)),
+                     None)
+            if n is None:
+                raise ValueError(f"batched operand {key!r}: expected (nx, "
+                                 f"{ng}) or (nx, ncomp, {ng}), got {val.shape}")
+            for i, ax in enumerate(components(n)):
+                scal[f"{key}_{ax}" if ax else key] = \
+                    np.ascontiguousarray(val[:, i])
+        if nx is not None and val.shape[0] != nx:
+            raise ValueError("batched operands disagree on nx")
+        nx = val.shape[0]
+    scal.update(_operands(plain, ng))
+    return scal, nx
+
+
 def _kind(name: str) -> str:
+    if name.endswith("_o2_batch"):
+        return "o2b"
     if name.endswith("_giao"):
         return "giao"
     if name.endswith("_o1_diag"):
@@ -126,8 +161,13 @@ class Library:
         Dchi_b) and the atom mask (nbf,), one atom per call."""
         kind = self.kind(name)
         ng = np.asarray(w).shape[0]
-        scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
-                **_operands(operands, ng)}
+        nx = None
+        if kind == "o2b":
+            bscal, nx = _batch_operands(operands, ng)
+            scal = {"w": np.ascontiguousarray(w, dtype=np.float64), **bscal}
+        else:
+            scal = {"w": np.ascontiguousarray(w, dtype=np.float64),
+                    **_operands(operands, ng)}
         names = self.scal_names(name)
         missing = [n for n in names if n not in scal]
         if missing:
@@ -161,6 +201,8 @@ class Library:
             nbf = val.shape[1]
             if arr == "chi":
                 args.append(ctypes.c_int64(nbf))
+                if kind == "o2b":
+                    args.append(ctypes.c_int64(nx))
             keep.append(val)
             args.append(val.ctypes.data_as(_P))
         if kind == "f1":
@@ -177,7 +219,7 @@ class Library:
             args.append(cen.ctypes.data_as(_P))
         shape = {"matrix": (nbf, nbf), "diag": (nbf,), "g1": (3, nbf),
                  "gg": (3, ng), "f1": (3, nbf, nbf), "fg": (3, nbf, nbf),
-                 "giao": (3, nbf, nbf)}[kind]
+                 "giao": (3, nbf, nbf), "o2b": (nx, nbf, nbf)}[kind]
         out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
         fn = getattr(self._dll, name)
         fn.restype = ctypes.c_int

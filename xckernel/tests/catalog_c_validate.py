@@ -62,14 +62,15 @@ def build_library(td: Path) -> Library:
         (src / f"{name}.cpp").write_text(cpp)
 
     for fam in FAMILIES:
-        matrix = [(s, 1) for s in ("r", "ua", "ub")]
-        if fam in GRADIENT_FAMILIES or fam in GENERAL_DM:
-            matrix += [("r", 2), ("ua", 2)]
+        matrix = [(s, 1, ()) for s in ("r", "ua", "ub")]
+        # every o2 (each has a batched twin in _one_index_entries)
+        matrix += [(s, 2, ()) for s in ("r", "ua", "ub")]
+        matrix += [("st", 2, (+1,)), ("st", 2, (-1,))]
         for e in _one_index_entries(fam):
             hpp, cpp, _ = _emit_kind(e)
             write(e.name, hpp, cpp)
-        for spin, order in matrix:
-            e = CatalogEntry(fam, spin, order)
+        for spin, order, par in matrix:
+            e = CatalogEntry(fam, spin, order, par)
             ck = collapse(_integrand_for(e))
             write(e.name, emit_kernel_hpp(ck, e.name),
                   emit_kernel_cpp(ck, e.name))
@@ -474,6 +475,35 @@ def check_matrix(lib, rep, fam, sysm):
         rep.check(f"{fam:9s} {spin:2s} o2 == d(o1)/dD . D1", F2, fd2, 1e-9)
 
 
+def check_batch(lib, rep, nbf=5, ng=37, seed=4):
+    """o2_batch == nx single o2 calls, every family and spin case."""
+    rng = np.random.default_rng(seed)
+    for fam in FAMILIES:
+        cases = [CatalogEntry(fam, s, 2) for s in ("r", "ua", "ub")] + \
+            [CatalogEntry(fam, "st", 2, (p,)) for p in (+1, -1)]
+        for single in cases:
+            batch = CatalogEntry(single.family, single.spin, 2,
+                                 single.parities, kind="o2b").name
+            names = lib.scal_names(single.name)
+            if lib.scal_names(batch) != names:
+                rep.check(f"{batch} operand order", 1.0, 0.0, 0.5)
+                continue
+            T = rng.standard_normal((len(components(lib.order(single.name))),
+                                     nbf, ng))
+            for nx in (1, 3, 11):
+                ground = {n: rng.standard_normal(ng) for n in names
+                          if "_p1" not in n}
+                ground["w"] = np.abs(ground["w"]) + 0.1
+                pert = {n: rng.standard_normal((nx, ng)) for n in names
+                        if "_p1" in n}
+                got = lib(batch, chi=T, **ground, **pert)
+                ref = np.stack([lib(single.name, chi=T, **ground,
+                                    **{n: v[x] for n, v in pert.items()})
+                                for x in range(nx)])
+                rep.check(f"{batch} nx={nx} == {nx} x {single.name}", got,
+                          ref, 1e-13)
+
+
 def check_fock_derivative(lib, rep, fam, spin, sysm):
     """dF/dX: basis class (f1, atom mask), grid class (fg, w := w M^A)
     and weight class (o1, w := dw/dX), each against FD of the o1 kernel
@@ -692,6 +722,8 @@ def main():
         lib = build_library(Path(td))
         print("Fock diagonal")
         check_diag(lib, rep)
+        print("batched linear response")
+        check_batch(lib, rep)
         sysm = System()
         for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")
