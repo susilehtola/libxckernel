@@ -331,9 +331,15 @@ host-supplied array it replaces, so the number of GEMMs is unchanged.
 Every kernel also exports its ABI kind (`<name>_kind`: `"matrix"`,
 `"diag"`, `"g1"`, `"f1u"`, `"h2bb"`, ...), output rank and shape
 (`<name>_out_rank`, `<name>_out_shape`), and `xckernel.h` declares an
-index of the build, `xckernel_kernels[]` of `{name, kind, order,
-out_rank, out_shape}`, so a host can dispatch without parsing
-signatures.
+index of the build, `xckernel_kernels[]`. Each entry holds:
+- `name`, `kind`, `order`, `out_rank` and `out_shape`;
+- the entry point `fn`, to be cast to the signature of its kind;
+- `scal_names`, `n_scal` and `n_fields`;
+- the tower orders `chi_order`, `dchi_order` and `dtchi_order`, which
+  are −1 for a tower the kind doesn't take.
+
+A host can therefore dispatch from the exported metadata alone, with no
+table of its own that could go stale against the kernels it vendors.
 
 Generation takes a small fraction of the time needed to compile the
 emitted code. To produce a self-contained source tree for distribution
@@ -342,6 +348,23 @@ emitted code. To produce a self-contained source tree for distribution
 ```sh
 python3 -m xckernel.catalog libxckernel "lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau,hmgga" 4 c
 ```
+
+A host that needs only some of the kernel kinds selects them with
+`--kinds`, which takes the exported kind names (default: `all`):
+
+```sh
+python3 -m xckernel.catalog libxckernel lda,gga,mgga_tau,mgga_lapl,mgga,cmgga_tau 2 c \
+    --kinds exc,matrix,diag,o2b,mo2,mo2u,g1,g1c,gg
+```
+
+Unselected kinds are not generated at all. Everything in the package
+follows the selection: the kernel sources, `xckernel.h`, the index, the
+CMake and Fortran files, and `manifest.json`, whose `kinds` field records
+it. `evaluator.hpp` carries only the helpers the selected kernels call,
+and `xckernel.h` records the selection as `XCKERNEL_KINDS`. For the
+selection above, generation drops from about 7 min to 9 s and the package
+from 19 MB to 4 MB. `catalog_c_validate --kinds …` validates the same
+selection, skipping the check groups that need an absent kind.
 
 ## What is validated
 

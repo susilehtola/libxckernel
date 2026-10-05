@@ -219,11 +219,39 @@ def _one_index_entries(fam: str, max_order: int = 2) -> Iterator[CatalogEntry]:
 
 
 def entries(families=FAMILIES, max_order: int = 4,
-            include_heavy: bool = False) -> Iterator[CatalogEntry]:
-    """Enumerate the catalog; HEAVY entries only with include_heavy."""
+            include_heavy: bool = False,
+            kinds=None) -> Iterator[CatalogEntry]:
+    """Enumerate the catalog; HEAVY entries only with include_heavy, and
+    only the ABI kinds in ``kinds`` (None: all)."""
     for e in _all_entries(families, max_order):
-        if include_heavy or e.name not in HEAVY:
-            yield e
+        if not include_heavy and e.name in HEAVY:
+            continue
+        if kinds is not None and entry_kind(e) not in kinds:
+            continue
+        yield e
+
+
+def kind_names() -> Tuple[str, ...]:
+    """Every ABI kind a C package entry can have, as exported in
+    <name>_kind and accepted by --kinds."""
+    from .emitters.cbackend import ABI_KINDS
+    return ("exc",) + tuple(ABI_KINDS)
+
+
+def parse_kinds(spec) -> Optional[Tuple[str, ...]]:
+    """A kind selection, 'all'/None or a comma-separated list of ABI kinds
+    (validated), as a tuple in the canonical order of kind_names()."""
+    if spec is None or spec == "all":
+        return None
+    want = [k.strip() for k in (spec.split(",") if isinstance(spec, str)
+                                else spec) if k.strip()]
+    known = kind_names()
+    unknown = [k for k in want if k not in known]
+    if unknown:
+        raise ValueError(f"unknown kinds {unknown}; known: {', '.join(known)}")
+    if not want:
+        raise ValueError("empty kind selection")
+    return tuple(k for k in known if k in want)
 
 
 def _all_entries(families, max_order: int) -> Iterator[CatalogEntry]:
@@ -592,6 +620,14 @@ def abi_kind(e: CatalogEntry) -> str:
     return e.kind or "matrix"
 
 
+def entry_kind(e: CatalogEntry) -> str:
+    """The ABI kind of any catalog entry: 'exc' for the energy kernels,
+    abi_kind for the rest ('matrix' for the response kernels)."""
+    if e.order == 0 and not e.kind and not e.giao:
+        return "exc"
+    return abi_kind(e)
+
+
 def _emit_kind(e: CatalogEntry):
     """(hpp, cpp, manifest entry) of a diag/g1/gg entry."""
     from .emitters.cbackend import ABI_KINDS, emit_tower_cpp, emit_tower_hpp
@@ -817,9 +853,31 @@ _GRADIENT_CLASSES = {
 VERSION = "0.4.0"
 
 
+def _index_meta(m: Dict):
+    """(n_scal, n_fields, (chi, Dchi, DTchi orders)) of a C package
+    manifest entry, for the kernel index; -1 for a tower the kind does
+    not take."""
+    from .emitters.cbackend import ABI_KINDS
+    kind = m.get("abi_kind", "matrix")
+    if kind == "exc":
+        return 0, 0, (-1, -1, -1)
+    names = m["scal_names"]
+    nfl = len(names) - len(m["libxc"]["derivative_arrays"])
+    towers = ABI_KINDS[kind][1]
+    orders = m.get("tower_orders", {})
+
+    def first(prefixes):
+        for t in towers:
+            if t.split("_")[0] in prefixes:
+                return orders.get(t, 0)
+        return -1
+    return len(names), nfl, (first(("chi", "phi")), first(("Dchi",)),
+                             first(("DTchi",)))
+
+
 def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                   verbose: bool = True, backend: str = "numpy",
-                  include_heavy: bool = False) -> Dict:
+                  include_heavy: bool = False, kinds=None) -> Dict:
     """Generate the full catalog.
 
     backend='numpy': outdir/kernels/*.py + manifest.json (batched kernels).
@@ -829,16 +887,24 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                      are manifest-only in the C package (the contraction
                      sum(w*rho*zk) is left to the host); response kernels
                      take one perturbation-batch entry per call.
+
+    kinds: the ABI kinds to generate (see kind_names(); None or 'all':
+    every kind). Unselected entries are not generated at all; the header,
+    index, CMake, Fortran module, manifest and evaluator helpers follow
+    the selection, which the manifest records under "kinds".
     """
     out = Path(outdir)
+    kinds = parse_kinds(kinds)
     manifest: Dict = {"generator": "xckernel", "backend": backend,
                       "version": VERSION, "max_order": max_order,
+                      "families": list(families),
+                      "kinds": list(kinds) if kinds else "all",
                       "gradient_classes": _GRADIENT_CLASSES,
                       "kernels": []}
 
     if backend == "numpy":
         (out / "kernels").mkdir(parents=True, exist_ok=True)
-        for e in entries(families, max_order, include_heavy):
+        for e in entries(families, max_order, include_heavy, kinds):
             t0 = time.time()
             if e.kind:
                 manifest["kernels"].append({
@@ -857,24 +923,25 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                       f"{npat:3d} patterns {nprod:3d} products",
                       flush=True)
     elif backend == "c":
-        from .emitters.cbackend import (_CONFIG_H_IN, _EVALUATOR_HPP,
-                               emit_cmake, emit_exc_cpp,
+        from .emitters.cbackend import (_CONFIG_H_IN, emit_cmake,
+                               emit_evaluator, emit_exc_cpp,
                                emit_exc_hpp, emit_f03, emit_header,
-                               emit_kernel_cpp, emit_kernel_hpp)
+                               emit_kernel_cpp, emit_kernel_hpp,
+                               helpers_used)
         from .emitters.codegen import collapse, generate_collapsed
         (out / "src").mkdir(parents=True, exist_ok=True)
         (out / "include" / "xckernel" / "kernels").mkdir(parents=True,
                                                          exist_ok=True)
         (out / "fortran").mkdir(exist_ok=True)
-        (out / "include" / "xckernel" / "evaluator.hpp").write_text(
-            _EVALUATOR_HPP)
         (out / "include" / "xckernel" / "config.h.in").write_text(
             _CONFIG_H_IN)
         names: List = []
-        for e in entries(families, max_order, include_heavy):
+        sources: List[str] = []     # kernel headers, for the helper scan
+        for e in entries(families, max_order, include_heavy, kinds):
             t0 = time.time()
             if e.kind or e.giao:
                 hpp, cpp, m = _emit_kind(e)
+                sources.append(hpp)
                 (out / "include" / "xckernel" / "kernels"
                  / f"{e.name}.hpp").write_text(hpp)
                 (out / "src" / f"{e.name}.cpp").write_text(cpp)
@@ -898,8 +965,10 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
                 continue
             ki = _integrand_for(e)
             ck = collapse(ki)
+            hpp = emit_kernel_hpp(ck, e.name)
+            sources.append(hpp)
             (out / "include" / "xckernel" / "kernels"
-             / f"{e.name}.hpp").write_text(emit_kernel_hpp(ck, e.name))
+             / f"{e.name}.hpp").write_text(hpp)
             (out / "src" / f"{e.name}.cpp").write_text(
                 emit_kernel_cpp(ck, e.name))
             # manifest from the (unbatched-ABI) generated form
@@ -916,13 +985,20 @@ def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
             if verbose:
                 print(f"  {e.name:28s} {time.time()-t0:7.1f}s  "
                       f"{len(ck.patterns):3d} patterns", flush=True)
+        if not names:
+            raise ValueError(f"no kernels for kinds {kinds} in families "
+                             f"{list(families)} at max_order {max_order}")
+        (out / "include" / "xckernel" / "evaluator.hpp").write_text(
+            emit_evaluator(helpers_used(sources)))
         (out / "include" / "xckernel.h").write_text(
-            emit_header(names, VERSION))
+            emit_header(names, VERSION, kinds))
         (out / "fortran" / "xckernel_f03.f90").write_text(
             emit_f03(names, VERSION))
         (out / "CMakeLists.txt").write_text(emit_cmake(names, VERSION))
         from .emitters.cbackend import emit_index_cpp
-        (out / "src" / "xckernel_index.cpp").write_text(emit_index_cpp(names))
+        meta = {m["name"]: _index_meta(m) for m in manifest["kernels"]}
+        (out / "src" / "xckernel_index.cpp").write_text(
+            emit_index_cpp(names, meta))
     else:
         raise ValueError(f"unknown backend {backend!r}")
 
@@ -951,6 +1027,10 @@ def main(argv=None):
                    help="highest derivative order to generate (default: 4)")
     p.add_argument("backend", nargs="?", default="numpy",
                    help="emission backend (default: numpy)")
+    p.add_argument("--kinds", default="all",
+                   help="comma-separated ABI kinds to generate, as exported "
+                        "in <name>_kind (default: all; known: "
+                        f"{','.join(kind_names())})")
     p.add_argument("--include-heavy", action="store_true",
                    help="also generate the HEAVY entries "
                         f"({', '.join(sorted(HEAVY))})")
@@ -959,8 +1039,12 @@ def main(argv=None):
     unknown = [f for f in families if f not in FAMILIES]
     if unknown:
         p.error(f"unknown families {unknown}; known: {', '.join(FAMILIES)}")
+    try:
+        kinds = parse_kinds(a.kinds)
+    except ValueError as err:
+        p.error(str(err))
     m = build_catalog(a.outdir, families, a.max_order, backend=a.backend,
-                      include_heavy=a.include_heavy)
+                      include_heavy=a.include_heavy, kinds=kinds)
     print(f"{len(m['kernels'])} kernels -> {a.outdir}/ [{a.backend}]")
 
 

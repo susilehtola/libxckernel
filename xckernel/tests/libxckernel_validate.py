@@ -18,24 +18,161 @@ import numpy as np
 from ..catalog import build_catalog
 
 
+def _build(pkg: Path) -> Path:
+    """Configure and build a generated package; the build directory."""
+    bld = pkg / "build"
+    bld.mkdir()
+    # a small grid block exercises the blocked GEMM path (several
+    # blocks and a remainder) at the test's grid size; the prefix
+    # lets FindBLAS see an environment's BLAS (conda, venv)
+    subprocess.run(["cmake", "..", "-DBUILD_SHARED_LIBS=ON",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DXCKERNEL_GRID_BLOCK=16",
+                    f"-DCMAKE_PREFIX_PATH={sys.prefix}"],
+                   cwd=bld, check=True, capture_output=True)
+    subprocess.run(["make", "-j3"], cwd=bld, check=True,
+                   capture_output=True)
+    return bld
+
+
+def check_index(dll, man, verbose=False):
+    """The kernel index against the manifest and the per-kernel exports:
+    it lists exactly the manifest's kernels; each entry's kind, rank and
+    shape, entry point, operand names and tower orders match. Returns
+    (tested, failures)."""
+    import ctypes
+
+    from ..emitters.cbackend import ABI_KINDS, out_rank
+
+    class _Info(ctypes.Structure):
+        _fields_ = [("name", ctypes.c_char_p), ("kind", ctypes.c_char_p),
+                    ("order", ctypes.c_int), ("out_rank", ctypes.c_int),
+                    ("out_shape", ctypes.c_char_p),
+                    ("fn", ctypes.c_void_p),
+                    ("scal_names", ctypes.POINTER(ctypes.c_char_p)),
+                    ("n_scal", ctypes.c_int), ("n_fields", ctypes.c_int),
+                    ("chi_order", ctypes.c_int), ("dchi_order", ctypes.c_int),
+                    ("dtchi_order", ctypes.c_int)]
+    tested = failures = 0
+    n = ctypes.c_int.in_dll(dll, "xckernel_n_kernels").value
+    table = (_Info * n).in_dll(dll, "xckernel_kernels")
+    index = {t.name.decode(): t for t in table}
+    built = {k["name"]: k for k in man["kernels"] if "abi" in k}
+    tested += 1
+    if set(index) != set(built):
+        failures += 1
+        print("  [FAIL] kernel index:", sorted(set(index) ^ set(built)))
+    for name, k in built.items():
+        t = index.get(name)
+        got = (ctypes.c_char_p.in_dll(dll, f"{name}_kind").value.decode(),
+               ctypes.c_int.in_dll(dll, f"{name}_out_rank").value,
+               ctypes.c_char_p.in_dll(dll, f"{name}_out_shape").value
+               .decode())
+        want = (k["abi_kind"], out_rank(k["output_shape"]),
+                k["output_shape"])
+        tested += 1
+        if t is None or got != want or \
+                (t.kind.decode(), t.out_rank, t.out_shape.decode()) != got:
+            failures += 1
+            print(f"  [FAIL] kind export {name}: {got} vs {want}")
+            continue
+        # dispatch metadata: the entry point is the symbol; the operand
+        # names, field count and tower orders are the kernel's exports
+        bad = []
+        if t.fn != ctypes.cast(getattr(dll, name), ctypes.c_void_p).value:
+            bad.append("fn")
+        kind = got[0]
+        if kind == "exc":
+            if t.scal_names or t.n_scal or \
+                    (t.chi_order, t.dchi_order, t.dtchi_order) != (-1,) * 3:
+                bad.append("exc metadata")
+        else:
+            ns = ctypes.c_int.in_dll(dll, f"{name}_n_scal").value
+            nf = ctypes.c_int.in_dll(dll, f"{name}_n_fields").value
+            names = [t.scal_names[i].decode() for i in range(t.n_scal)]
+            if (t.n_scal, t.n_fields) != (ns, nf) or \
+                    names != k["scal_names"]:
+                bad.append("operands")
+            towers = ABI_KINDS[kind][1]
+
+            def order(prefix):
+                for a in towers:
+                    if a.split("_")[0] in prefix:
+                        return ctypes.c_int.in_dll(
+                            dll, f"{name}_{a}_order").value
+                return -1
+            if (t.chi_order, t.dchi_order, t.dtchi_order) != (
+                    order(("chi", "phi")), order(("Dchi",)),
+                    order(("DTchi",))):
+                bad.append("tower orders")
+        tested += 1
+        if bad:
+            failures += 1
+            print(f"  [FAIL] index entry {name}: {', '.join(bad)}")
+    return tested, failures
+
+
+def validate_selection(families=("gga", "mgga_tau"), max_order=2,
+                       kinds=("exc", "matrix", "diag", "o2b", "mo2"),
+                       verbose=False):
+    """A kind-selective package: the manifest records the selection and
+    lists exactly the selected entries, the index matches it, the header
+    declares only them, and the evaluator carries only the helpers they
+    call. Returns (tested, failures)."""
+    import ctypes
+    import re
+
+    from ..catalog import entries, entry_kind, parse_kinds
+    from ..emitters.cbackend import OPTIONAL_HELPERS
+    tested = failures = 0
+    sel = parse_kinds(",".join(kinds))
+    with tempfile.TemporaryDirectory() as td:
+        pkg = Path(td) / "libxck"
+        build_catalog(str(pkg), families, max_order, verbose=verbose,
+                      backend="c", kinds=sel)
+        man = json.loads((pkg / "manifest.json").read_text())
+        want = {e.name for e in entries(families, max_order, kinds=sel)}
+        got = {k["name"] for k in man["kernels"]}
+        tested += 1
+        if man["kinds"] != list(sel) or got != want or \
+                {entry_kind(e) for e in entries(families, max_order)
+                 if e.name in got} - set(sel):
+            failures += 1
+            print(f"  [FAIL] selection manifest: kinds {man['kinds']}, "
+                  f"{sorted(got ^ want)}")
+        header = (pkg / "include" / "xckernel.h").read_text()
+        declared = set(re.findall(r"\b(xck_\w+)\(", header))
+        tested += 1
+        if declared != want or \
+                f'#define XCKERNEL_KINDS "{",".join(sel)}"' not in header:
+            failures += 1
+            print("  [FAIL] selection header:", sorted(declared ^ want))
+        ev = (pkg / "include" / "xckernel" / "evaluator.hpp").read_text()
+        srcs = "\n".join(p.read_text() for p in
+                         (pkg / "include" / "xckernel" / "kernels")
+                         .glob("*.hpp"))
+        for h in OPTIONAL_HELPERS:
+            used = re.search(rf"\b{h}\s*[<(]", srcs) is not None
+            present = re.search(rf"inline void {h}\(", ev) is not None
+            tested += 1
+            if used != present:
+                failures += 1
+                print(f"  [FAIL] evaluator helper {h}: used {used}, "
+                      f"present {present}")
+        bld = _build(pkg)
+        dll = ctypes.CDLL(str(bld / "libxckernel.so"))
+        t, f = check_index(dll, man)
+        tested, failures = tested + t, failures + f
+    return tested, failures
+
+
 def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                        nbf=4, ng=50, seed=3, verbose=False):
     with tempfile.TemporaryDirectory() as td:
         pkg = Path(td) / "libxck"
         build_catalog(str(pkg), families, max_order, verbose=verbose,
                       backend="c")
-        bld = pkg / "build"
-        bld.mkdir()
-        # a small grid block exercises the blocked GEMM path (several
-        # blocks and a remainder) at the test's grid size; the prefix
-        # lets FindBLAS see an environment's BLAS (conda, venv)
-        subprocess.run(["cmake", "..", "-DBUILD_SHARED_LIBS=ON",
-                        "-DCMAKE_BUILD_TYPE=Release",
-                        "-DXCKERNEL_GRID_BLOCK=16",
-                        f"-DCMAKE_PREFIX_PATH={sys.prefix}"],
-                       cwd=bld, check=True, capture_output=True)
-        subprocess.run(["make", "-j3"], cwd=bld, check=True,
-                       capture_output=True)
+        bld = _build(pkg)
         man = json.loads((pkg / "manifest.json").read_text())
 
         # every response kernel through the self-describing runtime layer
@@ -67,38 +204,9 @@ def build_and_validate(families=("lda", "gga", "hmgga"), max_order=3,
                 failures += 1
                 print(f"  [FAIL] {name}")
 
-        # machine-readable kinds: every kernel's exported kind, rank and
-        # shape match its manifest entry, and the index lists exactly the
-        # built kernels
-        import ctypes
-
-        from ..emitters.cbackend import out_rank
-
-        class _Info(ctypes.Structure):
-            _fields_ = [("name", ctypes.c_char_p), ("kind", ctypes.c_char_p),
-                        ("order", ctypes.c_int), ("out_rank", ctypes.c_int),
-                        ("out_shape", ctypes.c_char_p)]
-        dll = rt._dll
-        n = ctypes.c_int.in_dll(dll, "xckernel_n_kernels").value
-        table = (_Info * n).in_dll(dll, "xckernel_kernels")
-        index = {t.name.decode(): (t.kind.decode(), t.out_rank,
-                                   t.out_shape.decode()) for t in table}
-        built = {k["name"]: k for k in man["kernels"] if "abi" in k}
-        tested += 1
-        if set(index) != set(built):
-            failures += 1
-            print("  [FAIL] kernel index:", sorted(set(index) ^ set(built)))
-        for name, k in built.items():
-            got = (ctypes.c_char_p.in_dll(dll, f"{name}_kind").value.decode(),
-                   ctypes.c_int.in_dll(dll, f"{name}_out_rank").value,
-                   ctypes.c_char_p.in_dll(dll, f"{name}_out_shape").value
-                   .decode())
-            want = (k["abi_kind"], out_rank(k["output_shape"]),
-                    k["output_shape"])
-            tested += 1
-            if got != want or index.get(name) != got:
-                failures += 1
-                print(f"  [FAIL] kind export {name}: {got} vs {want}")
+        # machine-readable kinds and the dispatch index
+        t, f = check_index(rt._dll, man)
+        tested, failures = tested + t, failures + f
 
         # datatype templating: instantiate a kernel at long double through
         # the header-only path and compare against the double ABI result
@@ -169,6 +277,9 @@ int main() {
 
 if __name__ == "__main__":
     tested, failures = build_and_validate()
+    t, f = validate_selection()
+    tested, failures = tested + t, failures + f
     status = "OK " if failures == 0 else "FAIL"
-    print(f"[{status}] libxckernel package: {tested} kernels built via "
-          f"CMake and validated vs NumPy, {failures} failures")
+    print(f"[{status}] libxckernel package: {tested} checks (kernels built "
+          f"via CMake vs NumPy, kind index, kind selection), "
+          f"{failures} failures")
