@@ -48,9 +48,47 @@ _AX = "xyz"
 # --- the compiled kernels ------------------------------------------------------
 
 
-def build_library(td: Path) -> Library:
+class _Absent(Exception):
+    """A check reached a kernel of an unselected kind."""
+
+
+class _Selective(Library):
+    """A Library restricted to a kind selection: a kernel of another kind
+    raises _Absent instead of failing on a missing symbol."""
+
+    def __init__(self, path, kinds):
+        super().__init__(path)
+        from ..catalog import entries, entry_kind
+        self.selected = kinds
+        self._kinds = {e.name: entry_kind(e) for e in
+                       entries(FAMILIES, 4, include_heavy=True)}
+
+    def _guard(self, name):
+        k = self._kinds.get(name)
+        if self.selected is not None and k is not None \
+                and k not in self.selected:
+            raise _Absent(k)
+
+    def scal_names(self, name):
+        self._guard(name)
+        return super().scal_names(name)
+
+    def order(self, name, array="chi"):
+        self._guard(name)
+        return super().order(name, array)
+
+    def __call__(self, name, **kw):
+        self._guard(name)
+        return super().__call__(name, **kw)
+
+
+def build_library(td: Path, kinds=None) -> Library:
     """Emit and compile every diag/g1/gg kernel, the o1 kernels of every
-    family, the o2 kernels of the gradient families and the o0 kernels."""
+    family, the o2 kernels of the gradient families and the o0 kernels;
+    only the ABI kinds in ``kinds`` (None: all)."""
+    from ..catalog import entry_kind
+    keep = (lambda e: True) if kinds is None else \
+        (lambda e: entry_kind(e) in kinds)
     inc = td / "include" / "xckernel"
     (inc / "kernels").mkdir(parents=True)
     (inc / "evaluator.hpp").write_text(_EVALUATOR_HPP)
@@ -67,10 +105,14 @@ def build_library(td: Path) -> Library:
         matrix += [(s, 2, ()) for s in ("r", "ua", "ub")]
         matrix += [("st", 2, (+1,)), ("st", 2, (-1,))]
         for e in _one_index_entries(fam):
+            if not keep(e):
+                continue
             hpp, cpp, _ = _emit_kind(e)
             write(e.name, hpp, cpp)
         for spin, order, par in matrix:
             e = CatalogEntry(fam, spin, order, par)
+            if not keep(e):
+                continue
             ck = collapse(_integrand_for(e))
             write(e.name, emit_kernel_hpp(ck, e.name),
                   emit_kernel_cpp(ck, e.name))
@@ -78,17 +120,20 @@ def build_library(td: Path) -> Library:
         if fam in GIAO_FAMILIES:
             for spin in ("r", "ua", "ub"):
                 e = CatalogEntry(fam, spin, 1, giao=True)
+                if not keep(e):
+                    continue
                 hpp, cpp, _ = _emit_kind(e)
                 write(e.name, hpp, cpp)
-        n0 = CatalogEntry(fam, "r", 0).name
-        write(n0, emit_exc_hpp(n0), emit_exc_cpp(n0))
+        n0 = CatalogEntry(fam, "r", 0)
+        if keep(n0):
+            write(n0.name, emit_exc_hpp(n0.name), emit_exc_cpp(n0.name))
     lib = td / "libxckt.so"
     # a small grid block: several blocks and a remainder at the test sizes
     subprocess.run(["c++", "-std=c++17", "-O1", "-shared", "-fPIC",
                     "-DXCKERNEL_GRID_BLOCK=16", "-I", str(td / "include"),
                     *sorted(str(p) for p in src.glob("*.cpp")),
                     "-o", str(lib)], check=True)
-    return Library(str(lib))
+    return _Selective(str(lib), kinds)
 
 
 def call_exc(lib: Library, name, w, rho, zk):
@@ -945,40 +990,69 @@ def check_gradient(lib, rep, fam, spin, sysm):
               total.sum(0), np.zeros(3), 1e-12, scale=scale)
 
 
-def main():
+def main(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        prog="python -m xckernel.tests.catalog_c_validate",
+        description="Physics validation of the compiled C kernels.")
+    p.add_argument("--kinds", default="all",
+                   help="validate only these ABI kinds (comma-separated, "
+                        "as in python -m xckernel.catalog --kinds); check "
+                        "groups that need an unselected kind are skipped")
+    a = p.parse_args(argv)
+    from ..catalog import parse_kinds
+    try:
+        kinds = parse_kinds(a.kinds)
+    except ValueError as err:
+        p.error(str(err))
     rep = Report()
+    skipped = []
+
+    def run(label, fn, *args):
+        try:
+            fn(*args)
+        except _Absent as x:
+            skipped.append(label)
+            print(f"  [skip] {label}: kind {x} not selected")
+
     with tempfile.TemporaryDirectory() as td:
         print("building the kernels ...", flush=True)
-        lib = build_library(Path(td))
+        lib = build_library(Path(td), kinds)
         print("Fock diagonal")
-        check_diag(lib, rep)
+        run("Fock diagonal", check_diag, lib, rep)
         print("batched linear response")
-        check_batch(lib, rep)
+        run("batched linear response", check_batch, lib, rep)
         print("MO-projected linear response")
-        check_mo(lib, rep)
+        run("MO-projected linear response", check_mo, lib, rep)
         sysm = System()
         for fam in GRADIENT_FAMILIES + GENERAL_DM:
             print(f"Fock matrix and linear response: {fam}")
-            check_matrix(lib, rep, fam, sysm)
+            run(f"Fock matrix: {fam}", check_matrix, lib, rep, fam, sysm)
         from ..catalog import GIAO_FAMILIES
         for fam in GIAO_FAMILIES:
             print(f"London orbitals: {fam}")
             for spin in ("r", "ua", "ub"):
-                check_giao(lib, rep, fam, spin, sysm)
+                run(f"London orbitals: {fam} {spin}", check_giao, lib, rep,
+                    fam, spin, sysm)
         from ..engine.geofock import FOCK_DERIV_FAMILIES
         for fam in FOCK_DERIV_FAMILIES:
             print(f"nuclear derivative of the Fock matrix: {fam}")
             for spin in ("r", "ua"):
-                check_fock_derivative(lib, rep, fam, spin, sysm)
+                run(f"dF/dX: {fam} {spin}", check_fock_derivative, lib,
+                    rep, fam, spin, sysm)
         from ..engine.hessian import HESSIAN_FAMILIES
         for fam in HESSIAN_FAMILIES:
             print(f"nuclear Hessian: {fam}")
             for spin in ("r", "u"):
-                check_hessian(lib, rep, fam, spin, sysm)
+                run(f"nuclear Hessian: {fam} {spin}", check_hessian, lib,
+                    rep, fam, spin, sysm)
         for fam in gradient_families():
             print(f"nuclear gradient: {fam}")
             for spin in ("r", "u"):
-                check_gradient(lib, rep, fam, spin, sysm)
+                run(f"nuclear gradient: {fam} {spin}", check_gradient, lib,
+                    rep, fam, spin, sysm)
+    if skipped:
+        print(f"{len(skipped)} check groups skipped (kinds not selected)")
     status = "OK " if rep.failures == 0 else "FAIL"
     print(f"[{status}] catalog_c_validate: {rep.tested} checks, "
           f"{rep.failures} failures")
