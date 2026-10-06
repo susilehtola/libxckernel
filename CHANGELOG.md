@@ -1,10 +1,41 @@
 # Changelog
 
-Releases of the generated C catalog (`xckernel.h`, `libxckernel`). Every
-release since 0.2.0 is additive to the C ABI v2: existing entries keep
-their interface, and new ones add new kernels and ABI kinds. Each kernel
-exports its kind and output shape (since 0.4.0), so a host can check what
-it links against.
+Releases of the generated C catalog (`xckernel.h`, `libxckernel`). Since
+0.2.0 every kernel entry point keeps its C ABI v2 interface; releases add
+kernels and ABI kinds. Each kernel exports its kind and output shape
+(since 0.4.0), so a host can check what it links against. The one
+layout change outside the entry points is the index struct
+`xck_kernel_info` in 0.5.0, which a host compiled against the header of
+the same generated tree picks up automatically.
+
+## 0.5.0 (2026-10-06)
+
+Generate only the kernel kinds a host uses, and dispatch from the index.
+
+- **Kind selection:** `python -m xckernel.catalog <out> <families>
+  <max_order> c --kinds k1,k2,...` takes the exported ABI kind names
+  (`exc`, `matrix`, `diag`, `o2b`, `mo2`, `mo2u`, `g1`, `g1c`, `gg`,
+  `f1`, …, `giao`, `h2bb`, …, `e1p`, …). The default is `all`.
+  - Unselected kinds are never generated.
+  - The sources, `xckernel.h`, the index, `CMakeLists.txt`, the Fortran
+    module and `manifest.json` follow the selection.
+  - The manifest records the selection as `"kinds"` and the header as
+    `XCKERNEL_KINDS`.
+  - `evaluator.hpp` carries only the helpers the selected kernels call.
+  - For six families at order 2 with
+    `exc,matrix,diag,o2b,mo2,mo2u,g1,g1c,gg`: 156 kernels, about 4 MB,
+    generated in 9 s, against 273 kernels, 19 MB and about 7 min for
+    all kinds.
+- **Dispatch metadata in the index:** `xck_kernel_info` gains:
+  - `fn`, the entry point as `void (*)(void)`, cast according to `kind`;
+  - `scal_names`, `n_scal` and `n_fields`;
+  - `chi_order`, `dchi_order` and `dtchi_order`, which are −1 for a
+    tower the kind doesn't take. `chi_order` gives the order of
+    `phi_o`/`phi_v` for the MO kinds.
+
+  This changes the struct layout. Kernel entry points are unchanged.
+- **Validation:** `catalog_c_validate --kinds …` validates a selection
+  and skips the check groups that need an unselected kind.
 
 ## 0.4.0 (2026-10-05)
 
