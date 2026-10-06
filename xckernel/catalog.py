@@ -814,7 +814,7 @@ _GRADIENT_CLASSES = {
 }
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def build_catalog(outdir: str, families=FAMILIES, max_order: int = 4,
