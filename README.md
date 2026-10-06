@@ -341,6 +341,40 @@ index of the build, `xckernel_kernels[]`. Each entry holds:
 A host can therefore dispatch from the exported metadata alone, with no
 table of its own that could go stale against the kernels it vendors.
 
+**Header-only use.** Each kernel header
+`include/xckernel/kernels/<name>.hpp` also works without the compiled
+library, at any floating-point type. It declares the template
+`xckernel::<name>_t<T, Txc>`, which takes the per-point fields (type `T`)
+and the Libxc derivative arrays (type `Txc`) as separate arrays.
+
+The header also states their order. `<name>_field_names[]` and
+`<name>_xc_names[]` give the two lists, and `<name>_n_fields` and
+`<name>_n_xc` their lengths; all four are `constexpr` in namespace
+`xckernel`. The C ABI's `<name>_scal_names` is initialised from these
+two lists, so the two can't drift apart.
+
+The operands are positional arrays of identically typed pointers, so
+passing them in the wrong order gives wrong numbers with no error. The
+header therefore also declares the structs `<name>_fields<T>` and
+`<name>_xc<Txc>`, with one named member per operand, and an overload of
+`<name>_t` that takes them:
+
+```cpp
+xckernel::xck_mgga_r_o1_fields<double> f{};
+f.w = w; f.rho_x = gx; f.rho_y = gy; f.rho_z = gz;
+xckernel::xck_mgga_r_o1_xc<double> x{};
+x.vrho = vrho; x.vsigma = vsigma; x.vlapl = vlapl; x.vtau = vtau;
+xckernel::xck_mgga_r_o1_t(npts, nbf, chi, f, x, F);
+```
+
+A misspelt or missing member is then a compile error. A host can also
+`static_assert` its own packing against the `constexpr` names.
+
+The order itself is fixed: fields in tower order, and the Libxc arrays
+grouped by derivative order, alphabetical within each group. Changing it
+would silently break every host that packs operands positionally, so any
+change will come with a version bump.
+
 Generation takes a small fraction of the time needed to compile the
 emitted code. To produce a self-contained source tree for distribution
 (no Python required downstream), run the generator directly:

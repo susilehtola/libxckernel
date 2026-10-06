@@ -220,6 +220,15 @@ extern "C" int xck_gga_r_o2(int64_t, int64_t, const double*,
 extern "C" const int xck_gga_r_o2_n_scal;
 extern "C" const int xck_gga_r_o2_n_fields;
 extern "C" const int xck_gga_r_o2_chi_order;
+extern "C" const char* xck_gga_r_o2_scal_names[];
+#include <cstring>
+// the header's operand names at compile time: a host can check its own
+// packing against them (here, that the second xc array is v2sigma2)
+constexpr bool same(const char* a, const char* b) {
+    return *a == *b && (*a == 0 || same(a + 1, b + 1));
+}
+static_assert(same(xckernel::xck_gga_r_o2_xc_names[1], "v2sigma2"),
+              "header operand names");
 int main() {
     const int64_t nbf = 3, ng = 20;
     const int ns = xck_gga_r_o2_n_scal, nfld = xck_gga_r_o2_n_fields;
@@ -247,6 +256,29 @@ int main() {
     std::vector<const double*> xcp(sp.begin() + nfld, sp.end());
     xckernel::xck_gga_r_o2_t<long double, double>(
         ng, nbf, chiL.data(), fldL.data(), xcp.data(), outL.data());
+    // the header's names and counts are the C ABI's operand table
+    if (nfld != xckernel::xck_gga_r_o2_n_fields
+        || ns != nfld + xckernel::xck_gga_r_o2_n_xc) return 2;
+    for (int i = 0; i < ns; i++) {
+        const char* h = i < nfld ? xckernel::xck_gga_r_o2_field_names[i]
+                                 : xckernel::xck_gga_r_o2_xc_names[i - nfld];
+        if (std::strcmp(h, xck_gga_r_o2_scal_names[i]) != 0) return 3;
+    }
+    // the named-operand overload, header-only: the same result as the
+    // positional arrays
+    xckernel::xck_gga_r_o2_fields<double> f{};
+    xckernel::xck_gga_r_o2_xc<double> x{};
+    f.w = sp[0]; f.rho_x = sp[1]; f.rho_y = sp[2]; f.rho_z = sp[3];
+    f.rho_p1_x = sp[4]; f.rho_p1_y = sp[5]; f.rho_p1_z = sp[6];
+    f.rho_p1 = sp[7];
+    x.v2rho2 = sp[8]; x.v2sigma2 = sp[9]; x.vsigma = sp[10];
+    x.v2rhosigma = sp[11];
+    std::vector<double> outS(nbf*nbf, 0.0);
+    xckernel::xck_gga_r_o2_t(ng, nbf, chi.data(), f, x, outS.data());
+    for (int i = 0; i < nbf*nbf; i++) {
+        const double d = outS[i] - outd[i];
+        if (d > 1e-12 || d < -1e-12) return 4;
+    }
     long double maxerr = 0.0L;
     for (int i = 0; i < nbf*nbf; i++) {
         long double d = outL[i] - (long double)outd[i];
@@ -271,7 +303,9 @@ int main() {
                                 env={"LD_LIBRARY_PATH": str(bld)})
             if r2.returncode != 0:
                 failures += 1
-                print("  [FAIL] long-double mismatch:", r2.stdout)
+                print(f"  [FAIL] header-only test (rc {r2.returncode}; 1: "
+                      "long double, 2/3: header operand table, 4: named "
+                      "overload):", r2.stdout)
         return tested, failures
 
 
