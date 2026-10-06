@@ -10,7 +10,8 @@ the same generated tree picks up automatically.
 
 ## 0.5.0 (2026-10-06)
 
-Generate only the kernel kinds a host uses, and dispatch from the index.
+Generate only the kernel kinds a host uses, dispatch from the index,
+and read operand names from the kernel headers.
 
 - **Kind selection:** `python -m xckernel.catalog <out> <families>
   <max_order> c --kinds k1,k2,...` takes the exported ABI kind names
@@ -34,6 +35,18 @@ Generate only the kernel kinds a host uses, and dispatch from the index.
     `phi_o`/`phi_v` for the MO kinds.
 
   This changes the struct layout. Kernel entry points are unchanged.
+- **Operand names in the kernel headers:** for header-only use, each
+  kernel header declares, in namespace `xckernel`:
+  - the `constexpr` lists `<name>_field_names[]` and `<name>_xc_names[]`,
+    split as the template `<name>_t` takes them, and their lengths
+    `<name>_n_fields` and `<name>_n_xc`;
+  - the structs `<name>_fields<T>` and `<name>_xc<Txc>`, with one named
+    member per operand;
+  - an overload of `<name>_t` that takes the structs, so a misnamed
+    operand is a compile error.
+
+  The C ABI's `scal_names` is initialised from the header's lists. The
+  operand order is unchanged, and this is additive.
 - **Validation:** `catalog_c_validate --kinds …` validates a selection
   and skips the check groups that need an unselected kind.
 
