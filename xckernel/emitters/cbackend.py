@@ -861,6 +861,88 @@ def _combine_call(srcs: List[str], wts: List[int], lds: str, bk: str, n: str,
             indent + "}"]
 
 
+_IDENT = re.compile(r"[A-Za-z_]\w*")
+
+
+def _operand_api(hpp: str, name: str, fields, xcs) -> str:
+    """Make a kernel header self-describing: the operand names and counts
+    the array form of <name>_t takes (fields, then xc), a named operand
+    struct per list, and an overload taking the structs, so header-only
+    hosts can wire operands by name (a misnamed member is a compile
+    error; a misordered array is not detectable). Inserted at the end of
+    namespace xckernel; the C ABI tables are initialised from the lists.
+    """
+    for n in list(fields) + list(xcs):
+        if not _IDENT.fullmatch(n):
+            raise ValueError(f"{name}: operand {n!r} is not an identifier")
+    m = re.search(rf"int {name}_t\((.*?)\) \{{", hpp, re.S)
+    params = [p.strip() for p in m.group(1).split(",")]
+    assert "const T* const* fields" in params and \
+        "const Txc* const* xc" in params, params
+
+    def strs(xs):
+        return "{" + ", ".join(f'"{x}"' for x in xs) + "}" if xs \
+            else "{nullptr}"
+
+    def members(tp, xs):
+        return [f"    const {tp}* {x};" for x in xs]
+
+    lines = [
+        "",
+        f"/* Operands of {name}_t: `fields` in the order of",
+        f" * {name}_field_names, `xc` in the order of {name}_xc_names (the",
+        " * C ABI's `scal` is the two concatenated, split at n_fields). The",
+        " * structs name them; the overload taking them packs the arrays. */",
+        f"inline constexpr int {name}_n_fields = {len(fields)};",
+        f"inline constexpr int {name}_n_xc = {len(xcs)};",
+        f"inline constexpr const char* {name}_field_names[] = "
+        f"{strs(fields)};",
+        f"inline constexpr const char* {name}_xc_names[] = {strs(xcs)};",
+        "template <typename T>",
+        f"struct {name}_fields {{", *members("T", fields), "};",
+        "template <typename Txc>",
+        f"struct {name}_xc {{", *members("Txc", xcs), "};", ""]
+    sig, call = [], []
+    for p in params:
+        if p == "const T* const* fields":
+            sig.append(f"const {name}_fields<T>& fields_")
+            call.append("f_")
+        elif p == "const Txc* const* xc":
+            sig.append(f"const {name}_xc<Txc>& xc_")
+            call.append("x_")
+        else:
+            sig.append(p)
+            call.append(re.findall(r"\w+", p.split("=")[0])[-1])
+
+    def pack(var, tp, src, xs):
+        if not xs:
+            return f"    const {tp}* const* {var} = nullptr;"
+        return (f"    const {tp}* {var}[] = {{"
+                + ", ".join(f"{src}.{x}" for x in xs) + "};")
+    lines += ["template <typename T, typename Txc = T>",
+              f"int {name}_t(" + ",\n        ".join(sig) + ") {",
+              pack("f_", "T", "fields_", fields),
+              pack("x_", "Txc", "xc_", xcs),
+              f"    return {name}_t<T, Txc>(" + ", ".join(call) + ");",
+              "}", ""]
+    tail = "} // namespace xckernel"
+    i = hpp.rindex(tail)
+    return hpp[:i] + "\n".join(lines) + "\n" + hpp[i:]
+
+
+def _scal_tables(name: str, nf: int, nxc: int) -> List[str]:
+    """The C ABI operand tables, initialised from the header's lists."""
+    refs = [f"xckernel::{name}_field_names[{i}]" for i in range(nf)] + \
+        [f"xckernel::{name}_xc_names[{i}]" for i in range(nxc)]
+    return [f"const char* {name}_scal_names[{nf + nxc}] = {{",
+            *[f"    {r}," for r in refs], "};",
+            f"extern const int {name}_n_scal;",
+            f"const int {name}_n_scal = xckernel::{name}_n_fields + "
+            f"xckernel::{name}_n_xc;",
+            f"extern const int {name}_n_fields;",
+            f"const int {name}_n_fields = xckernel::{name}_n_fields;"]
+
+
 def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
                    name: str, kind: str, computed=None, rename=None) -> str:
     """Header-only templated kernel on the tower interface.
@@ -908,8 +990,9 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         + ["const T* const* fields", "const Txc* const* xc", "T* out",
            "T* work = nullptr"]
     lines += ["/* fields: the per-point tower operands (type T), in the order",
-              f" * of {name}_scal_names; xc: the functional-derivative arrays",
-              " * (type Txc; Libxc computes in double whatever T is). */",
+              f" * of {name}_field_names; xc: the functional-derivative",
+              f" * arrays (type Txc; Libxc computes in double whatever T is),",
+              f" * in the order of {name}_xc_names (both below). */",
               "template <typename T, typename Txc = T>",
               f"int {name}_t(" + ",\n        ".join(sig) + ") {",
               "    const int64_t blk = npts < grid_block ? npts : grid_block;",
@@ -1039,7 +1122,7 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         lines += block_loop(range(len(blocks)))
     lines += ["    if (own) delete[] c;", "    return 0;", "}", "",
               "} // namespace xckernel", ""]
-    return "\n".join(lines)
+    return _operand_api("\n".join(lines), name, L.scal_names[:len(L.fields)], L.scal_names[len(L.fields):])
 
 
 #: perturbations per stacked GEMM in the batched kernels
@@ -1117,7 +1200,8 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
               f" + {len(sder)} * npts + 1;",
               "}", "",
               "/* fields: the per-point tower operands in the order of",
-              f" * {name}_scal_names; perturbed ones (_p1) are (nx, npts). */",
+              f" * {name}_field_names, perturbed ones (_p1) (nx, npts); xc in",
+              f" * the order of {name}_xc_names (both below). */",
               "template <typename T, typename Txc = T>",
               f"int {name}_t(int64_t npts, int64_t nbf, int64_t nx,",
               "        const T* chi, const T* const* fields,",
@@ -1191,7 +1275,7 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
                   f"{bexpr[vfac][1]}, out + x0*nbf*nbf, nbf);"]
     lines += ["        }", "    }", "    if (own) delete[] c;", "    return 0;",
               "}", "", "} // namespace xckernel", ""]
-    return "\n".join(lines)
+    return _operand_api("\n".join(lines), name, L.scal_names[:len(L.fields)], L.scal_names[len(L.fields):])
 
 
 def _split_by_perturbed(ck: CollapsedKernel):
@@ -1422,7 +1506,8 @@ def emit_mo_hpp(ck: CollapsedKernel, name: str, kind: str,
                   f"{bv[vfac][1]}, out + x0*{nocc}*{nvir}, {nvir});"]
     lines += ["        }", "    }", "    if (own) delete[] c;", "    return 0;",
               "}", "", "} // namespace xckernel", ""]
-    return "\n".join(lines)
+    names, nf, _ = mo_layout(ck)
+    return _operand_api("\n".join(lines), name, names[:nf], names[nf:])
 
 
 def mo_layout(ck: CollapsedKernel):
@@ -1457,14 +1542,8 @@ def emit_mo_cpp(ck: CollapsedKernel, name: str, kind: str) -> str:
     spec = MO_KINDS[kind]
     lines = ["/* generated by xckernel; do not edit. */",
              f'#include "xckernel/kernels/{name}.hpp"', "",
-             'extern "C" {', "",
-             f"const char* {name}_scal_names[{len(names)}] = {{"]
-    lines += [f'    "{n}",' for n in names]
-    lines += ["};",
-              f"extern const int {name}_n_scal;",
-              f"const int {name}_n_scal = {len(names)};",
-              f"extern const int {name}_n_fields;",
-              f"const int {name}_n_fields = {len(abi)};"]
+             'extern "C" {', ""]
+    lines += _scal_tables(name, len(abi), len(names) - len(abi))
     tower_order = mo_layout(ck)[2]
     for t in spec["towers"]:
         lines += [f"extern const int {name}_{t}_order;",
@@ -1519,14 +1598,8 @@ def emit_tower_cpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
         + (["bf_centers"] if kind in CENTER_KINDS else [])
     lines = ["/* generated by xckernel; do not edit. */",
              f'#include "xckernel/kernels/{name}.hpp"', "",
-             'extern "C" {', "",
-             f"const char* {name}_scal_names[{len(names)}] = {{"]
-    lines += [f'    "{n}",' for n in names]
-    lines += ["};",
-              f"extern const int {name}_n_scal;",
-              f"const int {name}_n_scal = {len(names)};",
-              f"extern const int {name}_n_fields;",
-              f"const int {name}_n_fields = {nf};"]
+             'extern "C" {', ""]
+    lines += _scal_tables(name, nf, len(names) - nf)
     lines += _kind_exports(name, kind)
     for a in arrays:
         lines += [f"extern const int {name}_{a}_order;",
