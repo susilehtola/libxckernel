@@ -437,6 +437,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | C batched response `o2_batch` | all seven | R + U + spin-adapted | nx single `o2` calls | ~1e-13 |
 | C MO-projected response `o2_mo` | all seven | U + spin-adapted | C_occᵀ·`o2`[fields of P_x]·C_vir | ~1e-15 |
 | C imaginary MO response `o2_mo_imag` | `cmgga_tau` | U + spin-adapted | the same, antisymmetric P_x | ~1e-15 |
+| HelFEM `cmgga_tau` channels (complex basis, real P) | `cmgga_tau` | R + U, 3D + pure-m | FD of E[P] and of the Fock; τ̃ = τ_W for one orbital; `mgga_tau` at j = 0 | ~1e-12 |
 | C Fock derivative `f1` + `fg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | C London-orbital kernels `giao` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | NumPy GIAO kernels (FD-validated in `london_validate`); antisymmetry | ~1e-15 |
@@ -521,7 +522,9 @@ xckernel/
     gpawwriter.py    GPAW pair-coefficient/stress-field emitter
     helfemwriter.py  HelFEM emitter: potential + kernel channels,
                      curvilinear (radial/spherical/prolate) coordinates,
-                     one/two/three gradient components, spin-resolved
+                     one/two/three gradient components, spin-resolved;
+                     cmgga_tau with a current channel (complex basis,
+                     real P: engine/current_channels.py)
     ncwriter.py      noncollinear (relativistic) kernel emitter
     gauxcwriter.py   GauXC emitter: fixed-grid nuclear-Hessian kernels
     octopuswriter.py Octopus Fortran emitter: third-derivative trilinears
