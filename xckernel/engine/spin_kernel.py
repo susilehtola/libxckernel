@@ -11,6 +11,7 @@ same-group second derivatives collapse to the symmetric aa/ab/bb packing).
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass
 from itertools import product
@@ -148,6 +149,8 @@ def pert2_scalar_value(sc: Scalar, l1: str, l2: str,
     own nonlinearity (the sigma components; composite scalars carry
     their own closure if they define one)."""
     axes = AXES if coords is None else coords.axes
+    if sc.value is not None:
+        return _pert2_from_value(sc.value(), l1, l2)
     if sc.group != "sigma":
         return sp.Integer(0)
     from .spin import COMP_SPINS
@@ -157,6 +160,38 @@ def pert2_scalar_value(sc: Scalar, l1: str, l2: str,
         total += _pert_grad(s1, l1, ax) * _pert_grad(s2, l2, ax) \
             + _pert_grad(s2, l1, ax) * _pert_grad(s1, l2, ax)
     return total
+
+
+def _pert_field_sym(sym: sp.Symbol, label: str) -> sp.Expr:
+    """A spin-resolved field symbol under perturbation ``label``."""
+    from .spin import FIELD_PERTS
+    if sym in FIELD_PERTS:
+        return FIELD_PERTS[sym](label)
+    m = re.fullmatch(r"(rho|tau|lapl_rho)_([ab])", sym.name)
+    if m is None:
+        raise ValueError(f"no perturbation for field {sym.name}")
+    return sp.Symbol(f"{m.group(1)}_{m.group(2)}_{label}", real=True)
+
+
+def _pert2_from_value(value: sp.Expr, l1: str, l2: str) -> sp.Expr:
+    """Second-order perturbation of a composite scalar from its value:
+    its own curvature in the fields, sum_pq d2V/dp dq p^l1 q^l2, plus
+    that of the pseudo-primitive inv_rho_s, (1/rho)^{l1 l2} =
+    2 inv_rho^3 rho^l1 rho^l2."""
+    from .spin import INV_RHO_S
+    fields = sorted(value.free_symbols, key=lambda a: a.name)
+    total = sp.Integer(0)
+    for p in fields:
+        for q in fields:
+            d2 = sp.diff(value, p, q)
+            if d2 != 0:
+                total += d2 * _pert_field_sym(p, l1) * _pert_field_sym(q, l2)
+    for s, inv in INV_RHO_S.items():
+        if value.has(inv):
+            total += sp.diff(value, inv) * 2 * inv**3 \
+                * sp.Symbol(f"rho_{s}_{l1}", real=True) \
+                * sp.Symbol(f"rho_{s}_{l2}", real=True)
+    return sp.expand(total)
 
 
 def fxc_bilinear_spin(family: str, l1: str = "p1", l2: str = "p2",
@@ -271,6 +306,11 @@ def fxc_channels_spin(family: str, label: str = "p1",
         tau_q = sp.Symbol(f"tau_{s}__q", real=True)
         if b.has(tau_q):
             out[f"tau_{s}"] = sp.expand(sp.diff(b, tau_q))
+        # the current-density family (Cartesian components only)
+        for ax in AXES:
+            jp_q = sp.Symbol(f"jp_{s}__q_{ax}", real=True)
+            if b.has(jp_q):
+                out[f"jp_{s}_{ax}"] = sp.expand(sp.diff(b, jp_q))
     return out
 
 
@@ -427,9 +467,12 @@ def response_fock_st(family: str, order: int = 2,
 
 def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
     """Ground-state value of a polarized Libxc scalar in terms of the
-    spin-resolved primitive fields.  Only sigma is composite; the rest
-    are primitives in their own right."""
+    spin-resolved primitive fields: sigma, and the composite scalars that
+    carry their own value (the gauge-corrected tau); the rest are
+    primitives in their own right."""
     from .spin import _sigma_value
+    if sc.value is not None:
+        return sc.value()
     if sc.group == "sigma":
         return _sigma_value(sc.comp, coords)
     if sc.group == "rho":
@@ -445,8 +488,11 @@ def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
 
 
 def _spin_primitives(coords=None):
-    """(channel key, symbol, seed) for every spin-resolved primitive field."""
-    from .spin import SPINS, _seed_grad, _seed_rho, _seed_tau, grad_syms
+    """(channel key, symbol, seed) for every spin-resolved primitive field.
+    The paramagnetic current is Cartesian-only, as are the families that
+    use it."""
+    from .spin import (JP_S, SPINS, _seed_grad, _seed_jp_field, _seed_rho,
+                       _seed_tau, grad_syms)
     grad = grad_syms(coords)
     axes = AXES if coords is None else coords.axes
     out = []
@@ -457,6 +503,9 @@ def _spin_primitives(coords=None):
             out.append((f"grad_{s}_{ax}", grad[s][i], _seed_grad(s, i, coords)))
         out.append((f"tau_{s}", sp.Symbol(f"tau_{s}", real=True),
                     _seed_tau(s, coords)))
+        if coords is None or coords.is_cartesian:
+            for i, ax in enumerate(AXES):
+                out.append((f"jp_{s}_{ax}", JP_S[s][i], _seed_jp_field(s, i)))
     return out
 
 
@@ -478,6 +527,13 @@ def vxc_channels_spin(family: str, coords=None) -> "dict[str, sp.Expr]":
         d = sp.expand(sp.diff(energy, sym))
         if d != 0:
             out[key] = d
+    # the pseudo-primitive inv_rho_s has no seed of its own: d(1/rho_s) =
+    # -inv_rho_s^2 d rho_s, so its coefficient belongs to the rho channel
+    from .spin import INV_RHO_S
+    for s, inv in INV_RHO_S.items():
+        d = sp.expand(sp.diff(energy, inv))
+        if d != 0:
+            out[f"rho_{s}"] = sp.expand(out.get(f"rho_{s}", 0) - inv**2 * d)
     return out
 
 

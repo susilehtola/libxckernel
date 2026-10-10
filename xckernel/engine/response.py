@@ -130,7 +130,12 @@ def perturbed_ingredient2(ing, l1: str, l2: str,
     ingredient's own nonlinearity, sum_pq (d2 Y/dp dq) p^X1 q^X2.
     Zero for primitive variables; reproduces sigma^{X1 X2} =
     2 grad rho^X1 . grad rho^X2 and extends to the mapped ingredients
-    (gauge-corrected tau, eta) through their primitive expressions."""
+    (gauge-corrected tau, eta) through their primitive expressions.
+
+    The pseudo-primitive inv_rho is not independent: besides entering
+    through the ingredient's own curvature it has one of its own,
+    (1/rho)^{X1 X2} = 2 inv_rho^3 rho^X1 rho^X2, which the gauge-corrected
+    tau carries as -|j|^2 inv_rho^3 rho^X1 rho^X2."""
     E = ing.value
     by_sym = prim_by_symbol_for(coords)
     prims = [a for a in E.free_symbols if by_sym.get(a) is not None]
@@ -141,6 +146,9 @@ def perturbed_ingredient2(ing, l1: str, l2: str,
             if d2 != 0:
                 total += d2 * _pert_atom(by_sym[p], l1) \
                     * _pert_atom(by_sym[q], l2)
+        if by_sym[p].name == "inv_rho":
+            total += sp.diff(E, p) * 2 * p**3 * pert_field("rho", l1) \
+                * pert_field("rho", l2)
     return sp.expand(total)
 
 
@@ -183,10 +191,11 @@ def fxc_channels(family: str, label: str = "p1",
     """Per-point coefficient channels of the fxc contraction with ONE
     perturbation: the derivative of the bilinear form with respect to
     the second perturbation's operands.  Returns {'rho': u, 'grad_x':
-    v_x, ..., 'tau': w_tau (tau families only)}: the XC pair potential
-    is u - div(v) plus the tau-channel operator term, and a Casida
-    coupling element is sum_g w [u drho' + v . grad drho' + w_tau
-    dtau'] against a second perturbation's fields."""
+    v_x, ..., 'tau': w_tau (tau families only), 'jp_x': y_x, ...
+    (current-density family)}: the XC pair potential is u - div(v) plus
+    the tau-channel operator term, and a Casida coupling element is
+    sum_g w [u drho' + v . grad drho' + w_tau dtau' + y . dj'] against
+    a second perturbation's fields."""
     b = fxc_bilinear(family, l1=label, l2="_q", coords=coords)
     out = {"rho": sp.expand(sp.diff(b, sp.Symbol("rho__q", real=True)))}
     for ax in (AXES if coords is None else coords.axes):
@@ -198,6 +207,12 @@ def fxc_channels(family: str, label: str = "p1",
     lapl_q = sp.Symbol("lapl_rho__q", real=True)
     if b.has(lapl_q):
         out["lapl"] = sp.expand(sp.diff(b, lapl_q))
+    # the current-density family: the channel of the pair's paramagnetic
+    # current (Cartesian components; jp exists only there)
+    for ax in AXES:
+        jp_q = sp.Symbol(f"jp__q_{ax}", real=True)
+        if b.has(jp_q):
+            out[f"jp_{ax}"] = sp.expand(sp.diff(b, jp_q))
     return out
 
 
