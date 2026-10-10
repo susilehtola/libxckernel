@@ -565,7 +565,10 @@ def check_mo(lib, rep, nbf=7, ng=41, nocc=3, seed=6):
     """The MO-projected response: sigma_x == C_occ^T F1[P_x] C_vir with
     F1 from the AO o2 kernel fed the perturbed fields of P_x = C_occ X_x
     C_vir^T + transpose (built independently from the towers), every
-    family, spin-adapted p/m and unrestricted ua/ub."""
+    family, spin-adapted p/m and unrestricted ua/ub; and the imaginary
+    (magnetic) response of the general-density-matrix families,
+    P_x = C_occ X_x C_vir^T - transpose (_mo_imag)."""
+    from ..engine.gradient import GENERAL_DM_FAMILIES
     rng = np.random.default_rng(seed)
     nvir = nbf - nocc
     T = rng.standard_normal((len(components(4)), nbf, ng))
@@ -573,9 +576,11 @@ def check_mo(lib, rep, nbf=7, ng=41, nocc=3, seed=6):
     for fam in FAMILIES:
         cases = [CatalogEntry(fam, "st", 2, (p,)) for p in (+1, -1)] + \
             [CatalogEntry(fam, s, 2) for s in ("ua", "ub")]
-        for single in cases:
+        kinds = [("mo2", +1)] + ([("mo2i", -1)] if fam in
+                                 GENERAL_DM_FAMILIES else [])
+        for (mk, sgn), single in ((k, c) for k in kinds for c in cases):
             name = CatalogEntry(single.family, single.spin, 2,
-                                single.parities, kind="mo2").name
+                                single.parities, kind=mk).name
             ground = {n: rng.standard_normal(ng)
                       for n in lib.scal_names(name)}
             ground["w"] = np.abs(ground["w"]) + 0.1
@@ -590,7 +595,7 @@ def check_mo(lib, rep, nbf=7, ng=41, nocc=3, seed=6):
                     ref = []
                     for x in range(nx):
                         P = Co @ X[x] @ Cv.T
-                        fP = fields(P + P.T, T)
+                        fP = fields(P + sgn * P.T, T)
                         F = lib(single.name, chi=T, **ground,
                                 **tower_ops(fP, fP, sfx="_p1"))
                         ref.append(Co.T @ F @ Cv)
@@ -610,7 +615,7 @@ def check_mo(lib, rep, nbf=7, ng=41, nocc=3, seed=6):
                         fP = {}
                         for c in "ab":
                             P = C[c][0] @ X[c][x] @ C[c][1].T
-                            fP[c] = fields(P + P.T, T)
+                            fP[c] = fields(P + sgn * P.T, T)
                         F = lib(single.name, chi=T, **ground,
                                 **tower_ops(fP["a"], fP["b"], sfx="_p1"))
                         ref.append(C[s][0].T @ F @ C[s][1])

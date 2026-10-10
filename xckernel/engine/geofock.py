@@ -122,9 +122,12 @@ def perturbed_field_terms(name: str, d: int, general: bool = False):
     return ch, [(c, a, b) for (a, b), c in acc.items() if c != 0]
 
 
-def mo_field_terms(name: str):
+def mo_field_terms(name: str, sign: int = +1):
     """The perturbed field ``name`` of a trial vector X in the occupied x
-    virtual space, P = C_occ X C_vir^T + C_vir X^T C_occ^T:
+    virtual space, P = C_occ X C_vir^T + sign C_vir X^T C_occ^T (sign -1:
+    the antisymmetric, imaginary perturbation of a general density
+    matrix, under which the density-like fields cancel and the
+    paramagnetic current remains):
 
         field(g) = sum_t c_t sum_i phi_o[a_t](i,g) Z[b_t](i,g),
         Z[b](i,g) = sum_a X(i,a) phi_v[b](a,g),
@@ -145,10 +148,11 @@ def mo_field_terms(name: str):
         (ku, au), (kv, av) = parts["u"], parts["v"]
         # B(phi_i, phi_a) and B(phi_a, phi_i): the occupied orbital in either
         # slot, the virtual one contracted with X
-        for (ko, ao), (kw, aw) in (((ku, au), (kv, av)), ((kv, av), (ku, au))):
+        for sg, (ko, ao), (kw, aw) in ((1, (ku, au), (kv, av)),
+                                       (sign, (kv, av), (ku, au))):
             for so, wo in _tower(ko, ao):
                 for sv, wv in _tower(kw, aw):
-                    acc[(so, sv)] += coeff * wo * wv
+                    acc[(so, sv)] += sg * coeff * wo * wv
     return ch, [(c, a, b) for (a, b), c in acc.items() if c != 0]
 
 

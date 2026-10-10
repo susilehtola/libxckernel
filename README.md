@@ -213,10 +213,22 @@ the β perturbation is the parity times them. The unrestricted kernels take
 both channels' towers and amplitudes (`phi_o_a`, …, `X_a`, `X_b`) and
 return the σ of their own channel.
 
-These kernels cover real response only (symmetric P), the case for
-real-orbital TDDFT and stability analysis. A purely imaginary (magnetic)
-perturbation of `cmgga_tau`, with an antisymmetric P, still goes through
-the AO `o2` kernels.
+These kernels cover real response (symmetric P), the case for
+real-orbital TDDFT and stability analysis.
+
+**Imaginary (magnetic) response.** `cmgga_tau` works with a general
+density matrix, whose antisymmetric part carries the paramagnetic
+current. For it, `xck_cmgga_tau_st_o2_{p,m}_mo_imag` (kind `mo2i`) and
+`xck_cmgga_tau_{ua,ub}_o2_mo_imag` (kind `mo2iu`) give the σ vectors of a
+purely imaginary perturbation, with P_x = C_occ X_x C_virᵀ − C_vir X_xᵀ
+C_occᵀ.
+- The arguments are the same as for the real kernels.
+- Under such a perturbation ρ, ∇ρ and τ are unchanged, and only jₚ
+  responds. The kernel keeps only the terms that survive.
+- σ_x is C_occᵀ·`o2`·C_vir, with `o2` the AO kernel's output for that P_x.
+
+The same pruning applies to the real `cmgga_tau` kernels, which skip
+the jₚ¹ terms that vanish under a symmetric P.
 
 ## Discretizations: molecular, periodic, curvilinear
 
@@ -424,6 +436,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | C nuclear Hessian (all classes, weight terms included) | all seven | R + U | FD of the matching gradient class; FD of the full gradient; translational sum rule | ~1e-11; ~1e-15 |
 | C batched response `o2_batch` | all seven | R + U + spin-adapted | nx single `o2` calls | ~1e-13 |
 | C MO-projected response `o2_mo` | all seven | U + spin-adapted | C_occᵀ·`o2`[fields of P_x]·C_vir | ~1e-15 |
+| C imaginary MO response `o2_mo_imag` | `cmgga_tau` | U + spin-adapted | the same, antisymmetric P_x | ~1e-15 |
 | C Fock derivative `f1` + `fg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | FD of `o1` per class; complete move; translational sum rule | ~1e-10; ~1e-16 |
 | C Fock diagonal `o1_diag` | all seven | R + U | diagonal of the `o1` kernel | exact |
 | C London-orbital kernels `giao` | LDA/GGA/mGGA(τ,∇²ρ) | R + U | NumPy GIAO kernels (FD-validated in `london_validate`); antisymmetry | ~1e-15 |
