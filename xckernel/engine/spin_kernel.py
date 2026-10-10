@@ -291,8 +291,9 @@ def fxc_channels_spin(family: str, label: str = "p1",
     """Per-point coefficient channels of the polarized fxc contraction
     with one perturbation: derivatives of the spin bilinear with
     respect to the second perturbation's operands, keyed
-    'rho_a'/'rho_b', 'grad_a_x'/... and (tau families)
-    'tau_a'/'tau_b'.  The polarized counterpart of
+    'rho_a'/'rho_b', 'grad_a_x'/... and, for the families that carry
+    them, 'tau_<s>', 'lapl_<s>', 'jp_<s>_<ax>' and 'hess_rho_<s>_<ij>'
+    (the keys of vxc_channels_spin).  The polarized counterpart of
     response.fxc_channels."""
     axes = AXES if coords is None else coords.axes
     b = fxc_bilinear_spin(family, l1=label, l2="_q", coords=coords)
@@ -306,11 +307,20 @@ def fxc_channels_spin(family: str, label: str = "p1",
         tau_q = sp.Symbol(f"tau_{s}__q", real=True)
         if b.has(tau_q):
             out[f"tau_{s}"] = sp.expand(sp.diff(b, tau_q))
-        # the current-density family (Cartesian components only)
+        lapl_q = sp.Symbol(f"lapl_rho_{s}__q", real=True)
+        if b.has(lapl_q):
+            out[f"lapl_{s}"] = sp.expand(sp.diff(b, lapl_q))
+        # the current-density and density-Hessian families (Cartesian
+        # components only)
         for ax in AXES:
             jp_q = sp.Symbol(f"jp_{s}__q_{ax}", real=True)
             if b.has(jp_q):
                 out[f"jp_{s}_{ax}"] = sp.expand(sp.diff(b, jp_q))
+        for sym in HESS_S[s]:
+            stem, comp = sym.name.rsplit("_", 1)
+            h_q = sp.Symbol(f"{stem}__q_{comp}", real=True)
+            if b.has(h_q):
+                out[sym.name] = sp.expand(sp.diff(b, h_q))
     return out
 
 
@@ -471,10 +481,6 @@ def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
     carry their own value (the gauge-corrected tau); the rest are
     primitives in their own right."""
     from .spin import _sigma_value
-    if sc.group == "eta":
-        # its value is in the Hessian fields, which have no channel here
-        raise NotImplementedError(
-            "no potential channels for the density-Hessian eta")
     if sc.value is not None:
         return sc.value()
     if sc.group == "sigma":
@@ -493,10 +499,12 @@ def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
 
 def _spin_primitives(coords=None):
     """(channel key, symbol, seed) for every spin-resolved primitive field.
-    The paramagnetic current is Cartesian-only, as are the families that
-    use it."""
-    from .spin import (JP_S, SPINS, _seed_grad, _seed_jp_field, _seed_rho,
-                       _seed_tau, grad_syms)
+    The Laplacian, the paramagnetic current and the density Hessian are
+    Cartesian-only, as are the families that use them; keys follow the
+    restricted channels (lapl, jp_<ax>, hess_rho_<ij>) with the spin tag."""
+    from .spin import (HESS_S, JP_S, SPINS, _seed_grad, _seed_hess_field,
+                       _seed_jp_field, _seed_lapl, _seed_rho, _seed_tau,
+                       grad_syms)
     grad = grad_syms(coords)
     axes = AXES if coords is None else coords.axes
     out = []
@@ -508,16 +516,21 @@ def _spin_primitives(coords=None):
         out.append((f"tau_{s}", sp.Symbol(f"tau_{s}", real=True),
                     _seed_tau(s, coords)))
         if coords is None or coords.is_cartesian:
+            out.append((f"lapl_{s}", sp.Symbol(f"lapl_rho_{s}", real=True),
+                        _seed_lapl(s)))
             for i, ax in enumerate(AXES):
                 out.append((f"jp_{s}_{ax}", JP_S[s][i], _seed_jp_field(s, i)))
+            for k, sym in enumerate(HESS_S[s]):
+                out.append((sym.name, sym, _seed_hess_field(s, k)))
     return out
 
 
 def vxc_channels_spin(family: str, coords=None) -> "dict[str, sp.Expr]":
     """Spin-resolved counterpart of :func:`~xckernel.engine.fock.vxc_channels`:
     the per-point coefficients of the ground-state XC potential, keyed
-    ``rho_a``/``rho_b``, ``grad_a_<axis>``/``grad_b_<axis>`` and (tau
-    families) ``tau_a``/``tau_b``.
+    ``rho_a``/``rho_b``, ``grad_a_<axis>``/``grad_b_<axis>`` and, for the
+    families that carry them, ``tau_<s>``, ``lapl_<s>``, ``jp_<s>_<axis>``
+    and ``hess_rho_<s>_<ij>``.
 
     The polarized Libxc arrays keep their flat component packing, so
     ``vsigma_1`` is the ab component of the caller's vsigma.  Channels

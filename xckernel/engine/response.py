@@ -191,8 +191,9 @@ def fxc_channels(family: str, label: str = "p1",
     """Per-point coefficient channels of the fxc contraction with ONE
     perturbation: the derivative of the bilinear form with respect to
     the second perturbation's operands.  Returns {'rho': u, 'grad_x':
-    v_x, ..., 'tau': w_tau (tau families only), 'jp_x': y_x, ...
-    (current-density family)}: the XC pair potential is u - div(v) plus
+    v_x, ..., 'tau': w_tau, 'lapl', 'jp_x': y_x, ... (current-density
+    family), 'hess_rho_xy', ... (density-Hessian family)}, each only for
+    the families that carry it: the XC pair potential is u - div(v) plus
     the tau-channel operator term, and a Casida coupling element is
     sum_g w [u drho' + v . grad drho' + w_tau dtau' + y . dj'] against
     a second perturbation's fields."""
@@ -213,6 +214,13 @@ def fxc_channels(family: str, label: str = "p1",
         jp_q = sp.Symbol(f"jp__q_{ax}", real=True)
         if b.has(jp_q):
             out[f"jp_{ax}"] = sp.expand(sp.diff(b, jp_q))
+    # the density-Hessian family: one channel per Hessian component, keyed
+    # by the primitive's name as in vxc_channels
+    for i, a in enumerate(AXES):
+        for c in AXES[i:]:
+            h_q = sp.Symbol(f"hess_rho__q_{a}{c}", real=True)
+            if b.has(h_q):
+                out[f"hess_rho_{a}{c}"] = sp.expand(sp.diff(b, h_q))
     return out
 
 

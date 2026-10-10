@@ -3,7 +3,8 @@ Casida-type codes): d2/dt1 dt2 of E = sum_g w e(fields + t1 d1 + t2 d2)
 by Richardson cross finite differences on analytic periodic fields,
 against xckernel.engine.response.fxc_bilinear evaluated with pylibxc
 derivative arrays -- for lda / gga / mgga_tau / mgga_lapl / mgga; and the
-hmgga bilinears exactly against a toy functional (validate_composite_exact)."""
+hmgga bilinears exactly against a toy functional (validate_composite_exact),
+and the completeness of the potential and fxc channels of every family."""
 
 from __future__ import annotations
 
@@ -426,6 +427,49 @@ def validate_composite_exact():
     return fails
 
 
+CHANNEL_FAMILIES = ("lda", "gga", "mgga_tau", "mgga_lapl", "mgga",
+                    "cmgga_tau", "hmgga")
+
+
+def _channel_key(q: sp.Symbol) -> str:
+    """Channel key of a second-perturbation operand: grad_rho_a__q_x ->
+    grad_a_x, lapl_rho__q -> lapl, hess_rho_a__q_xy -> hess_rho_a_xy."""
+    name = q.name.replace("__q", "").replace("grad_rho_", "grad_")
+    return "lapl" + name[len("lapl_rho"):] if name.startswith("lapl_rho") \
+        else name
+
+
+def validate_channels_complete():
+    """The channel helpers are only a regrouping, so they must lose
+    nothing, for every family and spin treatment: the potential channels
+    reproduce dExc/dP (check_vxc_channels), and the fxc channels rebuild
+    the bilinear exactly, sum_X c_X X^q, one channel per operand of the
+    second perturbation."""
+    from ..engine.fock import check_vxc_channels
+    from ..engine.response import fxc_channels
+    from ..engine.spin_kernel import (check_vxc_channels_spin,
+                                      fxc_bilinear_spin, fxc_channels_spin)
+    fails = 0
+    for family in CHANNEL_FAMILIES:
+        for spin in (False, True):
+            check = check_vxc_channels_spin if spin else check_vxc_channels
+            bil = fxc_bilinear_spin if spin else fxc_bilinear
+            ch = (fxc_channels_spin if spin else fxc_channels)(family)
+            b = bil(family, l1="p1", l2="_q")
+            ops = [a for a in b.free_symbols if "__q" in a.name]
+            missing = sorted(_channel_key(q) for q in ops
+                             if _channel_key(q) not in ch)
+            res = sp.expand(b - sum((ch[_channel_key(q)] * q for q in ops
+                                     if _channel_key(q) in ch),
+                                    sp.Integer(0)))
+            ok = check(family) == 0 and res == 0 and not missing
+            fails += 0 if ok else 1
+            print(f"  [{'OK ' if ok else 'FAIL'}] channels "
+                  f"{'spin ' if spin else ''}{family:10s}"
+                  + (f" missing {missing}" if missing else ""))
+    return fails
+
+
 def main():
     m, F0, pert = make_setup()
     failures = 0
@@ -437,7 +481,8 @@ def main():
                                          func_ids, H, tol)
     failures += validate_st(m, F0, pert)
     failures += validate_composite_exact()
-    n = len(FAMILIES) + 2 * len(SPIN_FAMILIES) + 2
+    failures += validate_channels_complete()
+    n = len(FAMILIES) + 2 * len(SPIN_FAMILIES) + 2 + 2 * len(CHANNEL_FAMILIES)
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] bilinear_validate: {n} checks, "
           f"{failures} failures")
