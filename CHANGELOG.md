@@ -8,6 +8,18 @@ layout change outside the entry points is the index struct
 `xck_kernel_info` in 0.5.0, which a host compiled against the header of
 the same generated tree picks up automatically.
 
+## Unreleased
+
+- **Imaginary (magnetic) MO-projected response** for `cmgga_tau`:
+  `xck_cmgga_tau_st_o2_{p,m}_mo_imag` (kind `mo2i`) and
+  `xck_cmgga_tau_{ua,ub}_o2_mo_imag` (kind `mo2iu`).
+  - Computes the σ vectors for P_x = C_occ X_x C_virᵀ − C_vir X_xᵀ C_occᵀ,
+    the antisymmetric part of the general density matrix.
+  - The arguments are the same as for `mo2`/`mo2u`.
+  - Only the paramagnetic-current terms remain.
+- The MO-projected kernels now drop perturbed fields that vanish
+  identically, such as jₚ¹ of a real perturbation in `cmgga_tau`.
+
 ## 0.5.0 (2026-10-06)
 
 Generate only the kernel kinds a host uses, dispatch from the index,
