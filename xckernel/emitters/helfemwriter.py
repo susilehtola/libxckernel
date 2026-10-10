@@ -24,6 +24,30 @@ three-dimensional atomic and diatomic workers carry three and use the
 ``_3d`` ones.  All three come from the same expressions, so they cannot
 drift apart.
 
+The current-corrected tau-meta-GGA (``cmgga_tau``, tau~ = tau -
+|j_p|^2 / 2 rho per spin) adds a fourth channel, ``y_<c>``, which
+multiplies the pair's paramagnetic current density.  HelFEM's basis
+functions are complex, chi = f exp(i m phi), and its density matrices
+real symmetric, so the current lives in the basis and a real symmetric
+perturbation moves it; the channels come from
+``engine.current_channels``, which derives them in that convention (the
+catalog's ``cmgga_tau`` kernels assume the opposite one).  Per worker:
+
+* ``_3d`` (atomic and diatomic): three gradient and three current
+  components, physical, as for the other ``_3d`` kernels.
+* ``_2d`` (diatomic pure-m): gradient (mu, nu), current (phi) only: the
+  pure-m current is purely azimuthal, j_phi = sum_m m rho_m / h_phi, and
+  the host multiplies y_phi by m / h_phi times the real pair product
+  f_u f_v within the m block.
+* radial (spherically averaged atomic): none.  The spherically averaged
+  density carries no current, j_p = 0 identically, so the functional
+  reduces to the tau-meta-GGA and the ``mgga_tau`` kernels apply.
+
+The ground state needs the ``u`` and ``y`` channels (``xck_helfem_vxc_
+cmgga_tau_*``): u = vrho + vtau |j|^2 / (2 rho^2) replaces vrho, y =
+-vtau j / rho is new, and the gradient channel is the shared
+``xck_helfem_vxc_grad``.  The Libxc arrays are evaluated at tau~.
+
 Reproduce with: python -m xckernel.emitters.helfemwriter --emit <file>
 """
 
@@ -34,6 +58,8 @@ from .fieldkernel import (ChannelLayout, FieldKernel, GradientLayout,
                           SpinChannelLayout, SpinGradientLayout)
 from ..engine.fock import vxc_channels
 from ..engine.response import fxc_channels
+from ..engine.current_channels import (fxc_current_channels,
+                                       vxc_current_channels)
 from ..engine.spin_kernel import vxc_channels_spin
 from ..inputs.basis import PROLATE_PUREM, RADIAL
 
@@ -57,8 +83,19 @@ CARTESIAN_AXES = ("x", "y", "z")
 #: reduction removes is a component, not a metric.
 PUREM_AXES = PROLATE_PUREM.axes
 
+#: the current-density family, emitted by its own specs (below); its
+#: channels need a complex-basis, real-P derivation of their own
+CURRENT_FAMILIES = ("cmgga_tau",)
 
-def _channel_params(spec_exprs, axes, spins=None) -> list:
+#: current components per worker.  The 3D workers carry all three; the
+#: pure-m worker carries the azimuthal one ONLY -- a component its
+#: gradient channels do not have, which is why these are not
+#: PUREM_AXES.
+CARTESIAN_CURRENTS = CARTESIAN_AXES
+PUREM_CURRENTS = ("phi",)
+
+
+def _channel_params(spec_exprs, axes, spins=None, currents=()) -> list:
     """Positional parameter order for a channel kernel.
 
     The operands a :class:`FieldKernel` discovers come back sorted by
@@ -87,6 +124,17 @@ def _channel_params(spec_exprs, axes, spins=None) -> list:
     for sp_ in (spins or (None,)):
         tag = "" if sp_ is None else f"_{sp_}"
         head.append(f"tau{tag}_p1")
+    # current-density families: the perturbed current, then the current,
+    # then the density (tau~ divides by it), per spin
+    for sp_ in (spins or (None,)):
+        tag = "" if sp_ is None else f"_{sp_}"
+        head += [f"jp{tag}_p1_{ax}" for ax in currents]
+    for sp_ in (spins or (None,)):
+        tag = "" if sp_ is None else f"_{sp_}"
+        head += [f"jp{tag}_{ax}" for ax in currents]
+    if currents:
+        for sp_ in (spins or (None,)):
+            head.append("rho" if sp_ is None else f"rho_{sp_}")
     head = [n for n in head if n in ops]
     return head + [n for n in ops if n not in head]
 
@@ -198,6 +246,9 @@ def _vgrad_exprs(family: str, spin: bool):
     """Only the gradient channels: the rho and tau channels of the
     ground-state potential are Libxc outputs the host already holds, so
     emitting them would just copy vrho and vtau through a function."""
+    if family in CURRENT_FAMILIES:
+        ch = vxc_current_channels(RADIAL_AXES, (), polarized=spin)
+        return {k: v for k, v in ch.items() if k.startswith("grad")}
     ch = (vxc_channels_spin if spin else vxc_channels)(family, RADIAL)
     return {k: v for k, v in ch.items() if k.startswith("grad")}
 
@@ -213,7 +264,7 @@ def _shared_vgrad_exprs(spin: bool):
     loudly instead of silently getting the wrong kernel.
     """
     base = _vgrad_exprs("gga", spin)
-    for fam in FAMILIES:
+    for fam in FAMILIES + CURRENT_FAMILIES:
         if fam == "lda":
             continue
         other = _vgrad_exprs(fam, spin)
@@ -261,6 +312,101 @@ def spec_vgrad_spin() -> FieldKernel:
     )
 
 
+def _vxc_current_params(exprs, currents, spins) -> list:
+    """Ground-state current kernels: density, current, then the Libxc
+    arrays (sorted, flat packing)."""
+    ops = sorted({sym.name for e in exprs.values() for sym in e.free_symbols})
+    head = []
+    for sp_ in spins:
+        head.append("rho" if sp_ is None else f"rho_{sp_}")
+    for sp_ in spins:
+        tag = "" if sp_ is None else f"_{sp_}"
+        head += [f"jp{tag}_{ax}" for ax in currents]
+    head = [n for n in head if n in ops]
+    return head + [n for n in ops if n not in head]
+
+
+def spec_vxc_current(currents, suffix: str, spin: bool) -> FieldKernel:
+    """Ground-state u and y channels of the current-corrected
+    tau-meta-GGA.  The gradient axes do not enter (the gradient channel
+    is the shared xck_helfem_vxc_grad), so only the current's are given."""
+    from .fieldkernel import ExplicitLayout
+    ch = vxc_current_channels((), currents, polarized=spin)
+    spins = ("a", "b") if spin else (None,)
+    exprs, targets = {}, []
+    for sp_ in spins:
+        t = "" if sp_ is None else f"_{sp_}"
+        exprs[f"rho{t}"] = ch[f"rho{t}"]
+        targets.append(f"u{t}")
+        for ax in currents:
+            exprs[f"jp{t}_{ax}"] = ch[f"jp{t}_{ax}"]
+            targets.append(f"y{t}_{ax}")
+    name = f"xck_helfem_vxc_cmgga_tau_{suffix}" + ("_spin" if spin else "")
+    comps = ", ".join(currents)
+    doc = [f"Ground-state cmgga_tau potential: u replaces vrho, y_<c> "
+           f"multiplies the pair's current ({comps}).",
+           "tau~ = tau - |j|^2 / (2 rho) per spin; Libxc arrays evaluated "
+           "at tau~.",
+           "w = vtau and v = xck_helfem_vxc_grad as for the "
+           "tau-meta-GGA."]
+    if suffix == "2d":
+        doc.append("Pure-m: the current is azimuthal only; the host "
+                   "multiplies y_phi by m / h_phi f_u f_v.")
+    if spin:
+        doc.append("Polarized Libxc arrays keep their flat packing "
+                   "(vrho_0 = a, _1 = b).")
+    return FieldKernel(
+        name=name, exprs=exprs,
+        params=_vxc_current_params(exprs, currents, spins),
+        binding="positional",
+        layout=ExplicitLayout(targets=targets,
+                              ret="(" + ", ".join(targets) + ")"),
+        doc=tuple(doc))
+
+
+def spec_fxc_current(gaxes, currents, suffix: str, spin: bool) -> FieldKernel:
+    """fxc channels of the current-corrected tau-meta-GGA: u, v_<ax>,
+    w_tau and the current channel y_<c>, for a perturbation with rho_p1,
+    grad_rho_p1, tau_p1 and the perturbed current jp_p1."""
+    exprs = fxc_current_channels(gaxes, currents, polarized=spin)
+    spins = ("a", "b") if spin else None
+    name = f"xck_helfem_fxc_cmgga_tau_{suffix}" + ("_spin" if spin else "")
+    doc = [f"cmgga_tau fxc coefficient channels: gradient ({', '.join(gaxes)}),"
+           f" current ({', '.join(currents)}).",
+           "u, v_<ax>, w as for the tau-meta-GGA; y_<c> multiplies the "
+           "pair's current density",
+           "Im(chi_u^* d_c chi_v), symmetrized (complex basis, real "
+           "symmetric P).",
+           "tau~ = tau - |j|^2 / (2 rho) per spin; Libxc arrays evaluated "
+           "at tau~."]
+    if suffix == "2d":
+        doc.append("Pure-m: the current is azimuthal only; the host "
+                   "multiplies y_phi by m / h_phi f_u f_v.")
+    if spin:
+        doc.append("Polarized Libxc arrays keep their flat packing "
+                   "(v2rho2_0 = uu, _1 = ud, _2 = dd, ...).")
+    layout = (SpinChannelLayout(axes=gaxes, currents=currents) if spin
+              else ChannelLayout(axes=gaxes, currents=currents))
+    return FieldKernel(
+        name=name, exprs=exprs,
+        params=_channel_params(exprs, gaxes, spins=spins,
+                               currents=currents),
+        binding="positional", layout=layout, doc=tuple(doc))
+
+
+def specs_current():
+    """The current-density kernels: ground state and fxc, 3D and pure-m,
+    restricted and spin-resolved.  No radial ones: the spherically
+    averaged density carries no current."""
+    out = []
+    for gaxes, cur, sfx in ((CARTESIAN_AXES, CARTESIAN_CURRENTS, "3d"),
+                            (PUREM_AXES, PUREM_CURRENTS, "2d")):
+        for spin in (False, True):
+            out.append(spec_vxc_current(cur, sfx, spin))
+            out.append(spec_fxc_current(gaxes, cur, sfx, spin))
+    return out
+
+
 def specs():
     """Every kernel this writer emits, radial first."""
     out = [spec_vgrad(), spec_vgrad_spin()]
@@ -272,7 +418,7 @@ def specs():
             out.append(spec_purem_spin(fam))
             out.append(spec_cartesian(fam))
             out.append(spec_cartesian_spin(fam))
-    return out
+    return out + specs_current()
 
 
 def emit_header(cse: bool = True) -> str:
