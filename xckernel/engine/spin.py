@@ -321,7 +321,8 @@ def _pert_eta(spin: str):
 
 SCALARS = _make_scalars()
 for _c in COMPS["eta"]:
-    SCALARS[("eta", _c)] = Scalar("eta", _c, _seed_eta(_c), _pert_eta(_c))
+    SCALARS[("eta", _c)] = Scalar("eta", _c, _seed_eta(_c), _pert_eta(_c),
+                                  lambda c=_c: _eta_value(c))
 
 #: per-family scalar overrides: cmgga_tau evaluates the Libxc tau slot at the
 #: gauge-corrected tau~, so the tau scalars carry the ctau seed/pert instead.

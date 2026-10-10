@@ -2,7 +2,8 @@
 Casida-type codes): d2/dt1 dt2 of E = sum_g w e(fields + t1 d1 + t2 d2)
 by Richardson cross finite differences on analytic periodic fields,
 against xckernel.engine.response.fxc_bilinear evaluated with pylibxc
-derivative arrays -- for lda / gga / mgga_tau / mgga_lapl / mgga."""
+derivative arrays -- for lda / gga / mgga_tau / mgga_lapl / mgga; and the
+hmgga bilinears exactly against a toy functional (validate_composite_exact)."""
 
 from __future__ import annotations
 
@@ -313,6 +314,118 @@ def validate_st(m, F0, pert):
     return fails
 
 
+def _toy_point(spins, seed=3):
+    """Rational ground-state and perturbation fields at one point, as
+    linear functions of (t1, t2), and their symbol values."""
+    import random
+    from ..engine.spin import HESS_INDEX
+    rnd = random.Random(seed)
+    R = lambda: sp.Rational(rnd.randint(-9, 9), 7)  # noqa: E731
+    t1, t2 = sp.symbols("t1 t2")
+    vals, F = {}, {}
+
+    def line(name, base, ins=""):
+        b = (base, R(), R())
+        vals[name] = b[0]
+        for lab, x in zip(("p1", "p2"), b[1:]):
+            stem, comp = (name.rsplit("_", 1) if ins else (name, None))
+            vals[f"{stem}_{lab}_{comp}" if ins else f"{name}_{lab}"] = x
+        return b[0] + t1 * b[1] + t2 * b[2]
+
+    for s in spins:
+        t = f"_{s}" if s else ""
+        pos = lambda: sp.Rational(rnd.randint(3, 9), 5)  # noqa: E731
+        F[s] = {k: line(f"{k}{t}", pos()) for k in ("rho", "lapl_rho",
+                                                     "tau")}
+        F[s]["grad"] = [line(f"grad_rho{t}_{ax}", R(), "ax") for ax in AXES]
+        H = {}
+        for (i, j) in HESS_INDEX:
+            if i <= j:
+                H[(i, j)] = H[(j, i)] = line(
+                    f"hess_rho{t}_{AXES[i]}{AXES[j]}", R(), "ax")
+        F[s]["hess"] = H
+    return (t1, t2), vals, F
+
+
+def _toy_scalar(F, group, comp):
+    """Libxc scalar from the toy fields (comp: spin tag(s), '' restricted)."""
+    if group == "rho":
+        return F[comp]["rho"]
+    if group == "lapl":
+        return F[comp]["lapl_rho"]
+    if group == "tau":
+        return F[comp]["tau"]
+    if group == "sigma":
+        s, t = (comp[0], comp[1]) if comp else ("", "")
+        return sum(a * b for a, b in zip(F[s]["grad"], F[t]["grad"]))
+    g, H = F[comp]["grad"], F[comp]["hess"]
+    return sum(g[i] * H[(i, j)] * g[j] for i in range(3) for j in range(3))
+
+
+def validate_composite_exact():
+    """The density-Hessian eta, a composite scalar, enters the bilinear
+    through its own curvature, which no Libxc functional reachable from
+    pylibxc exercises.  Check the restricted and polarized hmgga
+    bilinears exactly against d2/dt1 dt2 of a toy f(scalars) of known
+    derivatives, in rational arithmetic."""
+    import re
+    from ..engine.spin import family_scalars
+    from ..engine.spin_kernel import _SYM_SCALARS, fxc_bilinear_spin
+
+    groups = ("rho", "sigma", "lapl", "tau", "eta")
+    fails = 0
+    for spin in (False, True):
+        spins = ("a", "b") if spin else ("",)
+        (t1, t2), vals, F = _toy_point(spins)
+        if spin:
+            keys = [(sc.group, sc.comp) for sc in family_scalars("hmgga")]
+        else:
+            keys = [(g, "") for g in groups]
+        X = {k: sp.Symbol("X_" + "_".join(k)) for k in keys}
+        xs = list(X.values())
+        rnd = __import__("random").Random(5)
+        f = sum(sp.Rational(rnd.randint(-9, 9), 11) * xs[i] * xs[j] * xs[k]
+                for i in range(len(xs)) for j in range(i, len(xs))
+                for k in range(j, len(xs)))
+        on = {X[k]: _toy_scalar(F, *k) for k in keys}
+        at0 = {t1: 0, t2: 0}
+        ref = sp.diff(f.subs(on, simultaneous=True), t1, t2).subs(at0)
+        x0 = {x: v.subs(at0) for x, v in on.items()}
+
+        def deriv(ks):
+            d = f
+            for k in ks:
+                d = sp.diff(d, X[k])
+            return d.subs(x0)
+
+        if spin:
+            expr = fxc_bilinear_spin("hmgga")
+            sub = {a: deriv([(sc.group, sc.comp)
+                             for sc in _SYM_SCALARS[a.name]])
+                   for a in expr.free_symbols if a.name in _SYM_SCALARS}
+        else:
+            expr = fxc_bilinear("hmgga")
+            sub = {}
+            for a in expr.free_symbols:
+                m = re.fullmatch(r"v2?((?:%s)+?)2?" % "|".join(groups),
+                                 a.name)
+                if m is None:
+                    continue
+                gs = re.findall("|".join(groups), m.group(1))
+                if a.name.startswith("v2") and len(gs) == 1:
+                    gs = gs * 2
+                sub[a] = deriv([(g, "") for g in gs])
+        sub.update({a: vals[a.name] for a in expr.free_symbols
+                    if a not in sub})
+        diff = sp.nsimplify(expr.subs(sub) - ref)
+        ok = diff == 0
+        fails += 0 if ok else 1
+        print(f"  [{'OK ' if ok else 'FAIL'}] exact "
+              f"{'spin ' if spin else ''}hmgga (eta curvature): "
+              f"ana - exact = {diff}")
+    return fails
+
+
 def main():
     m, F0, pert = make_setup()
     failures = 0
@@ -323,7 +436,8 @@ def main():
         failures += validate_family_spin(ms, FS0, spert, family,
                                          func_ids, H, tol)
     failures += validate_st(m, F0, pert)
-    n = len(FAMILIES) + 2 * len(SPIN_FAMILIES)
+    failures += validate_composite_exact()
+    n = len(FAMILIES) + 2 * len(SPIN_FAMILIES) + 2
     status = "OK " if failures == 0 else "FAIL"
     print(f"[{status}] bilinear_validate: {n} checks, "
           f"{failures} failures")

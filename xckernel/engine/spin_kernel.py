@@ -471,6 +471,10 @@ def _scalar_value_spin(sc: Scalar, coords=None) -> sp.Expr:
     carry their own value (the gauge-corrected tau); the rest are
     primitives in their own right."""
     from .spin import _sigma_value
+    if sc.group == "eta":
+        # its value is in the Hessian fields, which have no channel here
+        raise NotImplementedError(
+            "no potential channels for the density-Hessian eta")
     if sc.value is not None:
         return sc.value()
     if sc.group == "sigma":
