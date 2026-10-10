@@ -88,8 +88,9 @@ def _batch_operands(operands: Dict, ng: int):
 
 
 def _kind(name: str) -> str:
-    if name.endswith("_mo"):
-        return "mo2u" if ("_ua_" in name or "_ub_" in name) else "mo2"
+    if name.endswith(("_mo", "_mo_imag")):
+        k = "mo2" if name.endswith("_mo") else "mo2i"
+        return k + ("u" if ("_ua_" in name or "_ub_" in name) else "")
     if name.endswith("_o2_batch"):
         return "o2b"
     if name.endswith("_giao"):
@@ -151,7 +152,7 @@ class Library:
         _a/_b pairs), amplitudes X (or X_a, X_b) of shape (nx, nocc, nvir);
         returns sigma (nx, nocc, nvir) of the output channel."""
         ng = np.asarray(w).shape[0]
-        chans = ["a", "b"] if kind == "mo2u" else [""]
+        chans = ["a", "b"] if kind.endswith("u") else [""]
         sfx = lambda c: f"_{c}" if c else ""
         keep, args, dims = [], [ctypes.c_int64(ng)], {}
         towers = {}
@@ -183,7 +184,8 @@ class Library:
         if missing:
             raise TypeError(f"{name}: missing operands {missing}")
         ptrs = (_P * len(names))(*[scal[n].ctypes.data_as(_P) for n in names])
-        s = "" if kind == "mo2" else ("a" if "_ua_" in name else "b")
+        s = "" if not kind.endswith("u") else \
+            ("a" if "_ua_" in name else "b")
         shape = (nx, dims["nocc" + sfx(s)], dims["nvir" + sfx(s)])
         out = np.zeros(shape) if out is None else np.ascontiguousarray(out)
         fn = getattr(self._dll, name)
@@ -211,7 +213,7 @@ class Library:
         DTchi = M^T chi; the dF/dX basis class takes Dchi (or Dchi_a and
         Dchi_b) and the atom mask (nbf,), one atom per call."""
         kind = self.kind(name)
-        if kind in ("mo2", "mo2u"):
+        if kind in ("mo2", "mo2u", "mo2i", "mo2iu"):
             return self._call_mo(name, kind, w, out, operands)
         ng = np.asarray(w).shape[0]
         nx = None
