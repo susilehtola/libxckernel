@@ -507,6 +507,39 @@ def symbolic(rep):
                   f"{bad} mismatches)")
 
 
+def engine_helpers(rep):
+    """The engine's generic channel helpers (fock.vxc_channels,
+    response.fxc_channels and their spin counterparts) give the same
+    cmgga_tau channels as current_channels, once inv_rho = 1/rho: the
+    channels do not depend on the basis convention, only the seeds do."""
+    from ..engine.current_channels import fxc_current_channels as fx
+    from ..engine.current_channels import vxc_current_channels as vx
+    from ..engine.fock import vxc_channels
+    from ..engine.response import fxc_channels
+    from ..engine.spin_kernel import fxc_channels_spin, vxc_channels_spin
+    X = ("x", "y", "z")
+
+    def sub(e):
+        return sp.expand(e.subs({
+            s: 1 / sp.Symbol(s.name.replace("inv_rho", "rho"), real=True)
+            for s in e.free_symbols if s.name.startswith("inv_rho")}))
+    for tag, eng, ref in (
+            ("vxc_channels", vxc_channels("cmgga_tau"), vx(X, X)),
+            ("fxc_channels", fxc_channels("cmgga_tau"), fx(X, X)),
+            ("vxc_channels_spin", vxc_channels_spin("cmgga_tau"),
+             vx(X, X, True)),
+            ("fxc_channels_spin", fxc_channels_spin("cmgga_tau"),
+             fx(X, X, True))):
+        bad = sorted(set(eng) ^ set(ref))
+        bad += [k for k in ref if k in eng
+                and sp.expand(sub(eng[k]) - ref[k]) != 0]
+        rep.tested += 1
+        rep.failures += bool(bad)
+        print(f"  [{'OK' if not bad else 'FAIL'}] engine {tag}(cmgga_tau) "
+              f"= current_channels ({len(ref)} channels"
+              + (f"; differ: {bad}" if bad else "") + ")")
+
+
 def main():
     rng = np.random.default_rng(11)
     rep = Report()
@@ -519,6 +552,7 @@ def main():
         zero_current(K, rep, rng)
         purem(K, rep, rng)
     symbolic(rep)
+    engine_helpers(rep)
     status = "OK " if rep.failures == 0 else "FAIL"
     print(f"[{status}] helfem_current_validate: {rep.tested} checks, "
           f"{rep.failures} failures")
