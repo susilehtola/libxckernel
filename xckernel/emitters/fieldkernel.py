@@ -65,12 +65,17 @@ class ChannelLayout(Layout):
     """
 
     axes: Sequence[str] = ("x", "y", "z")
+    #: components of the paramagnetic-current channel ``y_<axis>``
+    #: (current-density families only); separate from ``axes`` because a
+    #: worker's current may have components its gradient lacks
+    currents: Sequence[str] = ()
 
     def assignments(self, exprs):
         out = [("u", exprs["rho"])]
         out += [(f"v_{ax}", exprs[f"grad_{ax}"]) for ax in self.axes]
         if "tau" in exprs:
             out.append(("w_tau", exprs["tau"]))
+        out += [(f"y_{ax}", exprs[f"jp_{ax}"]) for ax in self.currents]
         return out
 
     def epilogue(self, exprs):
@@ -78,6 +83,9 @@ class ChannelLayout(Layout):
         ret = "{'rho': u, 'grad': [" + vec + "]"
         if "tau" in exprs:
             ret += ", 'tau': w_tau"
+        if self.currents:
+            ret += ", 'jp': [" + ", ".join(f"y_{ax}" for ax in
+                                           self.currents) + "]"
         return [f"    return {ret}}}"]
 
 
@@ -88,6 +96,7 @@ class SpinChannelLayout(Layout):
 
     axes: Sequence[str] = ("x", "y", "z")
     spins: Sequence[str] = ("a", "b")
+    currents: Sequence[str] = ()
 
     def assignments(self, exprs):
         out = []
@@ -97,6 +106,8 @@ class SpinChannelLayout(Layout):
                     for ax in self.axes]
             if f"tau_{s}" in exprs:
                 out.append((f"w_{s}", exprs[f"tau_{s}"]))
+            out += [(f"y_{s}_{ax}", exprs[f"jp_{s}_{ax}"])
+                    for ax in self.currents]
         return out
 
     def epilogue(self, exprs):
@@ -107,6 +118,9 @@ class SpinChannelLayout(Layout):
             entries.append(f"'grad_{s}': [{vec}]")
             if f"tau_{s}" in exprs:
                 entries.append(f"'tau_{s}': w_{s}")
+            if self.currents:
+                vec = ", ".join(f"y_{s}_{ax}" for ax in self.currents)
+                entries.append(f"'jp_{s}': [{vec}]")
         return ["    return {" + ", ".join(entries) + "}"]
 
 
