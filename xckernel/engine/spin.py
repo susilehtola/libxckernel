@@ -154,6 +154,10 @@ class Scalar:
     seed: Callable[[str, Orbital, Orbital], sp.Expr]
     #: perturbed value under a response label (None -> group-default form)
     pert: "Callable[[str], sp.Expr] | None" = None
+    #: ground-state value in the spin-resolved field symbols, for a
+    #: composite scalar (None -> the scalar's own primitive); the
+    #: potential channels and the second-order perturbation derive from it
+    value: "Callable[[], sp.Expr] | None" = None
 
     @property
     def key(self) -> Tuple[int, int]:
@@ -272,6 +276,15 @@ def _pert_ctau(spin: str):
     return f
 
 
+def _ctau_value(spin: str):
+    """tau~_s = tau_s - |j_s|^2 inv_rho_s / 2, in the field symbols."""
+    def f() -> sp.Expr:
+        return (sp.Symbol(f"tau_{spin}", real=True)
+                - sp.Rational(1, 2) * INV_RHO_S[spin]
+                * sum(j**2 for j in JP_S[spin]))
+    return f
+
+
 def _eta_value(spin: str) -> sp.Expr:
     """eta_s = grad rho_s . (grad grad^T rho_s) . grad rho_s (spin-pure)."""
     g = GRAD[spin]
@@ -314,7 +327,8 @@ for _c in COMPS["eta"]:
 #: gauge-corrected tau~, so the tau scalars carry the ctau seed/pert instead.
 FAMILY_SCALAR_OVERRIDES: Dict[str, Dict[Tuple[str, str], Scalar]] = {
     "cmgga_tau": {
-        ("tau", c): Scalar("tau", c, _seed_ctau(c), _pert_ctau(c))
+        ("tau", c): Scalar("tau", c, _seed_ctau(c), _pert_ctau(c),
+                           _ctau_value(c))
         for c in COMPS["tau"]
     },
 }

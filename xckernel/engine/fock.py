@@ -95,14 +95,20 @@ def vxc_channels(family: str, coords=None) -> "dict[str, sp.Expr]":
     out = {}
     for key, prim in _channel_primitives(energy, coords):
         out[key] = sp.expand(sp.diff(energy, prim.symbol))
+    # inv_rho is a pseudo-primitive with no seed of its own: d(1/rho) =
+    # -inv_rho^2 d rho, so its coefficient belongs to the rho channel (the
+    # gauge-corrected tau's vtau |j|^2 / 2 rho^2)
+    if "inv_rho" in out:
+        inv = sp.Symbol("inv_rho", real=True)
+        out["rho"] = sp.expand(out.get("rho", 0) - inv**2 * out.pop("inv_rho"))
     return out
 
 
 #: Libxc-facing channel key for a primitive.  The common ones keep the
 #: names ``fxc_channels`` uses, so a host consumes the potential and the
 #: kernel through one layout; anything else (the paramagnetic current
-#: density, the density Hessian, the 1/rho pseudo-primitive) keeps its
-#: own primitive name.
+#: density, the density Hessian) keeps its own primitive name.  The 1/rho
+#: pseudo-primitive has no seed of its own; vxc_channels folds it into rho.
 def _channel_key(name: str) -> str:
     if name.startswith("grad_rho_"):
         return "grad_" + name[len("grad_rho_"):]
@@ -140,5 +146,7 @@ def check_vxc_channels(family: str, coords=None) -> sp.Expr:
     ch = vxc_channels(family, coords)
     total = sp.Integer(0)
     for key, prim in _channel_primitives(energy, coords):
+        if key == "inv_rho":
+            continue            # folded into the rho channel
         total += ch[key] * prim.seed(fi.u, fi.v)
     return sp.expand(fi.expr / fi.weight - total)
