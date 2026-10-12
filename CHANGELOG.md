@@ -8,7 +8,12 @@ layout change outside the entry points is the index struct
 `xck_kernel_info` in 0.5.0, which a host compiled against the header of
 the same generated tree picks up automatically.
 
-## Unreleased
+## 0.6.0 (2026-10-12)
+
+Imaginary (magnetic) MO-projected response for the current-corrected
+meta-GGA, HelFEM kernels for it in a complex basis, and complete
+channel helpers in the engine. The C ABI is unchanged; the catalog
+adds the kinds `mo2i` and `mo2iu`.
 
 - **Imaginary (magnetic) MO-projected response** for `cmgga_tau`:
   `xck_cmgga_tau_st_o2_{p,m}_mo_imag` (kind `mo2i`) and
