@@ -19,6 +19,33 @@ the same generated tree picks up automatically.
   - Only the paramagnetic-current terms remain.
 - The MO-projected kernels now drop perturbed fields that vanish
   identically, such as jₚ¹ of a real perturbation in `cmgga_tau`.
+- **HelFEM `cmgga_tau` kernels** (`helfemwriter`): the current-corrected
+  tau-meta-GGA in HelFEM's convention, complex basis functions
+  χ = f e^{imφ} with real symmetric density matrices, so the
+  paramagnetic current lives in the basis and a real perturbation
+  moves it. The C catalog's `cmgga_tau` is unchanged and keeps its
+  real-basis, Im P convention.
+  - Ground state (the u correction and the current channel y) and fxc
+    (with jₚ¹), restricted and spin.
+  - `_3d` kernels take three current components; the pure-m `_2d`
+    kernels take only the azimuthal one, stated in their signature.
+    The radial worker has no current kernel.
+  - Validated in HelFEM's convention by `helfem_current_validate`:
+    Fock and fxc against finite differences, the single-orbital τ_W
+    limit, the j = 0 reduction to `mgga_tau`, and `_2d` against `_3d`.
+    The existing HelFEM kernels are byte-identical.
+- **Engine channel helpers:** fixes in `vxc_channels`, `fxc_channels`
+  and their spin counterparts, which no emitted kernel was affected by.
+  - `cmgga_tau`: the 1/ρ term of τ̃ is folded into the ρ channel, with
+    its own curvature at second order; the current channels are
+    returned; the spin helpers keep τ̃.
+  - `hmgga`: the spin fxc bilinear includes η's own second-order term.
+  - The spin helpers return the Laplacian channel (`mgga_lapl`,
+    `mgga`), which they had dropped; both fxc helpers return the
+    density-Hessian channels (`hmgga`).
+  - `bilinear_validate` now checks, for every family and both spin
+    treatments, that the channels lose nothing, and checks the `hmgga`
+    bilinears exactly.
 
 ## 0.5.0 (2026-10-06)
 
