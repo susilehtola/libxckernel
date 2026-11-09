@@ -127,6 +127,93 @@ def _gemm_plan(patterns) -> Tuple[str, list]:
     return side, list(groups.items())
 
 
+def _min_cover(codes, forced, edges):
+    """A smallest set of basis codes containing ``forced`` and an end of
+    every edge (exhaustive by size; the codes of one kernel are few)."""
+    from itertools import combinations
+    rest = sorted(set(codes) - set(forced))
+    for k in range(len(rest) + 1):
+        for extra in combinations(rest, k):
+            cover = set(forced) | set(extra)
+            if all(a in cover or b in cover for a, b in edges):
+                return cover
+    return set(codes)
+
+
+def _half_patterns(pairs):
+    """Half of a (anti)symmetric pattern set, each unordered pair once with
+    its shared factor in a minimal cover: [(shared, other, monos)]."""
+    forced = {u for u, v in pairs if u == v}
+    edges = [(u, v) for u, v in pairs if u != v]
+    cover = _min_cover({c for p in pairs for c in p}, forced, edges)
+    out = []
+    for (u, v), monos in pairs.items():
+        if u != v and u not in cover:
+            u, v = v, u
+        out.append((u, v, monos))
+    return sorted(out, key=lambda p: (p[0], p[1])), len(cover)
+
+
+def symmetry_split(ck: CollapsedKernel):
+    """The matrix kernel as out += (X_s + X_s^T) + (X_a - X_a^T), when that
+    needs fewer GEMMs than the plain grouping.
+
+    A Fock-type kernel is symmetric in (u, v): every pattern (a, b) has
+    its transpose (b, a) with the same monomials, and the plain grouping
+    pays a GEMM for each.  X_s holds one of each transposed pair (and
+    half of each self-transposed pattern), X_a the antisymmetric
+    remainder of a general-M kernel (cmgga_tau).  Returns
+    [(half kernel, sign)] with sign +1 for X_s and -1 for X_a, or None
+    when the plain grouping is at least as cheap."""
+    from dataclasses import replace
+
+    def table(monos):
+        t = {}
+        for coeff, factors in monos:
+            k = tuple(sorted(factors))
+            t[k] = t.get(k, 0.0) + coeff
+        return t
+
+    full = {}
+    for u, v, monos in ck.patterns:
+        if (u, v) in full:
+            return None
+        full[(u, v)] = table(monos)
+    sym, anti = {}, {}
+    for (u, v), m in full.items():
+        if (v, u) in sym or (v, u) in anti:
+            continue
+        if u == v:
+            sym[(u, u)] = {k: c / 2 for k, c in m.items()}
+            continue
+        t = full.get((v, u), {})
+        s = {k: (m.get(k, 0.0) + t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
+        a = {k: (m.get(k, 0.0) - t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
+        s = {k: c for k, c in s.items() if c != 0.0}
+        a = {k: c for k, c in a.items() if c != 0.0}
+        if s:
+            sym[(u, v)] = s
+        if a:
+            anti[(u, v)] = a
+    parts, cost = [], 0
+    for pairs, sign in ((sym, +1), (anti, -1)):
+        if not pairs:
+            continue
+        half, n = _half_patterns(pairs)
+        cost += n
+        if sign < 0:
+            # (a, b) of X_a carries the (a, b) element; a pattern turned
+            # round for the cover carries the (b, a) one, which is -
+            half = [(u, v, m if (u, v) in pairs else
+                     {k: -c for k, c in m.items()}) for u, v, m in half]
+        parts.append(([(u, v, sorted(((c, k) for k, c in m.items()),
+                                     key=lambda x: x[1]))
+                       for u, v, m in half], sign))
+    if cost >= len(_gemm_plan(ck.patterns)[1]):
+        return None
+    return [(replace(ck, patterns=p), sign) for p, sign in parts]
+
+
 def _stage_b_calls(ck: CollapsedKernel, bexpr, stage_a_call, indent="        ",
                    gemm="gemm_nt", acc="accumulate", cast=lambda x: x,
                    out="out"):
@@ -577,6 +664,16 @@ XCK_HD inline void rowdot(int64_t n, int64_t k, const T* A, int64_t lda,
     }
 }
 
+/* The symmetric (sign +1) or antisymmetric (-1) completion of a half
+ * product: out(i,j) += X(i,j) + sign X(j,i), n x n row-major. */
+template <typename T>
+XCK_HD inline void add_sym(int64_t n, int sign, const T* X, T* out) {
+    const T s = T(sign);
+    for (int64_t i = 0; i < n; ++i)
+        for (int64_t j = 0; j < n; ++j)
+            out[i * n + j] += X[i * n + j] + s * X[j * n + i];
+}
+
 #ifdef XCKERNEL_USE_BLAS
 namespace detail {
 inline bool blas_fits(int64_t n, int64_t k, int64_t lda, int64_t ldb) {
@@ -655,7 +752,7 @@ inline void gemm_nt(int64_t n, int64_t k, const float* A, int64_t lda,
 #: response kernel and are always emitted)
 OPTIONAL_HELPERS = ("lincomb", "gemm_rect", "gemm_dn", "masked_rowcolsum",
                     "gemm_nn", "colsum_prod", "mask_rows", "scale_rows",
-                    "masked_colsum", "rowdot")
+                    "masked_colsum", "rowdot", "add_sym")
 
 
 def helpers_used(sources) -> set:
@@ -968,16 +1065,27 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     xder = L.derived_basis()
     sder = L.derived_fields()
     cfld = L.computed
+    # matrix kernels symmetric in (u, v): one of each transposed pattern
+    # pair, accumulated into an nbf x nbf half product per part
+    splits = [symmetry_split(ck) if kind in MATRIX_KINDS else None
+              for ck in blocks]
+    nz = max((len(sp_) for sp_ in splits if sp_), default=0)
+
+    def tags(r):
+        if splits[r] is None:
+            return [(str(r), blocks[r], 0)]
+        return [(f"{r}{'s' if sign > 0 else 'a'}", sub, sign)
+                for sub, sign in splits[r]]
 
     lines = ["/* generated by xckernel; do not edit. */", "#pragma once",
              "#include <cstdint>", "#include <new>",
              '#include "xckernel/evaluator.hpp"', "",
              "namespace xckernel {", f"namespace {ns} {{"]
-    nms = []
-    for r, ck in enumerate(blocks):
-        t, n = _tables(ck, sidx, str(r))
-        lines += t
-        nms.append(n)
+    nms = {}
+    for r in range(len(blocks)):
+        for tag, ck, _ in tags(r):
+            t, nms[tag] = _tables(ck, sidx, tag)
+            lines += t
     lines += [f"static constexpr int64_t NFLD = {nfld};",
               f"}} // namespace {ns}", "",
               "/* Scratch (elements of T) the kernel needs: pass at least this",
@@ -986,7 +1094,8 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
               "    const int64_t blk = npts < grid_block ? npts : grid_block;",
               f"    return blk * (1 + nbf * "
               f"{1 + len(xder) + int(ncon) if has_nbf else 0})"
-              f" + {len(sder) + len(cfld)} * npts + 1;",
+              f" + {len(sder) + len(cfld)} * npts"
+              + (f" + {nz} * nbf * nbf" if nz else "") + " + 1;",
               "}", ""]
 
     sig = ["int64_t npts"] + (["int64_t nbf"] if has_nbf else []) \
@@ -1027,6 +1136,10 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
     for j, n in enumerate(cfld):
         lines.append(f"    T* C{j} = c + {base} + "
                      f"(int64_t){len(sder) + j}*npts;")
+    for k in range(nz):
+        lines.append(f"    T* Z{k} = c + {base} + "
+                     f"(int64_t){len(sder) + len(cfld)}*npts + "
+                     f"(int64_t){k}*nbf*nbf;")
     # the engine's per-point operands in table order: passed, formed from
     # the tower, or computed by the kernel (internal_fields keeps the
     # table order of the passed and formed ones; computed ones were split
@@ -1079,30 +1192,52 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
             k = comp_index(combo[0][0])
             bexpr[code] = (f"{arr} + (int64_t){k}*nbf*npts + g0", "npts")
 
-    def sa(r, ip):
-        return (f"stage_a<T, Txc>(g0, bk, {nms[r][ip]}, {ns}::c{r}_{ip}, "
-                f"{ns}::o{r}_{ip}, {ns}::f{r}_{ip}, {ns}::NFLD, fi, xc, c);")
+    def sa(tag, ip):
+        return (f"stage_a<T, Txc>(g0, bk, {nms[tag][ip]}, {ns}::c{tag}_{ip}, "
+                f"{ns}::o{tag}_{ip}, {ns}::f{tag}_{ip}, {ns}::NFLD, fi, xc, "
+                "c);")
 
     def row_body(r):
         ck = blocks[r]
+        if splits[r] is not None:
+            body = []
+            for k, (tag, sub, _) in enumerate(tags(r)):
+                body += _stage_b_calls(sub, bexpr,
+                                       lambda ip, t=tag: sa(t, ip),
+                                       acc="accumulate<T>",
+                                       cast=lambda w: "Wc", out=f"Z{k}")
+            return body
+        r_ = str(r)
         if kind in POINT_KINDS:
-            return ["        " + sa(r, 0),
+            return ["        " + sa(r_, 0),
                     f"        for (int64_t g = 0; g < bk; ++g) "
                     f"out[(int64_t){r}*npts + g0 + g] += c[g];"]
         if kind in MATRIX_KINDS:
-            return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
+            return _stage_b_calls(ck, bexpr, lambda ip: sa(r_, ip),
                                   acc="accumulate<T>", cast=lambda w: "Wc",
                                   out=f"out + (int64_t){r}*nbf*nbf")
         if kind in REDUCE_KINDS:
-            return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
+            return _stage_b_calls(ck, bexpr, lambda ip: sa(r_, ip),
                                   gemm="masked_rowcolsum",
                                   acc="accumulate<T>", cast=lambda w: "Wc",
                                   out=f"out + (int64_t){r}*npts + g0, "
                                       "atom_mask")
-        return _stage_b_calls(ck, bexpr, lambda ip: sa(r, ip),
+        return _stage_b_calls(ck, bexpr, lambda ip: sa(r_, ip),
                               gemm="rowdot", acc="accumulate<T>",
                               cast=lambda w: "Wc",
                               out=f"out + (int64_t){r}*nbf")
+
+    def sym_loop(r):
+        """block_loop([r]), completing its half products into out."""
+        if splits[r] is None:
+            return block_loop([r])
+        zs = [f"Z{k}" for k in range(len(splits[r]))]
+        out = [f"    for (int64_t i_ = 0; i_ < nbf * nbf; ++i_) {z}[i_] = T(0);"
+               for z in zs]
+        out += block_loop([r])
+        out += [f"    add_sym<T>(nbf, {sign}, {z}, out + (int64_t){r}*nbf*nbf);"
+                for z, (_, _, sign) in zip(zs, tags(r))]
+        return out
 
     if cfld:
         # one pass per row block: that block's computed fields first
@@ -1124,7 +1259,11 @@ def emit_tower_hpp(blocks: List[CollapsedKernel], scal_ck: CollapsedKernel,
                     f"        masked_colsum<T>(npts, nbf, atom_mask, "
                     f"{len(terms)}, A_, B_, c_, C{j});",
                     "    }"]
-            lines += block_loop([r])
+            lines += sym_loop(r)
+    elif nz:
+        # one pass per row block, so the half products share their scratch
+        for r in range(len(blocks)):
+            lines += sym_loop(r)
     else:
         lines += block_loop(range(len(blocks)))
     lines += ["    if (own) delete[] c;", "    return 0;", "}", "",
