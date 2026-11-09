@@ -142,6 +142,12 @@ SPIN_FAMILIES = {
     "mgga_tau": (["MGGA_X_R2SCAN", "MGGA_C_R2SCAN"], 1e-3, 2e-7),
 }
 
+#: FD steps of the singlet/triplet check where they differ from
+#: SPIN_FAMILIES.  Its double-sided cross difference is rounding-limited
+#: for PBE at 1e-3 (1e-8, close to the tolerance and past it on some
+#: libxc builds); 2e-3 sits at the optimum (7e-10).
+ST_STEPS = {"gga": 2e-3}
+
 
 def make_spin_setup(seed=21):
     m = FieldModel(seed)
@@ -246,6 +252,7 @@ def validate_st(m, F0, pert):
     FS = {s: {"rho": F0["rho"] / 2, "grad": F0["grad"] / 2,
               "tau": F0["tau"] / 2} for s in "ab"}
     for family, (func_ids, H, tol) in SPIN_FAMILIES.items():
+        H = ST_STEPS.get(family, H)
         try:
             out = spin_libxc_eval(func_ids, family, FS, orders=(1, 2))
         except Exception as exc:
