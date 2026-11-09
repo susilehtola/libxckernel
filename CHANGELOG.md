@@ -8,7 +8,10 @@ layout change outside the entry points is the index struct
 `xck_kernel_info` in 0.5.0, which a host compiled against the header of
 the same generated tree picks up automatically.
 
-## Unreleased
+## 0.7.0 (2026-11-09)
+
+Fewer matrix products in the symmetric kernels, from one product
+planner shared by the NumPy and C/C++ emitters. The C ABI is unchanged.
 
 - **Half the matrix products in symmetric kernels.** The C/C++ matrix
   kernels paid a GEMM for both members of each transposed pattern
