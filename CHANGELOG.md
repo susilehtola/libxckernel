@@ -8,6 +8,28 @@ layout change outside the entry points is the index struct
 `xck_kernel_info` in 0.5.0, which a host compiled against the header of
 the same generated tree picks up automatically.
 
+## Unreleased
+
+- **Half the matrix products in symmetric kernels.** The C/C++ matrix
+  kernels paid a GEMM for both members of each transposed pattern
+  pair. They now accumulate one member of each pair, and
+  self-transposed patterns at half weight, into a half product X, then
+  add X + Xᵀ into `out` (X − Xᵀ for an antisymmetric remainder). They
+  fall back to the plain grouping where that is no dearer.
+  - GEMMs per call:
+    - `gga` `o1`/`o2`: 4 → 1;
+    - `hmgga` `o1`/`o2`: 11 → 4;
+    - `mgga`, `mgga_lapl` `o1`/`o2`: 5 → 4;
+    - `f1`, `fg`, `giao`: 2–4× fewer;
+    - the batched `o2` kernels: the same reductions.
+  - Unchanged: `lda`, `mgga_tau`, `cmgga_tau`.
+  - The plan is shared with the NumPy emitter, which already paired
+    transposes; `planner_validate` checks that both emit exactly the
+    planned products.
+  - The scratch in `<name>_work` grows by nbf² per part (nxc·nbf² in
+    the batched kernels). Callers that size `work` with
+    `<name>_work` need no change. The C ABI is unchanged.
+
 ## 0.6.0 (2026-10-12)
 
 Imaginary (magnetic) MO-projected response for the current-corrected

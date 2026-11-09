@@ -340,6 +340,17 @@ per grid block. Each formed operand takes the place of the single
 host-supplied array it replaces, so the number of GEMMs is unchanged.
 `manifest.json` records every such definition under `formed_in_kernel`.
 
+The matrix products follow one plan, shared by the C/C++ and NumPy
+emitters (`codegen.symmetry_split`). Patterns that share a basis factor
+fuse into one GEMM. A kernel symmetric in (u, v) accumulates only one
+of each transposed pattern pair, and its self-transposed patterns at
+half weight, into a half product X, then adds X + Xᵀ into `out`; an
+antisymmetric remainder (the GIAO kernels, the current terms of
+`cmgga_tau`) completes as X − Xᵀ. The plan is used only where it saves
+products. For example, the GGA potential `xck_gga_r_o1` costs one GEMM
+per grid block. The half products take nbf² of scratch per part
+(nxc·nbf² in the batched kernels), which `<name>_work` includes.
+
 Every kernel also exports its ABI kind (`<name>_kind`: `"matrix"`,
 `"diag"`, `"g1"`, `"f1u"`, `"h2bb"`, ...), output rank and shape
 (`<name>_out_rank`, `<name>_out_shape`), and `xckernel.h` declares an
@@ -435,6 +446,7 @@ precision, `~1e-13`–`1e-17`) where PySCF implements the quantity, and against
 | C gradient kernels `g1` + `gg` + weight class | all seven; `cmgga_tau` with complex orbitals | R + U | Richardson FD of Exc per class; translational sum rule | ~1e-10; ~1e-16 |
 | C nuclear Hessian (all classes, weight terms included) | all seven | R + U | FD of the matching gradient class; FD of the full gradient; translational sum rule | ~1e-11; ~1e-15 |
 | C batched response `o2_batch` | all seven | R + U + spin-adapted | nx single `o2` calls | ~1e-13 |
+| product plan (C/C++ and NumPy) | all seven | R + U | exact reassembly of every matrix kernel from its half products; emitted products = plan | exact |
 | C MO-projected response `o2_mo` | all seven | U + spin-adapted | C_occᵀ·`o2`[fields of P_x]·C_vir | ~1e-15 |
 | C imaginary MO response `o2_mo_imag` | `cmgga_tau` | U + spin-adapted | the same, antisymmetric P_x | ~1e-15 |
 | HelFEM `cmgga_tau` channels (complex basis, real P) | `cmgga_tau` | R + U, 3D + pure-m | FD of E[P] and of the Fock; τ̃ = τ_W for one orbital; `mgga_tau` at j = 0 | ~1e-12 |
