@@ -700,6 +700,126 @@ def _side_factor(fac: str, suffix: str, why: str) -> str:
     return fac.replace(base, base + suffix, 1)
 
 
+# --- product planning, shared by the NumPy and C/C++ emitters ---------------
+#
+# A collapsed kernel is a sum of basis-pair patterns (a, b): sum_g
+# a_u(g) c(g) b_v(g).  Patterns sharing a factor on one side cost one
+# matrix product together, and a pattern and its transpose (b, a) cost
+# one product and a transposed accumulation; the planner chooses the
+# cheaper of the two forms, so every emitter that forms the products
+# itself pays the same, minimal count.
+
+def _gemm_plan(patterns) -> Tuple[str, list]:
+    """Group patterns into GEMMs sharing one basis factor.
+
+    Returns (side, groups): side "u" merges patterns with a common U factor
+    (out += U . W^T, W = sum_p c_p o V_p), side "v" those with a common V
+    factor (out += W . V^T, W = sum_p c_p o U_p) -- whichever side has fewer
+    distinct factors.  groups is an ordered list of
+    (shared_factor, [(pattern_index, other_factor), ...]).
+    """
+    us = {u for u, _, _ in patterns}
+    vs = {v for _, v, _ in patterns}
+    side = "u" if len(us) <= len(vs) else "v"
+    groups: dict = {}
+    for ip, (u, v, _) in enumerate(patterns):
+        key, other = (u, v) if side == "u" else (v, u)
+        groups.setdefault(key, []).append((ip, other))
+    return side, list(groups.items())
+
+
+def _min_cover(codes, forced, edges):
+    """A smallest set of basis codes containing ``forced`` and an end of
+    every edge (exhaustive by size; the codes of one kernel are few)."""
+    from itertools import combinations
+    rest = sorted(set(codes) - set(forced))
+    for k in range(len(rest) + 1):
+        for extra in combinations(rest, k):
+            cover = set(forced) | set(extra)
+            if all(a in cover or b in cover for a, b in edges):
+                return cover
+    return set(codes)
+
+
+def _half_patterns(pairs):
+    """Half of a (anti)symmetric pattern set, each unordered pair once with
+    its shared factor in a minimal cover: [(shared, other, monos)]."""
+    forced = {u for u, v in pairs if u == v}
+    edges = [(u, v) for u, v in pairs if u != v]
+    cover = _min_cover({c for p in pairs for c in p}, forced, edges)
+    out = []
+    for (u, v), monos in pairs.items():
+        if u != v and u not in cover:
+            u, v = v, u
+        out.append((u, v, monos))
+    return sorted(out, key=lambda p: (p[0], p[1])), len(cover)
+
+
+def symmetry_split(ck: CollapsedKernel, plain_cost=None):
+    """The matrix kernel as out += (X_s + X_s^T) + (X_a - X_a^T), when that
+    needs fewer GEMMs than the plain grouping.
+
+    A Fock-type kernel is symmetric in (u, v): every pattern (a, b) has
+    its transpose (b, a) with the same monomials, and the plain grouping
+    pays a GEMM for each.  X_s holds one of each transposed pair (and
+    half of each self-transposed pattern), X_a the antisymmetric
+    remainder of a general-M kernel (cmgga_tau).  Returns
+    [(half kernel, sign)] with sign +1 for X_s and -1 for X_a, or None
+    when the plain grouping is at least as cheap: ``plain_cost``
+    products, by default those of _gemm_plan, which shares a factor on
+    either side (an emitter that groups by the u-side factor alone
+    passes the number of distinct u factors)."""
+    from dataclasses import replace
+
+    def table(monos):
+        t = {}
+        for coeff, factors in monos:
+            k = tuple(sorted(factors))
+            t[k] = t.get(k, 0.0) + coeff
+        return t
+
+    full = {}
+    for u, v, monos in ck.patterns:
+        if (u, v) in full:
+            return None
+        full[(u, v)] = table(monos)
+    sym, anti = {}, {}
+    for (u, v), m in full.items():
+        if (v, u) in sym or (v, u) in anti:
+            continue
+        if u == v:
+            sym[(u, u)] = {k: c / 2 for k, c in m.items()}
+            continue
+        t = full.get((v, u), {})
+        s = {k: (m.get(k, 0.0) + t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
+        a = {k: (m.get(k, 0.0) - t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
+        s = {k: c for k, c in s.items() if c != 0.0}
+        a = {k: c for k, c in a.items() if c != 0.0}
+        if s:
+            sym[(u, v)] = s
+        if a:
+            anti[(u, v)] = a
+    parts, cost = [], 0
+    for pairs, sign in ((sym, +1), (anti, -1)):
+        if not pairs:
+            continue
+        half, n = _half_patterns(pairs)
+        cost += n
+        if sign < 0:
+            # (a, b) of X_a carries the (a, b) element; a pattern turned
+            # round for the cover carries the (b, a) one, which is -
+            half = [(u, v, m if (u, v) in pairs else
+                     {k: -c for k, c in m.items()}) for u, v, m in half]
+        parts.append(([(u, v, sorted(((c, k) for k, c in m.items()),
+                                     key=lambda x: x[1]))
+                       for u, v, m in half], sign))
+    if plain_cost is None:
+        plain_cost = len(_gemm_plan(ck.patterns)[1])
+    if cost >= plain_cost:
+        return None
+    return [(replace(ck, patterns=p), sign) for p, sign in parts]
+
+
 def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                        batch: bool = False,
                        sesquilinear: bool = False,
@@ -827,98 +947,38 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
                 factors.append(f"{c}**({e})")
         return "*".join(factors)
 
-    # Transpose-partner deduplication: patterns (u, v) and (v, u) whose
-    # coefficient polynomials are identical (or exactly negated, as in the
-    # antisymmetric current channel) are evaluated with a single matrix
-    # multiplication and a (subtracted) transposed accumulation. In the
-    # sesquilinear mode the partner accumulates through the conjugate
-    # transpose instead, which is exact because the per-point coefficients
-    # are real (all ingredients of a Hermitian density matrix are real
-    # also for a complex basis). The two-sided mode emits every pattern
-    # separately, as its bra and ket collocations are different arrays.
-    def _mono_dict(monos):
-        return {fac: coeff for coeff, fac in monos}
-
-    plan: List[tuple] = []          # (pattern index, +1 / -1 / None)
-    if two_sided:
-        plan = [(k, None) for k in range(len(ck.patterns))]
-    else:
-        index = {(u, v): k for k, (u, v, _) in enumerate(ck.patterns)}
-        done = set()
-        for k, (u, v, m) in enumerate(ck.patterns):
-            if k in done:
-                continue
-            done.add(k)
-            j = index.get((v, u))
-            sign = None
-            if u != v and j is not None and j not in done:
-                mk = _mono_dict(m)
-                mj = _mono_dict(ck.patterns[j][2])
-                if mj == mk:
-                    sign = 1
-                elif mj == {fac: -c for fac, c in mk.items()}:
-                    sign = -1
-                if sign is not None:
-                    done.add(j)
-            plan.append((k, sign))
-
-    # Cartesian fusion: patterns that share their u-side factor and whose
-    # v-side factors are components of one collocation array contract
-    # against the SAME left operand, so the Cartesian sum can be carried
-    # out on the grid before the matrix product,
+    # Product plan (shared with the C/C++ emitter, see symmetry_split):
+    # a pattern and its transpose (v, u) cost one matrix product and a
+    # transposed accumulation, t + t^T for the symmetric part of the pair
+    # and t - t^T for the antisymmetric one (t + t^H, t - t^H in the
+    # sesquilinear mode, exact because the per-point coefficients are
+    # real), with self-transposed patterns at half weight; patterns that
+    # share their u-side factor fuse into one product,
     #
     #   sum_c (u * c_c) @ dchi[c].T  =  u @ (sum_c c_c * dchi[c]).T,
     #
     # trading n_c matrix products for n_c elementwise scalings of an
-    # (nbf, ngrid) array.  A diagonal pattern (u == v) joins the group with
-    # half its coefficient, since its product is (anti)symmetric and the
-    # transposed accumulation restores the other half.  This is the fusion
-    # that hand-written GGA Fock builds perform by folding the potential
-    # into a single modified collocation array.  Restricted to the plain
-    # single-array lowering: the two-sided mode has different bra and ket
-    # arrays, and split storage fuses per part elsewhere.  Batched kernels
-    # fuse inside an explicit loop over the perturbation index, so that the
-    # fused array stays (nbf, ngrid) rather than growing an nbatch axis;
-    # the coefficient assembly, which carries the monomials, stays
-    # vectorized over the batch.
-    _COMPONENT = re.compile(r"^(.*)\[(\d)\]$")
-
-    def _fuse(plan_in):
-        """Group plan entries into ``(entries, sign)`` fusion bundles.
-
-        Entries are ``(pattern index, halve)``.  Patterns that share their
-        u-side factor contract against the same left operand, so their sum
-        can be formed on the grid before the matrix product.  Only patterns
-        accumulated the same way may share a bundle: a transpose-paired
-        group closes as ``t +- t^T``, whereas an unpaired group closes as
-        ``t`` alone.  A diagonal pattern (u == v) is symmetric and has no
-        distinct partner; it joins a transpose-paired group of its own
-        u-side factor with half its coefficient, the transposed
-        accumulation supplying the other half, and otherwise joins the
-        unpaired group at full strength.
-        """
-        buckets: Dict[tuple, List[tuple]] = {}
-        order: List[tuple] = []
-
-        def _put(key, entry):
-            if key not in buckets:
-                buckets[key] = []
-                order.append(key)
-            buckets[key].append(entry)
-
-        pending = []
-        for k, sign in plan_in:
-            ufac, vfac, _ = ck.patterns[k]
-            if sign is not None and not two_sided:
-                _put((ufac, sign), (k, False))
-            else:
-                pending.append((k, ufac, vfac))
-        for k, ufac, vfac in pending:
-            if not two_sided and ufac == vfac and (ufac, 1) in buckets:
-                _put((ufac, 1), (k, True))       # half now, half by t^T
-            else:
-                _put((ufac, None), (k, False))
-        return [(buckets[key], key[1]) for key in order]
+    # (nbf, ngrid) array -- the fusion hand-written GGA Fock builds perform
+    # by folding the potential into one modified collocation array.  The
+    # planner keeps the plain grouping by u-side factor where pairing is
+    # no cheaper, and always in the two-sided mode, whose bra and ket
+    # collocations are different arrays.  Batched kernels fuse inside an
+    # explicit loop over the perturbation index, so that the fused array
+    # stays (nbf, ngrid) rather than growing an nbatch axis; the
+    # coefficient assembly, which carries the monomials, stays vectorized
+    # over the batch.  Each bundle is ([(index into pats, halve)], sign),
+    # sign None for an unpaired group.
+    split = None if two_sided else symmetry_split(
+        ck, plain_cost=len({u for u, _, _ in ck.patterns}))
+    parts = [(ck, None)] if split is None else split
+    pats: List[tuple] = []
+    bundles: List[tuple] = []
+    for sub, sign in parts:
+        by_u: Dict[str, List[int]] = {}
+        for pat in sub.patterns:
+            by_u.setdefault(pat[0], []).append(len(pats))
+            pats.append(pat)
+        bundles += [([(k, False) for k in ks], sign) for ks in by_u.values()]
 
     # Emit big sums as chunked += accumulation: a single expression over
     # tens of thousands of monomials builds an AST deep enough to blow
@@ -943,20 +1003,20 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
         return [f"    {name} = {ch[0]}"] + [f"    {name} += {p}" for p in ch[1:]]
 
     lines: List[str] = []
-    for bundle, bsign in _fuse(plan):
+    for bundle, bsign in bundles:
         if len(bundle) > 1 and part is not None:
             # --- fusion in split storage: the part decomposition turns each
             # pattern into real products (sign, a, b); those sharing a left
             # operand a fuse into one product against the summed right one
             for i, (k, _h) in enumerate(bundle):
-                lines += _chunked(f"c{i}", ck.patterns[k][2])
+                lines += _chunked(f"c{i}", pats[k][2])
             tT = "np.transpose(t, (0, 2, 1))" if batch else "t.T"
             bx = "[:, None, :]" if batch else ""
             for p, out_name in outs:
                 groups: Dict[str, List[tuple]] = {}
                 gorder: List[str] = []
                 for i, (k, halve) in enumerate(bundle):
-                    kufac, kvfac, _ = ck.patterns[k]
+                    kufac, kvfac, _ = pats[k]
                     umask, vmask = _mask(kufac), _mask(kvfac)
                     half = halve
                     for sg, lp, rp in part_product(p, True):
@@ -989,7 +1049,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
 
         if len(bundle) > 1:
             # --- Cartesian fusion: one matrix product for the group -------
-            bu = ck.patterns[bundle[0][0]][0]
+            bu = pats[bundle[0][0]][0]
             if sesquilinear:
                 ucode = _side_factor(bu, "_c", "sesquilinear")
             elif two_sided:
@@ -997,13 +1057,13 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
             else:
                 ucode = bu
             for i, (k, _s) in enumerate(bundle):
-                lines += _chunked(f"c{i}", ck.patterns[k][2])
+                lines += _chunked(f"c{i}", pats[k][2])
             # the fused operand carries the batch axis, so the whole
             # bundle becomes ONE batched matrix product; the grid batch
             # size is the host's knob for the (nx, nbf, ng) intermediate
             bx = "[:, None, :]" if batch else ""
             for i, (k, halve) in enumerate(bundle):
-                kufac, kvfac, _ = ck.patterns[k]
+                kufac, kvfac, _ = pats[k]
                 half = "0.5 * " if halve else ""
                 vcode = (_side_factor(kvfac, "_r", "two-sided")
                          if two_sided else kvfac)
@@ -1024,7 +1084,7 @@ def generate_collapsed(ki: KernelIntegrand, func_name: str = "kernel",
 
         k, _halve = bundle[0]
         sign = bsign
-        ufac, vfac, monos = ck.patterns[k]
+        ufac, vfac, monos = pats[k]
 
 
         if part is not None:

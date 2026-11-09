@@ -41,7 +41,8 @@ from __future__ import annotations
 import re
 from typing import List, Tuple
 
-from .codegen import CollapsedKernel, _classify
+from .codegen import (CollapsedKernel, _classify, _gemm_plan,
+                      symmetry_split)
 
 #: basis-factor code -> (array expression, needs)
 _BASIS = {
@@ -106,112 +107,6 @@ def scal_order(ck: CollapsedKernel) -> List[str]:
 
 def _scal_index(ck: CollapsedKernel) -> dict:
     return {name: i for i, name in enumerate(scal_order(ck))}
-
-
-def _gemm_plan(patterns) -> Tuple[str, list]:
-    """Group patterns into GEMMs sharing one basis factor.
-
-    Returns (side, groups): side "u" merges patterns with a common U factor
-    (out += U . W^T, W = sum_p c_p o V_p), side "v" those with a common V
-    factor (out += W . V^T, W = sum_p c_p o U_p) -- whichever side has fewer
-    distinct factors.  groups is an ordered list of
-    (shared_factor, [(pattern_index, other_factor), ...]).
-    """
-    us = {u for u, _, _ in patterns}
-    vs = {v for _, v, _ in patterns}
-    side = "u" if len(us) <= len(vs) else "v"
-    groups: dict = {}
-    for ip, (u, v, _) in enumerate(patterns):
-        key, other = (u, v) if side == "u" else (v, u)
-        groups.setdefault(key, []).append((ip, other))
-    return side, list(groups.items())
-
-
-def _min_cover(codes, forced, edges):
-    """A smallest set of basis codes containing ``forced`` and an end of
-    every edge (exhaustive by size; the codes of one kernel are few)."""
-    from itertools import combinations
-    rest = sorted(set(codes) - set(forced))
-    for k in range(len(rest) + 1):
-        for extra in combinations(rest, k):
-            cover = set(forced) | set(extra)
-            if all(a in cover or b in cover for a, b in edges):
-                return cover
-    return set(codes)
-
-
-def _half_patterns(pairs):
-    """Half of a (anti)symmetric pattern set, each unordered pair once with
-    its shared factor in a minimal cover: [(shared, other, monos)]."""
-    forced = {u for u, v in pairs if u == v}
-    edges = [(u, v) for u, v in pairs if u != v]
-    cover = _min_cover({c for p in pairs for c in p}, forced, edges)
-    out = []
-    for (u, v), monos in pairs.items():
-        if u != v and u not in cover:
-            u, v = v, u
-        out.append((u, v, monos))
-    return sorted(out, key=lambda p: (p[0], p[1])), len(cover)
-
-
-def symmetry_split(ck: CollapsedKernel):
-    """The matrix kernel as out += (X_s + X_s^T) + (X_a - X_a^T), when that
-    needs fewer GEMMs than the plain grouping.
-
-    A Fock-type kernel is symmetric in (u, v): every pattern (a, b) has
-    its transpose (b, a) with the same monomials, and the plain grouping
-    pays a GEMM for each.  X_s holds one of each transposed pair (and
-    half of each self-transposed pattern), X_a the antisymmetric
-    remainder of a general-M kernel (cmgga_tau).  Returns
-    [(half kernel, sign)] with sign +1 for X_s and -1 for X_a, or None
-    when the plain grouping is at least as cheap."""
-    from dataclasses import replace
-
-    def table(monos):
-        t = {}
-        for coeff, factors in monos:
-            k = tuple(sorted(factors))
-            t[k] = t.get(k, 0.0) + coeff
-        return t
-
-    full = {}
-    for u, v, monos in ck.patterns:
-        if (u, v) in full:
-            return None
-        full[(u, v)] = table(monos)
-    sym, anti = {}, {}
-    for (u, v), m in full.items():
-        if (v, u) in sym or (v, u) in anti:
-            continue
-        if u == v:
-            sym[(u, u)] = {k: c / 2 for k, c in m.items()}
-            continue
-        t = full.get((v, u), {})
-        s = {k: (m.get(k, 0.0) + t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
-        a = {k: (m.get(k, 0.0) - t.get(k, 0.0)) / 2 for k in set(m) | set(t)}
-        s = {k: c for k, c in s.items() if c != 0.0}
-        a = {k: c for k, c in a.items() if c != 0.0}
-        if s:
-            sym[(u, v)] = s
-        if a:
-            anti[(u, v)] = a
-    parts, cost = [], 0
-    for pairs, sign in ((sym, +1), (anti, -1)):
-        if not pairs:
-            continue
-        half, n = _half_patterns(pairs)
-        cost += n
-        if sign < 0:
-            # (a, b) of X_a carries the (a, b) element; a pattern turned
-            # round for the cover carries the (b, a) one, which is -
-            half = [(u, v, m if (u, v) in pairs else
-                     {k: -c for k, c in m.items()}) for u, v, m in half]
-        parts.append(([(u, v, sorted(((c, k) for k, c in m.items()),
-                                     key=lambda x: x[1]))
-                       for u, v, m in half], sign))
-    if cost >= len(_gemm_plan(ck.patterns)[1]):
-        return None
-    return [(replace(ck, patterns=p), sign) for p, sign in parts]
 
 
 def _stage_b_calls(ck: CollapsedKernel, bexpr, stage_a_call, indent="        ",
