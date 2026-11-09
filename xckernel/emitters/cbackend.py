@@ -39,6 +39,7 @@ hess_chi and the engine's per-point names).
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import List, Tuple
 
 from .codegen import (CollapsedKernel, _classify, _gemm_plan,
@@ -1199,11 +1200,26 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
     component) are evaluated once per grid block; per perturbation the
     coefficient is their combination with its fields (lincomb), and the
     perturbations of a chunk share one stacked GEMM per V-factor group:
-    [W_1; ...; W_n] V^T lands directly in out (nx, nbf, nbf)."""
+    [W_1; ...; W_n] V^T lands directly in out (nx, nbf, nbf).
+
+    A kernel symmetric in (u, v) (symmetry_split) stacks the half
+    products instead, transposed so the shared factor is the stacked
+    GEMM's V side: per chunk, the grid loop fills the chunk's half
+    products Z (nxc, nbf, nbf), which are then completed into out as
+    Z + Z^T (or Z - Z^T for the antisymmetric part)."""
     from .tower import comp_index
     L = kernel_layout([ck], ck, "matrix")
     ns = f"detail_{name}"
-    split = _split_batched(ck, L)
+    split = symmetry_split(ck, plain_cost=len({v for _, v, _ in ck.patterns}))
+    if split is None:
+        parts = [(ck, None)]
+    else:
+        # shared factor on the V side: X^T + X is the same completion, and
+        # X_a^T - X_a = -(X_a - X_a^T)
+        parts = [(replace(sub, patterns=[
+            (v, u, m if sign > 0 else [(-c, f) for c, f in m])
+            for u, v, m in sub.patterns]), sign) for sub, sign in split]
+    splits = [_split_batched(sub, L) for sub, _ in parts]
     # the tables' operands: the ground-state fields, then the Libxc arrays
     order = scal_order(ck)
     nf_all = len(order) - len(ck.libxc_args)
@@ -1217,18 +1233,23 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
              "#include <cstdint>", "#include <new>",
              '#include "xckernel/evaluator.hpp"', "",
              "namespace xckernel {", f"namespace {ns} {{"]
-    tables = []          # (pattern, component j, tag, n monomials)
-    for ip, (_, _, tabs) in enumerate(split):
-        for j, monos in sorted(tabs.items()):
-            tag = f"{ip}_{j}"
-            fake = CollapsedKernel.__new__(CollapsedKernel)
-            fake.patterns = [(None, None, monos)]
-            t, nm = _tables(fake, gidx, tag)
-            lines += [x.replace(f"c{tag}_0", f"c{tag}")
-                       .replace(f"o{tag}_0", f"o{tag}")
-                       .replace(f"f{tag}_0", f"f{tag}") for x in t]
-            tables.append((ip, j, tag, nm[0]))
-    ntab = len(tables)
+    tables = []      # per part: (pattern, component j, tag, n monomials)
+    for k, split_k in enumerate(splits):
+        tabs_k = []
+        for ip, (_, _, tabs) in enumerate(split_k):
+            for j, monos in sorted(tabs.items()):
+                tag = f"{ip}_{j}" if split is None else \
+                    f"{'sa'[k] if len(parts) > 1 else 's'}{ip}_{j}"
+                fake = CollapsedKernel.__new__(CollapsedKernel)
+                fake.patterns = [(None, None, monos)]
+                t, nm = _tables(fake, gidx, tag)
+                lines += [x.replace(f"c{tag}_0", f"c{tag}")
+                           .replace(f"o{tag}_0", f"o{tag}")
+                           .replace(f"f{tag}_0", f"f{tag}") for x in t]
+                tabs_k.append((ip, j, tag, nm[0]))
+        tables.append(tabs_k)
+    ntab = max(len(t) for t in tables)
+    zwork = "" if split is None else " + nxc * nbf * nbf"
     lines += [f"static constexpr int64_t NFLD = {nfld};",
               f"}} // namespace {ns}", "",
               "/* Scratch (elements of T) the kernel needs for nx "
@@ -1238,7 +1259,7 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
               "    const int64_t blk = npts < grid_block ? npts : grid_block;",
               f"    const int64_t nxc = nx < {BATCH_CHUNK} ? nx : {BATCH_CHUNK};",
               f"    return blk * ({1 + ntab} + nbf * (nxc + {len(xder)}))"
-              f" + {len(sder)} * npts + 1;",
+              f" + {len(sder)} * npts{zwork} + 1;",
               "}", "",
               "/* fields: the per-point tower operands in the order of",
               f" * {name}_field_names, perturbed ones (_p1) (nx, npts); xc in",
@@ -1267,54 +1288,97 @@ def emit_batch_hpp(ck: CollapsedKernel, name: str) -> str:
         lines += _combine_call([f"fields[{i}]" for i, _ in L.field_map[n]],
                                [w for _, w in L.field_map[n]],
                                "0", "npts", "1", f"S{j}", "    ")
+    if split is not None:
+        lines.append(f"    T* Z = Sb + (int64_t){len(sder)}*npts;")
     fi = [f"S{sder.index(n)}" if n in sder else
           f"fields[{L.field_map[n][0][0]}]" for n in ground]
     lines.append(f"    const T* fi[{max(nfld, 1)}] = {{" + ", ".join(fi or ["nullptr"])
                  + "};")
-    lines += ["    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
-              "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;"]
-    bexpr = {}
-    for code, (arr, combo) in L.basis.items():
-        if code in xder:
-            j = xder.index(code)
-            lines += _combine_call(
-                [f"{arr} + (int64_t){comp_index(ax)}*nbf*npts + g0"
-                 for ax, _ in combo], [w for _, w in combo],
-                "npts", "bk", "nbf", f"X{j}", "        ")
-            bexpr[code] = (f"X{j}", "bk")
-        else:
-            k = comp_index(combo[0][0])
-            bexpr[code] = (f"{arr} + (int64_t){k}*nbf*npts + g0", "npts")
-    # the ground-state tables, once per block
-    for t, (ip, j, tag, nm) in enumerate(tables):
-        lines.append(f"        stage_a<T, Txc>(g0, bk, {nm}, {ns}::c{tag}, "
-                     f"{ns}::o{tag}, {ns}::f{tag}, {ns}::NFLD, fi, xc, "
-                     f"A + (int64_t){t}*blk);")
-    # groups sharing the V factor: one stacked GEMM per group and chunk
-    groups: dict = {}
-    for ip, (ufac, vfac, _) in enumerate(split):
-        groups.setdefault(vfac, []).append((ip, ufac))
-    lines += ["        for (int64_t x0 = 0; x0 < nx; x0 += nxc) {",
-              "            const int64_t nxb = nx - x0 < nxc ? nx - x0 : nxc;"]
-    for vfac, members in groups.items():
-        lines.append("            for (int64_t x = 0; x < nxb; ++x) {")
-        for k, (ip, ufac) in enumerate(members):
-            ts = [(t, j) for t, (p, j, _, _) in enumerate(tables) if p == ip]
-            lines += [
-                "                {",
-                "                    const T* A_[] = {" + ", ".join(
-                    f"A + (int64_t){t}*blk" for t, _ in ts) + "};",
-                "                    const T* P_[] = {" + ", ".join(
-                    f"fields[{j}] + (x0 + x)*npts + g0" for _, j in ts) + "};",
-                f"                    lincomb<T>(bk, {len(ts)}, A_, P_, c);",
-                "                }",
-                f"                accumulate<T>(bk, nbf, c, {bexpr[ufac][0]}, "
-                f"{bexpr[ufac][1]}, W + x*nbf*bk, {int(k == 0)});"]
-        lines += ["            }",
-                  f"            gemm_rect(nxb*nbf, nbf, bk, "
-                  f"static_cast<const T*>(W), bk, {bexpr[vfac][0]}, "
-                  f"{bexpr[vfac][1]}, out + x0*nbf*nbf, nbf);"]
-    lines += ["        }", "    }", "    if (own) delete[] c;", "    return 0;",
+
+    def grid_head(ind):
+        """The block's derived basis operands; bexpr per basis code."""
+        out = []
+        bexpr = {}
+        for code, (arr, combo) in L.basis.items():
+            if code in xder:
+                j = xder.index(code)
+                out += _combine_call(
+                    [f"{arr} + (int64_t){comp_index(ax)}*nbf*npts + g0"
+                     for ax, _ in combo], [w for _, w in combo],
+                    "npts", "bk", "nbf", f"X{j}", ind)
+                bexpr[code] = (f"X{j}", "bk")
+            else:
+                k = comp_index(combo[0][0])
+                bexpr[code] = (f"{arr} + (int64_t){k}*nbf*npts + g0", "npts")
+        return out, bexpr
+
+    def stage_tables(tabs_k, ind):
+        return [f"{ind}stage_a<T, Txc>(g0, bk, {nm}, {ns}::c{tag}, "
+                f"{ns}::o{tag}, {ns}::f{tag}, {ns}::NFLD, fi, xc, "
+                f"A + (int64_t){t}*blk);"
+                for t, (ip, j, tag, nm) in enumerate(tabs_k)]
+
+    def group_gemms(split_k, tabs_k, bexpr, ind, dst, ldd):
+        """Per V-factor group: the chunk's stacked operands, one GEMM."""
+        out = []
+        groups: dict = {}
+        for ip, (ufac, vfac, _) in enumerate(split_k):
+            groups.setdefault(vfac, []).append((ip, ufac))
+        for vfac, members in groups.items():
+            out.append(f"{ind}for (int64_t x = 0; x < nxb; ++x) {{")
+            for k, (ip, ufac) in enumerate(members):
+                ts = [(t, j) for t, (p, j, _, _) in enumerate(tabs_k)
+                      if p == ip]
+                out += [
+                    f"{ind}    {{",
+                    f"{ind}        const T* A_[] = {{" + ", ".join(
+                        f"A + (int64_t){t}*blk" for t, _ in ts) + "};",
+                    f"{ind}        const T* P_[] = {{" + ", ".join(
+                        f"fields[{j}] + (x0 + x)*npts + g0" for _, j in ts)
+                    + "};",
+                    f"{ind}        lincomb<T>(bk, {len(ts)}, A_, P_, c);",
+                    f"{ind}    }}",
+                    f"{ind}    accumulate<T>(bk, nbf, c, {bexpr[ufac][0]}, "
+                    f"{bexpr[ufac][1]}, W + x*nbf*bk, {int(k == 0)});"]
+            out += [f"{ind}}}",
+                    f"{ind}gemm_rect(nxb*nbf, nbf, bk, "
+                    f"static_cast<const T*>(W), bk, {bexpr[vfac][0]}, "
+                    f"{bexpr[vfac][1]}, {dst}, {ldd});"]
+        return out
+
+    if split is None:
+        lines += ["    for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+                  "        const int64_t bk = npts - g0 < blk ? npts - g0 : blk;"]
+        head, bexpr = grid_head("        ")
+        lines += head
+        # the ground-state tables, once per block
+        lines += stage_tables(tables[0], "        ")
+        # groups sharing the V factor: one stacked GEMM per group and chunk
+        lines += ["        for (int64_t x0 = 0; x0 < nx; x0 += nxc) {",
+                  "            const int64_t nxb = nx - x0 < nxc ? nx - x0 : nxc;"]
+        lines += group_gemms(splits[0], tables[0], bexpr, "            ",
+                             "out + x0*nbf*nbf", "nbf")
+        lines += ["        }", "    }"]
+    else:
+        for (_, sign), split_k, tabs_k in zip(parts, splits, tables):
+            lines += ["    for (int64_t x0 = 0; x0 < nx; x0 += nxc) {",
+                      "        const int64_t nxb = nx - x0 < nxc ? nx - x0 : nxc;",
+                      "        for (int64_t i_ = 0; i_ < nxb*nbf*nbf; ++i_) "
+                      "Z[i_] = T(0);",
+                      "        for (int64_t g0 = 0; g0 < npts; g0 += blk) {",
+                      "            const int64_t bk = npts - g0 < blk ? "
+                      "npts - g0 : blk;"]
+            head, bexpr = grid_head("            ")
+            lines += head
+            lines += stage_tables(tabs_k, "            ")
+            lines += group_gemms(split_k, tabs_k, bexpr, "            ",
+                                 "Z", "nbf")
+            lines += ["        }",
+                      "        for (int64_t x = 0; x < nxb; ++x)",
+                      f"            add_sym<T>(nbf, {sign}, Z + x*nbf*nbf, "
+                      "out + (x0 + x)*nbf*nbf);",
+                      "    }"]
+    lines += ["    if (own) delete[] c;", "    return 0;",
               "}", "", "} // namespace xckernel", ""]
     return _operand_api("\n".join(lines), name, L.scal_names[:len(L.fields)], L.scal_names[len(L.fields):])
 
