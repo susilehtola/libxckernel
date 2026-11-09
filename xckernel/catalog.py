@@ -870,7 +870,7 @@ _GRADIENT_CLASSES = {
 }
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 
 def _index_meta(m: Dict):
